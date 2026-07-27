@@ -143,12 +143,8 @@ export async function createDocHandler(req: Request, res: Response) {
       res.status(400).json({ error: 'html registration requires bot mount' })
       return
     }
-    if (mountType === 'thread') {
-      res.status(200).json({ skipped: true, reason: 'thread_mount_not_registered' })
-      return
-    }
-    if (mountType !== 'group' && mountType !== 'space') {
-      res.status(400).json({ error: 'mountType must be group or space' })
+    if (mountType !== 'group' && mountType !== 'space' && mountType !== 'thread') {
+      res.status(400).json({ error: 'mountType must be group, space, or thread' })
       return
     }
     if (typeof octoDocSlug !== 'string' || octoDocSlug === '') {
