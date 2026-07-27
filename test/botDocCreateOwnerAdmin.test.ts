@@ -321,23 +321,73 @@ describe('bot html doc registration', () => {
     expect(bumpEpochMock).not.toHaveBeenCalled()
   })
 
-  it('skips thread-mounted html docs without writing doc_meta', async () => {
-    setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1' }) }))
+  it('registers thread-mounted html docs idempotently and grants the human owner admin', async () => {
+    setOctoIdentity(
+      stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1', ownerUid: 'u_human' }) }),
+    )
+    upsertHtmlByOctoDocSlug
+      .mockResolvedValueOnce({ meta: htmlMeta, created: true } as never)
+      .mockResolvedValueOnce({ meta: htmlMeta, created: false } as never)
+
+    const request = () =>
+      fetch(`${base}/v1/bot/docs`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          title: 'HTML Doc',
+          docType: 'html',
+          octoDocSlug: 'html-slug-1',
+          mountType: 'thread',
+        }),
+      })
+
+    const firstRes = await request()
+    const repeatRes = await request()
+
+    expect(firstRes.status).toBe(201)
+    expect(repeatRes.status).toBe(201)
+    expect(await firstRes.json()).toMatchObject({ docId: 'd_html', octoDocSlug: 'html-slug-1', created: true })
+    expect(await repeatRes.json()).toMatchObject({ docId: 'd_html', octoDocSlug: 'html-slug-1', created: false })
+    expect(upsertHtmlByOctoDocSlug).toHaveBeenCalledTimes(2)
+    expect(upsertHtmlByOctoDocSlug.mock.calls[0]![0]).toMatchObject({
+      docType: 'html',
+      octoDocSlug: 'html-slug-1',
+      spaceId: 's_1',
+      ownerId: 's_tmos_bot',
+    })
+    expect(create).not.toHaveBeenCalled()
+    expect(upsertDirect).toHaveBeenCalledTimes(2)
+    expect(upsertDirect).toHaveBeenLastCalledWith({
+      docId: 'd_html',
+      uid: 'u_human',
+      roleNum: ROLE_ADMIN,
+      grantedBy: 's_tmos_bot',
+    })
+  })
+
+  it.each([
+    [undefined, 'mountType must be group, space, or thread'],
+    ['channel', 'mountType must be group, space, or thread'],
+  ])('rejects html registration with unsupported mountType %s before writing', async (mountType, error) => {
+    setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1', ownerUid: 'u_human' }) }))
+
     const res = await fetch(`${base}/v1/bot/docs`, {
       method: 'POST',
       headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
       body: JSON.stringify({
-        title: 'Thread HTML',
+        title: 'HTML Doc',
         docType: 'html',
-        octoDocSlug: 'thread-slug',
-        mountType: 'thread',
+        octoDocSlug: 'html-slug-1',
+        ...(mountType === undefined ? {} : { mountType }),
       }),
     })
 
-    expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ skipped: true, reason: 'thread_mount_not_registered' })
+    expect(res.status).toBe(400)
+    expect(await res.json()).toEqual({ error })
     expect(upsertHtmlByOctoDocSlug).not.toHaveBeenCalled()
     expect(create).not.toHaveBeenCalled()
+    expect(upsertDirect).not.toHaveBeenCalled()
+    expect(bumpEpochMock).not.toHaveBeenCalled()
   })
 
   it('rejects html registration with an octo-doc slug longer than 128 chars before writing', async () => {
