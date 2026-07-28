@@ -29,6 +29,7 @@ import { docCardActionReceiptRepo } from '../../db/repos/docCardActionReceiptRep
 import { resolveRole } from '../../permission/resolveRole.js'
 import { grantForwardAccess } from '../services/grantForward.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
+import { buildDecisionDisplay, buildDecisionDisplayAt } from '../services/decisionDisplay.js'
 
 /**
  * Exact callback path. octo-server signs the canonical over the PATH of the
@@ -236,12 +237,19 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     if (currentStatus !== targetStatus) {
       return { disposition: 'conflict', state: statusToState(currentStatus), requester_uid: request.uid }
     }
-    // Already at our target, decided by someone else — report without granting.
+    // Already at our target, decided by someone else — report the ACTUAL decider
+    // (current.decided_by / when the row transitioned), NEVER this losing caller.
+    // A duplicate or concurrent click on a not-yet-synced card must not rewrite
+    // the result card to show the late clicker as the approver, nor their click
+    // time as the decision time. Fall back safely (empty → octo-server shows the
+    // generic operator label) rather than fabricate this caller's identity.
     return {
       disposition: 'applied',
       state: req.decision === 'approve' ? 'approved' : 'denied',
       requester_uid: request.uid,
-      display: { title: meta.title || '文档访问申请' },
+      display: (
+        await buildDecisionDisplayAt(meta.title, current?.decided_by ?? '', current?.updated_at)
+      ).display,
     }
   }
 
@@ -270,6 +278,16 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
   // so it is skipped here (deciderCardHandledExternally: true). Fire-and-forget:
   // never blocks or fails the callback response, and the 409/receipt guards stay
   // the authoritative protection.
+  // Resolve the decider's display copy ONCE for this decision and reuse it for
+  // both the response display and the sibling-card sync — otherwise the same uid
+  // is looked up twice per callback (and logs two misses in the default
+  // deployment). acted_at is the authoritative decision time for every card.
+  const { display, operatorName } = await buildDecisionDisplay(
+    meta.title,
+    req.operator_uid,
+    req.acted_at,
+  )
+
   void syncDecisionCards({
     requestId,
     spaceId: meta.space_id,
@@ -279,13 +297,15 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     deciderCardHandledExternally: true,
     denied: req.decision === 'deny',
     denyReason: decisionNote(req),
+    deciderName: operatorName,
+    decidedAtSeconds: req.acted_at,
   }).catch(() => {})
 
   return {
     disposition: 'applied',
     state: req.decision === 'approve' ? 'approved' : 'denied',
     requester_uid: request.uid,
-    display: { title: meta.title || '文档访问申请' },
+    display,
   }
 }
 

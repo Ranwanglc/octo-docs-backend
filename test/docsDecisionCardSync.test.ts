@@ -14,8 +14,15 @@ vi.mock('../src/config/env.js', () => ({
   config: {
     octoIdentity: { serverBaseUrl: 'http://octo-server:8080' },
     notify: { docsToken: '', service: 'docs-service' },
+    cardDisplayTimeZone: 'Asia/Shanghai',
   },
 }))
+// The decider's display name is resolved once per decision and forwarded to every
+// sibling card. Mock the identity module so these tests stay offline and the fetch
+// assertions below count only card mutate / notify calls (the name resolution
+// itself is covered by decisionDisplay.test.ts).
+const { getUser } = vi.hoisted(() => ({ getUser: vi.fn() }))
+vi.mock('../src/auth/octoIdentity.js', () => ({ getOctoIdentity: () => ({ getUser }) }))
 vi.mock('../src/db/repos/docAccessNotifyCardRepo.js', () => ({
   NOTIFY_CARD_STATUS_ACTIVE: 1,
   NOTIFY_CARD_STATUS_TERMINALIZED: 2,
@@ -71,6 +78,7 @@ beforeEach(() => {
   cfg.notify.docsToken = 'internal-token'
   repo.listByRequest.mockReset().mockResolvedValue([])
   repo.markTerminalized.mockReset().mockResolvedValue(undefined)
+  getUser.mockReset().mockResolvedValue({ uid: 'u-owner', name: '决策人' })
   fetchMock = vi.fn(async () => ({ ok: true, status: 200 }))
   vi.stubGlobal('fetch', fetchMock)
 })
@@ -125,6 +133,79 @@ describe('syncDecisionCards', () => {
       expect(call[1].headers['X-Internal-Token']).toBe('internal-token')
     }
     expect(repo.markTerminalized).toHaveBeenCalledTimes(2)
+  })
+
+  it('forwards the decider identity so sibling cards name the real approver', async () => {
+    repo.listByRequest.mockResolvedValue([row('u-admin1'), row('u-admin2')])
+    await syncDecisionCards({ ...baseParams(), deciderCardHandledExternally: true })
+    // Resolved ONCE for the decider, then reused for every sibling card.
+    expect(getUser).toHaveBeenCalledTimes(1)
+    expect(getUser.mock.calls[0][0]).toBe('u-owner')
+    for (let i = 0; i < fetchMock.mock.calls.length; i++) {
+      const body = bodyOf(fetchMock, i)
+      expect(body.operator_name).toBe('决策人')
+      expect(body.decided_at_display).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/)
+    }
+  })
+
+  it('still mutates when the decider name cannot be resolved (server keeps generic copy)', async () => {
+    getUser.mockResolvedValue(null)
+    repo.listByRequest.mockResolvedValue([row('u-admin1')])
+    await syncDecisionCards({ ...baseParams(), deciderCardHandledExternally: true })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(bodyOf(fetchMock, 0).operator_name).toBe('')
+    expect(repo.markTerminalized).toHaveBeenCalledTimes(1)
+  })
+
+  it('renders the AUTHORITATIVE decision time, not the sync clock', async () => {
+    // 2026-07-24 15:35 Asia/Shanghai == 07:35 UTC. Passing the decision time
+    // keeps every sibling card on the same minute as the clicked card, which a
+    // new Date() at sync time cannot guarantee near a minute boundary.
+    const decidedAtSeconds = Math.floor(new Date('2026-07-24T07:35:00.000Z').getTime() / 1000)
+    repo.listByRequest.mockResolvedValue([row('u-admin1'), row('u-admin2')])
+    await syncDecisionCards({
+      ...baseParams(),
+      deciderCardHandledExternally: true,
+      decidedAtSeconds,
+    })
+    for (let i = 0; i < fetchMock.mock.calls.length; i++) {
+      expect(bodyOf(fetchMock, i).decided_at_display).toBe('2026-07-24 15:35')
+    }
+  })
+
+  it('reuses a pre-resolved decider name without a second identity lookup', async () => {
+    repo.listByRequest.mockResolvedValue([row('u-admin1')])
+    await syncDecisionCards({
+      ...baseParams(),
+      deciderCardHandledExternally: true,
+      deciderName: '张三',
+    })
+    expect(getUser).not.toHaveBeenCalled()
+    expect(bodyOf(fetchMock, 0).operator_name).toBe('张三')
+  })
+
+  it('carries the decider identity onto the re-notify fallback too', async () => {
+    repo.listByRequest.mockResolvedValue([row('u-admin1')])
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.includes('/v1/internal/cards/mutate')) return { ok: false, status: 500 }
+      return { ok: true, status: 200 }
+    })
+    await syncDecisionCards({
+      ...baseParams(),
+      deciderCardHandledExternally: true,
+      deciderName: '张三',
+      decidedAtSeconds: Math.floor(new Date('2026-07-24T07:35:00.000Z').getTime() / 1000),
+    })
+    const notifyIdx = fetchMock.mock.calls.findIndex((c) =>
+      (c[0] as string).includes('/v1/internal/notify'),
+    )
+    expect(notifyIdx).toBeGreaterThanOrEqual(0)
+    const card = (bodyOf(fetchMock, notifyIdx) as unknown as { docs_card: Record<string, string> })
+      .docs_card
+    // A card that lands on the fallback must not be the odd one out with a
+    // generic label and no time.
+    expect(card.actor_name).toBe('张三')
+    expect(card.updated_at).toBe('2026-07-24 15:35')
   })
 
   it('falls back to a fresh terminal card when a mutate fails', async () => {

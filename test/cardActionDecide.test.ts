@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import { createHash, createHmac } from 'node:crypto'
 
 // Handler-dependency mocks (hoisted). The vector suite below calls
@@ -43,6 +43,11 @@ vi.mock('../src/permission/resolveRole.js', () => ({ resolveRole: vi.fn(async ()
 vi.mock('../src/api/services/grantForward.js', () => ({
   grantForwardAccess: vi.fn(async () => ({ finalRole: 'reader', changed: true })),
 }))
+// getUser backs buildDecisionDisplay's operator-name resolution. Default returns
+// undefined (name omitted); individual tests set an implementation to assert the
+// resolved operator identity.
+const { mockGetUser } = vi.hoisted(() => ({ mockGetUser: vi.fn() }))
+vi.mock('../src/auth/octoIdentity.js', () => ({ getOctoIdentity: () => ({ getUser: mockGetUser }) }))
 
 import {
   verifyOctoSignature,
@@ -385,5 +390,125 @@ describe('cardActionDecideHandler (grant gated on decide() CAS, not claim)', () 
     expect((res.payload as { disposition: string }).disposition).toBe('applied')
     expect(grantForwardAccess).toHaveBeenCalledTimes(1) // the decider grants, once
     await resetRequestMock()
+  })
+})
+
+// Invariant: a duplicate/concurrent click on an already-decided request must
+// render the ACTUAL decider on the result card, never the late caller. Admin
+// A truly decided (won the CAS); admin B then taps the same not-yet-synced card,
+// loses the pending CAS, and lands in the report-only branch. B's response must
+// carry A's operator identity (and A's decision time), not B's — otherwise a
+// repeat submit rewrites the card to show the wrong approver.
+describe('cardActionDecideHandler (duplicate same-terminal callback → real decider)', () => {
+  const eventId = '4020'
+  const ts = String(Math.floor(Date.now() / 1000))
+  const body = JSON.stringify({
+    event_id: eventId,
+    action_id: 'approval-approve',
+    decision: 'approve',
+    operator_uid: 'admin-B', // the LATE duplicate clicker
+    inputs: {},
+    data: { owner: 'docs', action_type: 'access_request.decision', doc_id: 'doc-1', request_id: 'req-1' },
+    doc_id: 'doc-1',
+    request_id: 'req-1',
+    message_id: 'm-1',
+    channel_id: 'notification',
+    channel_type: 1,
+    space_id: 'space-1',
+    acted_at: Number(ts),
+  })
+
+  // Restoration belongs here, NOT at the end of an `it` body: these blocks set
+  // `getByRequestId` with mockResolvedValue (not …Once) and give mockGetUser an
+  // implementation, so if an assertion above ever fails, in-body cleanup never
+  // runs and every later block inherits an always-approved row plus a
+  // uid-dependent getUser — failing for unrelated reasons, or silently
+  // exercising the duplicate branch.
+  afterEach(async () => {
+    const { docAccessRequestRepo } = await import('../src/db/repos/docAccessRequestRepo.js')
+    mockGetUser.mockReset()
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue({
+      uid: 'req-u',
+      requested_role: 1,
+      status: 1,
+    } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
+  })
+
+  it('renders operator_name from the persisted decider (admin-A), never the late clicker (admin-B)', async () => {
+    const { docAccessRequestRepo, REQUEST_STATUS_APPROVED } = await import('../src/db/repos/docAccessRequestRepo.js')
+    const { docCardActionReceiptRepo } = await import('../src/db/repos/docCardActionReceiptRepo.js')
+    const { docMetaRepo } = await import('../src/db/repos/docMetaRepo.js')
+    vi.mocked(docCardActionReceiptRepo.claim).mockResolvedValueOnce(true)
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValueOnce({
+      doc_id: 'doc-1',
+      space_id: 'space-1',
+      document_name: 'dn-1',
+      title: 'T',
+      status: 1,
+    } as unknown as Awaited<ReturnType<typeof docMetaRepo.getByDocId>>)
+    // Row already APPROVED by admin-A at a fixed time; B's CAS will lose.
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue({
+      uid: 'req-u',
+      requested_role: 1,
+      status: REQUEST_STATUS_APPROVED,
+      decided_by: 'admin-A',
+      updated_at: new Date('2026-07-24T07:35:00.000Z'),
+    } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(false) // B loses the pending CAS
+    // Distinct names so a wrong identity would be visible in the assertion.
+    mockGetUser.mockImplementation(async (uid: string) =>
+      uid === 'admin-A' ? { uid, name: 'Alice' } : { uid, name: 'Bob' },
+    )
+
+    const sig = sign(CARD_ACTION_DECIDE_PATH, body, ts, eventId, HANDLER_SECRET)
+    const { req, res } = makeReqRes(
+      { 'X-Octo-Timestamp': ts, 'X-Octo-Event-ID': eventId, 'X-Octo-Signature': sig },
+      body,
+    )
+    await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
+
+    expect(res.statusCode).toBe(200)
+    const display = (res.payload as { display?: Record<string, string> }).display
+    expect(display?.operator_name).toBe('Alice') // the real decider (admin-A)
+    expect(display?.operator_name).not.toBe('Bob') // never the late clicker (admin-B)
+    expect(display?.decided_at).toBeTruthy() // A's decision time, from the persisted row
+    // The name was resolved for the persisted decider, not for the losing caller.
+    expect(mockGetUser.mock.calls.map((c) => c[0])).toContain('admin-A')
+    expect(mockGetUser.mock.calls.map((c) => c[0])).not.toContain('admin-B')
+  })
+
+  it('renders operator_name for the CAS-winning decider on the primary path', async () => {
+    const { docAccessRequestRepo, REQUEST_STATUS_PENDING } = await import('../src/db/repos/docAccessRequestRepo.js')
+    const { docCardActionReceiptRepo } = await import('../src/db/repos/docCardActionReceiptRepo.js')
+    const { docMetaRepo } = await import('../src/db/repos/docMetaRepo.js')
+    vi.mocked(docCardActionReceiptRepo.claim).mockResolvedValueOnce(true)
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValueOnce({
+      doc_id: 'doc-1',
+      space_id: 'space-1',
+      document_name: 'dn-1',
+      title: 'T',
+      status: 1,
+    } as unknown as Awaited<ReturnType<typeof docMetaRepo.getByDocId>>)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValueOnce({
+      uid: 'req-u',
+      requested_role: 1,
+      status: REQUEST_STATUS_PENDING,
+    } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(true) // this caller IS the decider
+    mockGetUser.mockResolvedValueOnce({ uid: 'admin-B', name: 'Bob' })
+
+    const sig = sign(CARD_ACTION_DECIDE_PATH, body, ts, eventId, HANDLER_SECRET)
+    const { req, res } = makeReqRes(
+      { 'X-Octo-Timestamp': ts, 'X-Octo-Event-ID': eventId, 'X-Octo-Signature': sig },
+      body,
+    )
+    await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
+
+    expect(res.statusCode).toBe(200)
+    const display = (res.payload as { display?: Record<string, string> }).display
+    // The winner's own operator_uid (admin-B here) is the right identity on this path.
+    expect(display?.operator_name).toBe('Bob')
+    expect(display?.decided_at).toBeTruthy()
+    expect(mockGetUser.mock.calls.map((c) => c[0])).toContain('admin-B')
   })
 })

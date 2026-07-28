@@ -28,6 +28,8 @@ import {
   docAccessNotifyCardRepo,
   type DocAccessNotifyCardRow,
 } from '../../db/repos/docAccessNotifyCardRepo.js'
+import { resolveOperatorName } from './decisionDisplay.js'
+import { formatCardTimestamp, formatCardTimestampFromSeconds } from '../../util/cardTime.js'
 
 const INTERNAL_MUTATE_PATH = '/v1/internal/cards/mutate'
 const INTERNAL_NOTIFY_PATH = '/v1/internal/notify'
@@ -56,6 +58,27 @@ export interface DecisionCardSyncParams {
   denied: boolean
   /** Reviewer deny reason surfaced on the terminal card; empty on approve. */
   denyReason?: string
+  /**
+   * The decider's already-resolved display name, when the caller has it (the
+   * decision routes resolve it for the decider's own card). Passing it here keeps
+   * sibling cards naming the same approver WITHOUT a second identity lookup for
+   * the same uid. Omitted/empty => resolved here, or left to octo-server's
+   * generic label if that also misses.
+   */
+  deciderName?: string
+  /**
+   * The authoritative decision time (unix SECONDS) — the same value the decider's
+   * own card renders, so every card shows one time. Without it the sync would
+   * stamp its own clock, which can render a different minute than the clicked
+   * card for a decision near a minute boundary.
+   */
+  decidedAtSeconds?: number
+  /**
+   * Caller session token, when the decision came from an authenticated request
+   * (the REST paths). Lets the name resolve without depending on
+   * OCTO_SERVER_TOKEN. The signed callback has no session and passes none.
+   */
+  callerToken?: string
 }
 
 /** POST helper with a bounded timeout. Returns the Response or null on network error. */
@@ -80,12 +103,26 @@ async function postJson(path: string, token: string, body: unknown): Promise<Res
   }
 }
 
+/**
+ * The decider's display copy, resolved ONCE per decision and reused for every
+ * sibling card. octo-server's mutate endpoint accepts `operator_name` /
+ * `decided_at_display` as optional additive fields; omitting them left every
+ * sibling card on the generic reviewer label even though the decider's own card
+ * showed a real name. Either field may be empty — the endpoint then keeps its
+ * localized generic copy (it never renders a raw UID).
+ */
+interface DeciderDisplay {
+  operatorName: string
+  decidedAtDisplay: string
+}
+
 /** In-place mutate one sibling card to terminal. Returns true when applied. */
 async function mutateOneCard(
   p: DecisionCardSyncParams,
   kind: string,
   card: DocAccessNotifyCardRow,
   token: string,
+  decider: DeciderDisplay,
 ): Promise<boolean> {
   const res = await postJson(INTERNAL_MUTATE_PATH, token, {
     space_id: p.spaceId,
@@ -96,16 +133,23 @@ async function mutateOneCard(
     doc_id: p.docId,
     title: p.title,
     deny_reason: p.denied ? (p.denyReason ?? '') : '',
+    operator_name: decider.operatorName,
+    decided_at_display: decider.decidedAtDisplay,
   })
   return res !== null && res.ok
 }
 
-/** Fallback: send the approver a fresh terminal ("已处理") card. */
+/**
+ * Fallback: send the approver a fresh terminal ("已处理") card. Carries the same
+ * decider identity + time as the in-place mutate so a card that lands on the
+ * fallback is not the odd one out showing a generic label and no time.
+ */
 async function reNotifyTerminal(
   p: DecisionCardSyncParams,
   kind: string,
   card: DocAccessNotifyCardRow,
   token: string,
+  decider: DeciderDisplay,
 ): Promise<void> {
   await postJson(INTERNAL_NOTIFY_PATH, token, {
     space_id: p.spaceId,
@@ -117,9 +161,9 @@ async function reNotifyTerminal(
       request_id: p.requestId,
       kind,
       title: p.title,
-      actor_name: '',
+      actor_name: decider.operatorName,
       excerpt: p.denied ? (p.denyReason ?? '') : '',
-      updated_at: '',
+      updated_at: decider.decidedAtDisplay,
     },
   })
 }
@@ -144,13 +188,26 @@ export async function syncDecisionCards(p: DecisionCardSyncParams): Promise<void
       : cards
     if (siblings.length === 0) return
 
+    // Decider display copy, resolved at most ONCE per decision and reused for
+    // every sibling card. The name is reused from the caller when it already
+    // resolved it for the decider's own card (no second lookup for the same uid);
+    // the time is the authoritative decision time so all cards agree to the
+    // minute. Either may be empty — the endpoint then keeps its generic copy.
+    const decider: DeciderDisplay = {
+      operatorName: p.deciderName ?? (await resolveOperatorName(p.deciderUid, p.callerToken)),
+      decidedAtDisplay:
+        p.decidedAtSeconds !== undefined
+          ? formatCardTimestampFromSeconds(p.decidedAtSeconds)
+          : formatCardTimestamp(new Date()),
+    }
+
     await Promise.all(
       siblings.map(async (card) => {
         try {
-          const applied = await mutateOneCard(p, kind, card, docsToken)
+          const applied = await mutateOneCard(p, kind, card, docsToken, decider)
           if (!applied) {
             // Fallback so the approver still gets a terminal card.
-            await reNotifyTerminal(p, kind, card, docsToken)
+            await reNotifyTerminal(p, kind, card, docsToken, decider)
             return
           }
           // Best-effort audit; a failure here is harmless.

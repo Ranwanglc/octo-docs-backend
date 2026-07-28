@@ -27,6 +27,7 @@ import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 import { docAccessNotifyCardRepo, type NotifyCardCoord } from '../../db/repos/docAccessNotifyCardRepo.js'
 import { ROLE_ADMIN } from '../../permission/role.js'
+import { formatCardTimestamp } from '../../util/cardTime.js'
 import { SHARE_SCOPE_ANYONE } from '../../permission/shareScope.js'
 
 const INTERNAL_NOTIFY_PATH = '/v1/internal/notify'
@@ -191,12 +192,6 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, task: (item: 
   return results
 }
 
-/** Format a Date as `YYYY-MM-DD HH:mm` in local time (docs-backend timezone). */
-function formatTimestamp(d: Date): string {
-  const p = (n: number): string => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
-}
-
 /**
  * POST one docs_card notification to a single recipient. Returns whether the
  * server confirmed delivery (for the delivered count — unchanged contract) and,
@@ -305,7 +300,7 @@ export async function notifyDocAccessRequested(p: AccessRequestNotifyParams): Pr
       actor_uid: p.requesterUid,
       actor_name: actorName,
       excerpt: p.reason,
-      updated_at: formatTimestamp(new Date()),
+      updated_at: formatCardTimestamp(new Date()),
     }
 
     const results = await Promise.all(
@@ -399,7 +394,7 @@ export async function notifyDocMentioned(p: MentionNotifyParams): Promise<number
       actor_uid: p.authorUid,
       actor_name: actorName,
       excerpt: toExcerpt(p.body),
-      updated_at: formatTimestamp(new Date()),
+      updated_at: formatCardTimestamp(new Date()),
     }
 
     // P1: bounded concurrency instead of Promise.all over the whole list.

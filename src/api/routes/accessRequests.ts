@@ -42,6 +42,18 @@ function parseReqRole(v: unknown, fallback: 'reader' | 'writer' = 'reader'): 're
 }
 
 /**
+ * The decider's own session token, when this request carries one. The REST
+ * decision paths are authenticated, so the approver name can resolve with the
+ * caller's token instead of depending on OCTO_SERVER_TOKEN. Read defensively:
+ * this feeds a fire-and-forget display detail, and it must never be the reason a
+ * decision response fails.
+ */
+function callerSessionToken(req: Request): string | undefined {
+  const header = typeof req.header === 'function' ? req.header('token') : undefined
+  return header && header !== '' ? header : undefined
+}
+
+/**
  * POST submit — any authenticated octo user (no doc role required). Idempotent
  * by (doc_id, uid). If the caller already holds >= the requested role, returns
  * 200 already_granted without writing a row.
@@ -185,6 +197,10 @@ accessRequestsRouter.post(
       title: guard.meta.title,
       deciderUid: req.uid!,
       denied: false,
+      // This request IS authenticated, so the approver name can resolve with the
+      // decider's own session token instead of depending on OCTO_SERVER_TOKEN.
+      callerToken: callerSessionToken(req),
+      decidedAtSeconds: Math.floor(Date.now() / 1000),
     }).catch(() => {})
     res.status(200).json({ ok: true, role: result.finalRole })
   },
@@ -234,6 +250,8 @@ accessRequestsRouter.post(
       title: guard.meta.title,
       deciderUid: req.uid!,
       denied: true,
+      callerToken: callerSessionToken(req),
+      decidedAtSeconds: Math.floor(Date.now() / 1000),
     }).catch(() => {})
     res.status(200).json({ ok: true })
   },

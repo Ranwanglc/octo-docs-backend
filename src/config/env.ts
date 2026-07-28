@@ -137,6 +137,30 @@ export function resolveCollabPublicWsUrl(raw: string): string {
   return value
 }
 
+/**
+ * Validate the card display timezone at config load.
+ *
+ * `Intl.DateTimeFormat` throws `RangeError` for anything that is not a
+ * recognised IANA zone (`Asia/Shangai`, `UTC+8`, a trailing space …). Card
+ * timestamps are rendered on the access-decision callback path, so an unvalidated
+ * typo would surface as a permanent 503 loop *after* the grant has committed —
+ * the receipt never finalizes, the cards never terminalize, and the same typo
+ * silently kills the notification paths that swallow their errors. A cosmetic
+ * field must not be able to wedge a functional path, so fail loudly at boot
+ * instead (same convention as the signing-secret / collab-WS guards above).
+ */
+export function resolveCardDisplayTimeZone(raw: string): string {
+  const value = raw.trim()
+  try {
+    new Intl.DateTimeFormat('en-CA', { timeZone: value })
+  } catch {
+    throw new Error(
+      `CARD_DISPLAY_TIME_ZONE must be a valid IANA time zone (e.g. Asia/Shanghai, UTC), got: ${JSON.stringify(raw)} (refusing to run)`,
+    )
+  }
+  return value
+}
+
 export const config = {
   hostname: str('HOSTNAME', 'octo-docs-local'),
   hocuspocusPort: num('HOCUSPOCUS_PORT', 1234),
@@ -254,6 +278,14 @@ export const config = {
     // Empty = the decide endpoint rejects all callbacks (fail-closed). Never logged.
     cardActionSecret: str('OCTO_DOCS_CARD_ACTION_SECRET', ''),
   },
+
+  // IANA zone used to render user-visible card timestamps. Card copy is zh-CN
+  // while the container image sets no TZ (the deployment compose defaults it to
+  // UTC), so formatting in the process-local zone would render decision times
+  // hours off. Pinning it here keeps card output deployment-independent and lets
+  // tests assert a fixed literal. VALIDATED at load: an invalid zone would make
+  // Intl.DateTimeFormat throw on the decision path, so it must fail at boot.
+  cardDisplayTimeZone: resolveCardDisplayTimeZone(str('CARD_DISPLAY_TIME_ZONE', 'Asia/Shanghai')),
 
   attachments: {
     bucket: str('ATTACHMENT_BUCKET', 'octo-docs-attachments'),

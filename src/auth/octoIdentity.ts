@@ -53,7 +53,7 @@ export interface OctoIdentity {
    * `token` header: the configured service token when set, else the optional
    * authenticated caller's own octo session token.
    */
-  getUser(uid: string, callerToken?: string): Promise<OctoUser | null>
+  getUser(uid: string, callerToken?: string, signal?: AbortSignal): Promise<OctoUser | null>
 
   /**
    * (b-bot) Look up a single user by uid on the BOT path, authenticating with
@@ -190,7 +190,7 @@ export class HttpOctoIdentity implements OctoIdentity {
     return { uid: body.bot_uid, spaceId: body.space_id, ...(ownerUid ? { ownerUid } : {}) }
   }
 
-  async getUser(uid: string, callerToken?: string): Promise<OctoUser | null> {
+  async getUser(uid: string, callerToken?: string, signal?: AbortSignal): Promise<OctoUser | null> {
     // octo-server requires auth on /v1/users/:uid: prefer a configured service
     // token, else fall back to the caller's own session token. Never logged.
     const token = config.octoIdentity.serviceToken || callerToken || ''
@@ -198,6 +198,9 @@ export class HttpOctoIdentity implements OctoIdentity {
     try {
       res = await fetch(`${this.baseUrl}/v1/users/${encodeURIComponent(uid)}`, {
         headers: token ? { token } : {},
+        // Caller-provided deadline: an abort reclaims the socket instead of
+        // leaving an in-flight request against a stalled identity endpoint.
+        ...(signal ? { signal } : {}),
       })
     } catch {
       return null
@@ -321,8 +324,8 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
     return this.delegate.verifyToken(token)
   }
 
-  getUser(uid: string, callerToken?: string): Promise<OctoUser | null> {
-    return this.delegate.getUser(uid, callerToken)
+  getUser(uid: string, callerToken?: string, signal?: AbortSignal): Promise<OctoUser | null> {
+    return this.delegate.getUser(uid, callerToken, signal)
   }
 
   getUserAsBot(uid: string, botToken: string): Promise<OctoUser | null> {
