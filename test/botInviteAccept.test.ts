@@ -191,7 +191,7 @@ describe('human invite accept /api/v1/docs/invites/:token/accept stays unchanged
 
     expect(res.status).toBe(200)
     expect(await res.json()).toMatchObject({ docId: 'd1', documentName: 'Doc', role: 'writer' })
-    expect(upsertFromInviteTx.mock.calls[0]![1]).toMatchObject({ uid: 'u_1', roleNum: 2 })
+    expect(upsertFromInviteTx.mock.calls[0]![1]).toMatchObject({ uid: 'u_1', roleNum: 3 })
   })
 
   it('still returns 401 login_required when the session token is invalid', async () => {

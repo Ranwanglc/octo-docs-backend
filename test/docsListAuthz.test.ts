@@ -97,12 +97,13 @@ describe('GET /api/v1/docs — listDocsHandler membership gate (P1-a, XIN-1297 R
 
 // Read/write role SYMMETRY at the wire layer: the repo now projects the same
 // numeric role the write side derives (effectiveRole), and the route serializes
-// it verbatim. Locks that an EDIT share-only doc (repo role 2) surfaces as
-// 'writer', not 'reader' — the user-visible half of RC#1.
+// it verbatim. Locks the canonical four-role encoding (1=reader 2=commenter
+// 3=writer 4=admin) round-trips to its wire string — the user-visible half of RC#1.
 describe('GET /api/v1/docs — role serialization mirrors the projected numeric role (RC#1)', () => {
   it.each([
-    [3, 'admin'],
-    [2, 'writer'],
+    [4, 'admin'],
+    [3, 'writer'],
+    [2, 'commenter'],
     [1, 'reader'],
   ])('repo role %i => wire role %s', async (numeric, wire) => {
     isSpaceMemberMock.mockResolvedValue(true)
