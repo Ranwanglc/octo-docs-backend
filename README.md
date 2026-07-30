@@ -75,6 +75,10 @@ Copy `.env.example` to `.env` and adjust. Summary:
 | `OCTO_IDENTITY_MODE` (`http`/`middleware`) / `OCTO_SERVER_BASE_URL` | octo identity integration | §4.7 |
 | `OCTO_SERVER_TOKEN` | service token for octo-server lookups on the human path (optional). The bot path (`/v1/bot/docs`) resolves the anti ghost-member existence check via the bot's own token against the bot user-info route, so this service token is no longer required for bot member-add or forward-grant | §4.7 / v4.3 bot API |
 | `MAX_DOC_BYTES` | single-doc size hard cap (~10MB) | §9.5 |
+| `SEARCH_ENABLED` / `SEARCH_PAGE_SIZE_MAX` / `SEARCH_MAX_VISIBLE_TERMS` | full-text doc search: feature switch, per-page hit cap, and the OpenSearch `doc_id IN` down-push bound (over bound ⇒ 503 `terms_limit_exceeded`) | search |
+| `OPENSEARCH_NODE` / `OPENSEARCH_USERNAME` / `OPENSEARCH_PASSWORD` | read-only OpenSearch client for the `octo-doc` index | search |
+| `OPENSEARCH_TLS_REJECT_UNAUTHORIZED` | verify the OpenSearch TLS cert (`true`/`false`/`1`/`0`, default `true`); set `false` only for a trusted internal self-signed https node — emits a one-time warning when disabled | search |
+| `KAFKA_BROKERS` / `KAFKA_ACKS` / `DOCINDEX_KAFKA_TOPIC` | doc-index signal producer: broker list, producer acks, and the topic the external indexer consumes (must match its `DOCINDEX_KAFKA_TOPIC`) | search / indexer |
 | `ATTACHMENT_BUCKET` | object-storage bucket (presign stub) | §3.5 |
 | `TYPST_EXPORT_BINARY` | path to the `typst` binary (empty ⇒ resolved from `PATH`) | PDF export |
 | `TYPST_EXPORT_MAX_CONCURRENT` / `TYPST_EXPORT_MAX_QUEUE` | compile concurrency + queue bound (over queue ⇒ 503) | PDF export |
@@ -329,3 +333,4 @@ Honest accounting of what is **stubbed / deferred** for the next round:
   default-off alternative; not implemented.
 - **Integration tests** — only offline unit tests this round. No live
   MySQL/Redis integration suite yet.
+

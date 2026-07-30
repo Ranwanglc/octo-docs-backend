@@ -9,6 +9,7 @@ import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { docViewHistoryRepo } from '../../db/repos/docViewHistoryRepo.js'
 import { normalizeTypeFilter, HTML_DOC_TYPE } from '../../db/docType.js'
 import { buildDocumentName, buildHtmlDocumentName, DocumentNameError } from '../../permission/documentName.js'
+import { enqueueDocIndex, isSearchIndexedDoc } from '../../search/docIndexQueue.js'
 import { refreshAndPublish, bumpEpoch } from '../../permission/epoch.js'
 import { ROLE_ADMIN } from '../../permission/role.js'
 import {
@@ -25,6 +26,7 @@ import { buildDocShareUrl } from '../../util/docShareLink.js'
 import { config } from '../../config/env.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { requireDocRole } from '../guard.js'
+import { searchDocs, VisibleTermsTooLargeError, encodeSearchCursor, decodeSearchCursor } from '../../search/osClient.js'
 
 export const docsRouter: ExpressRouter = Router()
 
@@ -216,6 +218,13 @@ export async function createDocHandler(req: Request, res: Response) {
   if (meta) {
     await grantBotOwnerAdmin(req, meta.doc_id ?? docId, meta.document_name ?? documentName)
   }
+
+  // html docs are intentionally NOT fed to the search index this phase: board +
+  // html are excluded at the producer (isSearchIndexedDoc only accepts
+  // 'document'), and the consumer skips html anyway, so NO index signal is
+  // enqueued on this html registration/upsert path. (An html doc's body is
+  // owned/rendered by the external octo-doc service and never flows through the
+  // Yjs store hooks, so the collab afterStoreDocument feed can't see it either.)
   const responseDocId = resolvedDocType === HTML_DOC_TYPE ? (meta?.doc_id ?? docId) : docId
   const responseDocumentName = resolvedDocType === HTML_DOC_TYPE ? (meta?.document_name ?? documentName) : documentName
   const responseSpaceId = resolvedDocType === HTML_DOC_TYPE ? (meta?.space_id ?? spaceId) : spaceId
@@ -323,6 +332,130 @@ export async function listDocsHandler(req: Request, res: Response) {
 }
 
 docsRouter.get('/', listDocsHandler)
+
+/**
+ * POST /api/v1/docs/search — full-text search with permission down-push (P4).
+ *
+ * MySQL computes the FULL visible set first (§5.3): the caller's visible doc_id
+ * set — owner OR doc_member OR (for a confirmed space member) share_scope=anyone,
+ * all gated by status=1. That set is pushed DOWN into the OpenSearch query as a
+ * `doc_id IN <set>` filter (§5.4), alongside space + status. OS then does the
+ * FULL-TEXT match, highlight, AND pagination — every hit
+ * is already within the caller's access, so there is NO per-hit MySQL re-check
+ * (§6.4). For space members, anyone_in_space docs ARE enumerated into that set
+ * in MySQL (docMetaRepo adds `OR m.share_scope = ANYONE`), trading scale for a
+ * clean fail-closed doc_id filter that also drops stale/soft-deleted OS copies.
+ * NOTE: a very large space can push visibleDocIds past OpenSearch
+ * `index.max_terms_count` (default 65536), which surfaces as a 503; bound this
+ * before enabling search on large spaces.
+ *
+ * Registered BEFORE the '/:docId' routes so the '/search' literal is never
+ * shadowed by the single-doc param route.
+ *
+ * Pagination is keyset (search_after), NOT offset: the client omits `cursor` on
+ * the first page and echoes back the response's `nextCursor` for each subsequent
+ * page. `nextCursor` is an opaque base64url token wrapping the last hit's sort
+ * values; it is absent once there is no further page, so the client's stop
+ * condition is simply "nextCursor missing" (never `page * size >= total`, which
+ * offset paging can get wrong under index churn). `total` is still an exact count
+ * for display, but no longer drives the stop.
+ *
+ *   body: { q: string, docType?: string[], cursor?: string, pageSize?: number }
+ *   400 q required         q empty/missing
+ *   400 invalid_cursor     cursor present but malformed
+ *   503 search unavailable search disabled, OR OpenSearch errored (never fail-open)
+ */
+export async function searchDocsHandler(req: Request, res: Response) {
+  // Gray release gate: with search disabled the endpoint never connects to OS.
+  if (config.search.enabled === false) {
+    res.status(503).json({ error: 'search unavailable', reason: 'search_disabled' })
+    return
+  }
+  const uid = req.uid!
+  const spaceId = req.spaceId!
+  const { q, docType: docTypeRaw, cursor: cursorRaw, pageSize: pageSizeRaw } = req.body ?? {}
+  if (typeof q !== 'string' || q.trim() === '') {
+    res.status(400).json({ error: 'q required' })
+    return
+  }
+  // Decode the opaque keyset cursor (absent => first page). A malformed cursor is
+  // a client bug, not a transient failure — answer 400 rather than silently
+  // restarting from page one (mirrors listRecentHandler's invalid_cursor path).
+  let searchAfter
+  try {
+    searchAfter = decodeSearchCursor(typeof cursorRaw === 'string' ? cursorRaw : undefined) ?? undefined
+  } catch {
+    res.status(400).json({ error: 'invalid_cursor' })
+    return
+  }
+  // Optional kind filter (§6.3): validated against the fixed doc_type enum;
+  // unknown/absent => no filter. Pushed to both the MySQL constraint and OS filter.
+  const docType = normalizeTypeFilter(docTypeRaw)
+  const pageSize = Math.min(config.search.pageSizeMax, Math.max(1, Number(pageSizeRaw ?? 20) || 20))
+  // Space-share visibility must match the list side: only a confirmed member of
+  // the queried space sees its anyone_in_space docs (fail-closed on lookup error).
+  const isSpaceMember = await resolveViewerSpaceMembership(req)
+
+  // 1. MySQL: the caller's visible doc_id set (private + explicitly-granted +,
+  //    for a confirmed member, space-share). All gated by status=1 in MySQL, so
+  //    soft-deleted docs are absent here regardless of what OS still holds.
+  //    Capped at maxVisibleTerms+1 rows: an oversized set is rejected below
+  //    (searchDocs throws VisibleTermsTooLargeError) before a large terms array
+  //    reaches OpenSearch, and the DB scan itself is bounded to limit+1 rather
+  //    than the true count. Recomputed on every keyset page (stateless paging),
+  //    so the bound also caps the per-page cost.
+  const visibleDocIds = await docMetaRepo.listVisibleDocIdSet({
+    uid,
+    spaceId,
+    docType,
+    isSpaceMember,
+    limit: config.search.maxVisibleTerms,
+  })
+
+  // 2. OS: full-text match with the visibility constraint pushed down as a filter,
+  //    keyset-paginated by OS via search_after. Empty visible set short-circuits to
+  //    total=0 inside searchDocs (no OS call). OS error => 503, never fail-open.
+  let result
+  try {
+    result = await searchDocs({
+      spaceId,
+      query: q.trim(),
+      docType,
+      visibleDocIds,
+      size: pageSize,
+      searchAfter,
+    })
+  } catch (err) {
+    // A visible set too large to push down as a terms filter is a deterministic,
+    // caller-observable limit (not a transient OS outage) — surface a distinct
+    // reason so clients can narrow the query rather than blindly retry.
+    if (err instanceof VisibleTermsTooLargeError) {
+      res.status(503).json({ error: 'search unavailable', reason: 'terms_limit_exceeded' })
+      return
+    }
+    res.status(503).json({ error: 'search unavailable' })
+    return
+  }
+
+  // Hits are already within the visibility constraint and carry their own display
+  // metadata from OS _source — no MySQL round-trip, no role (§6.3 response).
+  // nextCursor is present only when searchDocs reported a further page; the client
+  // stops paginating as soon as it is absent.
+  res.status(200).json({
+    total: result.total,
+    items: result.items.map((it) => ({
+      docId: it.docId,
+      title: it.title,
+      docType: it.docType,
+      updatedAt: it.updatedAt,
+      spaceId: it.spaceId,
+      ...(it.highlight ? { highlight: it.highlight } : {}),
+    })),
+    ...(result.searchAfter ? { nextCursor: encodeSearchCursor(result.searchAfter) } : {}),
+  })
+}
+
+docsRouter.post('/search', searchDocsHandler)
 
 /**
  * POST /api/v1/docs/{docId}/view — record that the caller opened this doc
@@ -474,6 +607,18 @@ async function renameDocById(req: Request, res: Response, docId: string): Promis
     return
   }
   await docMetaRepo.rename(docId, title, req.uid!)
+  // Title lives in the search index (matched as title^2, returned as _source.title),
+  // so a rename must re-index or the new title is missed / the stale one keeps
+  // showing until an unrelated body edit reindexes. Enqueue a body signal: the
+  // indexer re-reads the latest authoritative state (including title) by
+  // documentName. Best-effort / fire-and-forget (enqueue swallows its own
+  // errors); gated OFF by default; html has no searchable body and is skipped.
+  if (config.search.indexEnabled) {
+    const documentName = await docMetaRepo.resolveDocumentName(docId)
+    if (documentName && isSearchIndexedDoc(documentName)) {
+      void enqueueDocIndex(documentName)
+    }
+  }
   res.status(200).json({ docId, title })
 }
 

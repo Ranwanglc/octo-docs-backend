@@ -20,6 +20,7 @@ import { recheckCurrentRoleCached } from '../permission/recheck.js'
 import { roleAtLeast } from '../permission/role.js'
 import { handleAfterStore, handleBeforeUnload } from './autoSnapshot.js'
 import { parseDocumentName } from '../permission/documentName.js'
+import { enqueueDocIndex } from '../search/docIndexQueue.js'
 import { attachWhiteboardRepair, coldRepairLiveDoc } from '../whiteboard/repair.js'
 
 /**
@@ -48,6 +49,24 @@ const COLOR_RE = /^#[0-9a-fA-F]{6}$/
  * treated as unsafe (the client path already enforced this bound).
  */
 const NAME_MAX_LEN = 64
+
+/**
+ * Whether a documentName refers to a Yjs-backed document whose body should be
+ * fed to the full-text search index via THIS hook (§3.3a). 'document' (doc /
+ * sheet, 4-seg) and 'whiteboard' (board, 5-seg `:wb:` key, doc_type='board')
+ * both have an authoritative Yjs body flowing through the store path, so both
+ * are indexed here. Html docs are EXCLUDED this期 (their body lives in the
+ * external octo-doc service and never reaches the Yjs store). Parse failures are
+ * treated as non-indexable (never throws — this gates a best-effort side channel).
+ */
+function isIndexableDocument(documentName: string): boolean {
+  try {
+    const kind = parseDocumentName(documentName).kind
+    return kind === 'document' || kind === 'whiteboard'
+  } catch {
+    return false
+  }
+}
 
 /**
  * True if `v` is a presence display name safe to RELAY to peers (§4.7(b) / P2).
@@ -373,6 +392,15 @@ export function createServer() {
         data.lastContext as AuthContext | undefined,
         data.document,
       )
+
+      // §3.3a: feed the full-text search indexer. Enqueue only a tiny
+      // {documentName} signal; the consumer re-reads the latest body. Best-effort
+      // and fire-and-forget (enqueue swallows its own errors) so it can never add
+      // latency to, or fail, the authoritative store path above. Gated OFF by
+      // default; whiteboards (no searchable body) are skipped.
+      if (config.search.indexEnabled && isIndexableDocument(data.documentName)) {
+        void enqueueDocIndex(data.documentName, 'body')
+      }
     },
 
     // A4 (§5.2): flush the last editing burst + clear the per-doc idle timer

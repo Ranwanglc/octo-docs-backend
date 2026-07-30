@@ -20,6 +20,7 @@ import { createApp } from './api/app.js'
 import { epochInvalidateChannel, currentEpoch, invalidateEpochCache, type InvalidateEvent } from './permission/epoch.js'
 import { closePool } from './db/pool.js'
 import { closeRedis } from './db/redis.js'
+import { closeKafkaProducer } from './db/kafka.js'
 
 async function main(): Promise<void> {
   // B1 safety backstop: a stray throw/rejection inside an async hook (e.g. a
@@ -86,6 +87,7 @@ async function main(): Promise<void> {
       httpServer.close()
       sub.disconnect()
       await closeRedis()
+      await closeKafkaProducer()
       await closePool()
     } finally {
       process.exit(0)

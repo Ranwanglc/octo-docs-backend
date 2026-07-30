@@ -389,6 +389,91 @@ export const docMetaRepo = {
     return { total, items }
   },
 
+  /**
+   * Permission down-push for full-text search (P4, §5.3(a) / §5.4). Compute the
+   * caller's visible doc_id set in `spaceId` so the route can push it into
+   * OpenSearch as a `terms: { doc_id: [...] }` filter branch.
+   *
+   * The set is owner OR direct doc_member, PLUS space-share (share_scope=anyone)
+   * when the caller is a confirmed space member (fail-closed: a non-member
+   * collapses to owner OR doc_member). Space-share IS enumerated here (same
+   * predicate as listForUser's includeSpaceShare branch, #64) rather than being
+   * pushed to an OS-side share_scope branch: with the status=1 filter, a
+   * soft-deleted doc is simply absent from the set, so it cannot be searched even
+   * if OS still holds a stale copy — OS never needs to carry fresh share_scope /
+   * status. The trade-off is terms-list size for large space-share sets (§5.4).
+   *
+   * owner scope is the caller alone (owner_id = uid) — matching requireDocRole /
+   * resolveRole, which key off `uid === meta.owner_id` with no ownedBots widening.
+   * A content-returning search endpoint MUST fail-closed to the read guard: a doc
+   * owned by a bot the caller owns is NOT auto-visible here (it would return title
+   * + body highlight for a docId whose GET /content is 403 when the human has no
+   * doc_member row — reachable via the non-transactional grantBotOwnerAdmin path,
+   * see docs.ts). status=1 (active only). Optional docType narrows to a
+   * multi-value doc_type set. Returns the doc_id strings.
+   *
+   * When `limit` is given the SQL caps at `limit + 1` rows, so an oversized
+   * visible set is detected here (the caller compares `length > limit`) BEFORE
+   * the full set is streamed out of MySQL and a large terms array is built —
+   * the row cost is bounded to limit+1 instead of the true (unbounded) count.
+   */
+  async listVisibleDocIdSet(params: {
+    uid: string
+    spaceId: string
+    docType?: string[]
+    isSpaceMember?: boolean
+    limit?: number
+  }): Promise<string[]> {
+    // owner set: caller only (owner_id = uid), matching requireDocRole /
+    // resolveRole. Deliberately NOT widened to ownedBots (unlike listForUser
+    // owner='me'): this endpoint returns body highlights, so it must fail-closed
+    // to the read guard. A bot-owned doc without a doc_member row for the human
+    // stays out of the visible set here, same as GET /content would 403.
+    const ownerSet = [params.uid]
+
+    const docTypes = (params.docType ?? []).filter((t) => typeof t === 'string' && t !== '')
+
+    // Bind order MUST match placeholder order (mysql2 execute, errno 1210 on a
+    // mismatch): JOIN `dm.uid = ?` first, then space_id, then the optional
+    // doc_type IN (...), then the owner IN (...) set in the visibility tail.
+    const ownerPlaceholders = ownerSet.map(() => '?').join(', ')
+    const where = ['m.status = 1', 'm.space_id = ?']
+    const args: unknown[] = [params.uid, params.spaceId]
+    if (docTypes.length > 0) {
+      where.push(`m.doc_type IN (${docTypes.map(() => '?').join(', ')})`)
+      args.push(...docTypes)
+    }
+    // Visibility: owner OR direct doc_member, PLUS space-share (share_scope=anyone)
+    // for a confirmed space member — the SAME predicate as listForUser's
+    // includeSpaceShare branch (#64), gated on isSpaceMember (fail-closed: a
+    // non-member collapses to owner OR doc_member). Enumerating space-share here
+    // (with the status=1 filter above) means the search endpoint no longer needs
+    // OS to carry a fresh share_scope/status — an already-soft-deleted doc simply
+    // isn't in this set, so it can't be searched even if OS still holds a stale
+    // copy. SHARE_SCOPE_ANYONE is a numeric constant, inlined (no extra bind).
+    const spaceShare = params.isSpaceMember === true ? ` OR m.share_scope = ${SHARE_SCOPE_ANYONE}` : ''
+    where.push(`(m.owner_id IN (${ownerPlaceholders}) OR dm.uid IS NOT NULL${spaceShare})`)
+    args.push(...ownerSet)
+
+    // Cap rows at limit+1 (when a limit is given) so overflow is detectable by
+    // the caller (length > limit) without materializing the whole set. No ORDER
+    // BY: membership is set-semantics only (fed to an OS terms filter), so which
+    // limit+1 rows come back does not matter — only whether the count exceeds
+    // the bound. mysql2 forbids a bound `?` in LIMIT, so inline the validated int.
+    const limitClause =
+      typeof params.limit === 'number' && Number.isInteger(params.limit) && params.limit >= 0
+        ? ` LIMIT ${params.limit + 1}`
+        : ''
+    const sql = `
+      SELECT m.doc_id
+      FROM doc_meta m
+      LEFT JOIN doc_member dm ON dm.doc_id = m.doc_id AND dm.uid = ?
+      WHERE ${where.join(' AND ')}${limitClause}
+    `
+    const rows = await query<{ doc_id: string }>(sql, args)
+    return rows.map((r) => r.doc_id)
+  },
+
   /** Bump permission_epoch within an existing transaction (§4.5). */
   async bumpEpochTx(tx: Tx, docId: string): Promise<void> {
     await tx.query('UPDATE doc_meta SET permission_epoch = permission_epoch + 1 WHERE doc_id = ?', [docId])

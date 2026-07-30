@@ -73,7 +73,15 @@ export async function acceptInviteForUid(
   inviteToken: string,
   nowMs: number = Date.now(),
 ): Promise<AcceptResult> {
-  return transaction(async (tx) => {
+  // Branches c/d publish an epoch invalidation. Capture its payload in-tx and
+  // fire refreshAndPublish AFTER commit (see the call site below); stays null on
+  // the branches that make no permission change. A box (not a bare `let`) so the
+  // closure assignment is visible to the post-commit read without CFA narrowing.
+  const pending: { publish: { documentName: string; epoch: number; uid: string } | null } = {
+    publish: null,
+  }
+
+  const result = await transaction<AcceptResult>(async (tx) => {
     // step 2: lock invite row.
     const invite = await docInviteRepo.getForUpdateTx(tx, inviteToken)
     if (!invite) return { ok: false, status: 410, error: 'invite_invalid' }
@@ -142,28 +150,40 @@ export async function acceptInviteForUid(
       await docInviteRepo.incrementUsedCountTx(tx, inviteToken)
     }
     await tx.query('UPDATE doc_meta SET permission_epoch = permission_epoch + 1 WHERE doc_id = ?', [meta!.doc_id])
-    await publishEpoch(tx, meta!.doc_id, meta!.document_name, uid)
+    pending.publish = {
+      documentName: meta!.document_name,
+      epoch: await readEpochTx(tx, meta!.doc_id),
+      uid,
+    }
     return {
       ok: true,
       status: 200,
       body: { docId: meta!.doc_id, documentName: meta!.document_name, role: decision.role },
     }
   })
+
+  // Publish the invalidation AFTER the tx commits, matching every other ACL path
+  // (softDelete / setShareSettings / members / grantForward all publish
+  // post-commit). Publishing pre-commit would announce a permission_epoch bump
+  // that a concurrent reader could act on before the row is durably committed,
+  // and a rollback would leave a phantom cache-invalidation for a change that
+  // never landed. Best-effort: the accept is already committed, so a failure
+  // here only misses a cache refresh (the beforeHandleMessage recheck is the
+  // correctness backstop).
+  if (pending.publish) {
+    await refreshAndPublish(pending.publish.documentName, pending.publish.epoch, pending.publish.uid)
+  }
+  return result
 }
 
-/** Read the new epoch in-tx and publish the invalidation after commit-side caches. */
-async function publishEpoch(
+/** Read the freshly-bumped epoch inside the tx; the caller publishes post-commit. */
+async function readEpochTx(
   tx: Parameters<Parameters<typeof transaction>[0]>[0],
   docId: string,
-  documentName: string,
-  uid: string,
-): Promise<void> {
+): Promise<number> {
   const rows = await tx.query<{ permission_epoch: number }>(
     'SELECT permission_epoch FROM doc_meta WHERE doc_id = ? LIMIT 1',
     [docId],
   )
-  const epoch = Number(rows[0]?.permission_epoch ?? 0)
-  // refreshAndPublish touches Redis (best-effort); safe to call within the
-  // request even though the tx commit happens after the callback returns.
-  await refreshAndPublish(documentName, epoch, uid)
+  return Number(rows[0]?.permission_epoch ?? 0)
 }
