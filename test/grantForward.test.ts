@@ -89,4 +89,46 @@ describe('grantForwardAccess — only-up matrix (§7)', () => {
     expect(out).toEqual({ finalRole: 'reader', changed: false })
     expect(vi.mocked(bumpEpoch)).not.toHaveBeenCalled()
   })
+
+  it('reader + commenter -> upgrade, bump, commenter', async () => {
+    vi.mocked(resolveRole).mockResolvedValue('reader')
+    vi.mocked(docMemberRepo.upsertGrantMax).mockResolvedValue(true)
+    const out = await grantForwardAccess({ ...base, roleNum: roleToNumber('commenter') })
+
+    expect(out).toEqual({ finalRole: 'commenter', changed: true })
+    expect(vi.mocked(bumpEpoch)).toHaveBeenCalledTimes(1)
+  })
+
+  it('commenter + writer -> upgrade, bump, writer', async () => {
+    vi.mocked(resolveRole).mockResolvedValue('commenter')
+    vi.mocked(docMemberRepo.upsertGrantMax).mockResolvedValue(true)
+    const out = await grantForwardAccess({ ...base, roleNum: roleToNumber('writer') })
+
+    expect(out).toEqual({ finalRole: 'writer', changed: true })
+    expect(vi.mocked(bumpEpoch)).toHaveBeenCalledTimes(1)
+  })
+
+  it('writer + commenter -> NO downgrade: stays writer, no bump', async () => {
+    vi.mocked(resolveRole).mockResolvedValue('writer')
+    vi.mocked(docMemberRepo.upsertGrantMax).mockResolvedValue(false)
+    const out = await grantForwardAccess({ ...base, roleNum: roleToNumber('commenter') })
+
+    expect(out).toEqual({ finalRole: 'writer', changed: false })
+    expect(vi.mocked(bumpEpoch)).not.toHaveBeenCalled()
+  })
+
+  it('admin + any request -> stays admin (owner/admin skip short-circuits before upsert)', async () => {
+    vi.mocked(resolveRole).mockResolvedValue('admin')
+    const out = await grantForwardAccess({ ...base, roleNum: roleToNumber('writer') })
+
+    expect(out).toEqual({ finalRole: 'admin', changed: false })
+    expect(vi.mocked(docMemberRepo.upsertGrantMax)).not.toHaveBeenCalled()
+    expect(vi.mocked(bumpEpoch)).not.toHaveBeenCalled()
+  })
+
+  it('rejects an out-of-enum roleNum (fail closed, no write)', async () => {
+    vi.mocked(resolveRole).mockResolvedValue('none')
+    await expect(grantForwardAccess({ ...base, roleNum: 99 })).rejects.toThrow(/invalid roleNum/)
+    expect(vi.mocked(docMemberRepo.upsertGrantMax)).not.toHaveBeenCalled()
+  })
 })

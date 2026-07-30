@@ -30,15 +30,25 @@ import { resolveRole } from '../../permission/resolveRole.js'
 import { grantForwardAccess } from '../services/grantForward.js'
 import { notifyDocAccessRequested } from '../services/docsNotify.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
-import { roleAtLeast, roleToNumber, type Role } from '../../permission/role.js'
+import { roleAtLeast, roleFromNumber, roleToNumber, isAccessRequestRole, type Role } from '../../permission/role.js'
 
 export const accessRequestsRouter: ExpressRouter = Router()
 
-const roleName = (n: number): string => (n === 2 ? 'writer' : 'reader')
+/** Serialize a persisted requested_role number; fail closed on an unknown value. */
+const roleName = (n: number): 'reader' | 'commenter' | 'writer' => {
+  const role = roleFromNumber(n)
+  if (role !== 'reader' && role !== 'commenter' && role !== 'writer') {
+    throw new Error(`doc_access_request has invalid requested_role ${n}`)
+  }
+  return role
+}
 
-/** Only reader|writer can be requested / approved (no commenter/admin). */
-function parseReqRole(v: unknown, fallback: 'reader' | 'writer' = 'reader'): 'reader' | 'writer' {
-  return v === 'reader' || v === 'writer' ? v : fallback
+/** Only reader|commenter|writer can be requested / approved (no admin). */
+function parseReqRole(
+  v: unknown,
+  fallback: 'reader' | 'commenter' | 'writer' = 'reader',
+): 'reader' | 'commenter' | 'writer' {
+  return isAccessRequestRole(v) ? v : fallback
 }
 
 /**
@@ -162,7 +172,7 @@ accessRequestsRouter.post(
       return
     }
     // Approver picks the level; default to what was requested.
-    const grantRole = parseReqRole((req.body ?? {}).role, roleName(Number(request.requested_role)) as 'reader' | 'writer')
+    const grantRole = parseReqRole((req.body ?? {}).role, roleName(Number(request.requested_role)))
 
     // Transition pending -> approved first; grant only on a genuine transition.
     const decided = await docAccessRequestRepo.decide({

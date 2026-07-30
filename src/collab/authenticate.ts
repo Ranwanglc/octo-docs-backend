@@ -14,7 +14,7 @@ import { verifyCollabToken } from '../auth/collabToken.js'
 import { currentEpoch } from '../permission/epoch.js'
 import { recheckCurrentRoleCached } from '../permission/recheck.js'
 import { parseDocumentName } from '../permission/documentName.js'
-import type { Role } from '../permission/role.js'
+import { type Role, roleAtLeast } from '../permission/role.js'
 
 /**
  * Auth rejection carrying the WS close-code semantics (§8.2). Hocuspocus reads
@@ -113,8 +113,12 @@ export async function authenticate(data: AuthInput): Promise<AuthContext> {
     throw forbidden() // 4403
   }
 
-  // 6. reader: set readOnly so writes are rejected BEFORE being applied (v4).
-  if (role === 'reader') {
+  // 6. non-writer (reader OR commenter): set readOnly so Yjs body writes are
+  //    rejected BEFORE being applied (v4). Commenting is a separate REST API and
+  //    is NOT a collab-doc write, so a commenter is read-only on the Yjs channel
+  //    exactly like a reader. This mirrors the beforeHandleMessage write recheck
+  //    (server.ts), which also gates the live socket on roleAtLeast(role,'writer').
+  if (!roleAtLeast(role, 'writer')) {
     connectionConfig.readOnly = true
   }
 

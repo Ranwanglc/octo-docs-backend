@@ -18,7 +18,12 @@ import { roleRank, type ResolvedRole } from './role.js'
 export const SHARE_SCOPE_RESTRICTED = 0
 export const SHARE_SCOPE_ANYONE = 1
 
-/** doc_meta.share_role values (reuse the reader=1 / writer=2 numeric space). */
+/**
+ * doc_meta.share_role values. This is an INDEPENDENT 2-value enum (read/edit),
+ * NOT the doc_member role space — it is deliberately NOT recoded by the four-role
+ * migration. EDIT is DERIVED to the doc role `writer` (roleRank('writer')=3) at
+ * comparison time (see effectiveRole below); the stored 1/2 never changes.
+ */
 export const SHARE_ROLE_READ = 1
 export const SHARE_ROLE_EDIT = 2
 

@@ -95,7 +95,7 @@ function validInvite() {
   return {
     invite_token: 'tok123',
     doc_id: 'd1',
-    role: 2, // writer
+    role: 3, // writer (ordered code 3)
     max_uses: 0,
     used_count: 0,
     status: 1, // ACTIVE
@@ -144,7 +144,7 @@ describe('bot invite accept /v1/bot/docs/invites/:token/accept (docs #61)', () =
     expect(upsertFromInviteTx.mock.calls[0]![1]).toMatchObject({
       docId: 'd1',
       uid: 'bot_1',
-      roleNum: 2,
+      roleNum: 3,
       inviteToken: 'tok123',
     })
   })

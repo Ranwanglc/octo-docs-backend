@@ -15,7 +15,7 @@ vi.mock('../src/config/env.js', () => ({
   },
 }))
 vi.mock('../src/db/repos/docMemberRepo.js', () => ({
-  ROLE_ADMIN: 3,
+  ROLE_ADMIN: 4,
   docMemberRepo: { list: vi.fn(async () => []) },
 }))
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
@@ -60,9 +60,9 @@ describe('notifyDocAccessRequested', () => {
   beforeEach(() => {
     cfg.notify.docsToken = 'internal-token'
     ;(docMemberRepo.list as ReturnType<typeof vi.fn>).mockResolvedValue([
-      { doc_id: 'doc-1', uid: 'u-admin', role: 3 },
-      { doc_id: 'doc-1', uid: 'u-writer', role: 2 }, // not admin -> excluded
-      { doc_id: 'doc-1', uid: 'u-owner', role: 3 }, // duplicate of owner -> de-duped
+      { doc_id: 'doc-1', uid: 'u-admin', role: 4 },
+      { doc_id: 'doc-1', uid: 'u-writer', role: 3 }, // not admin -> excluded
+      { doc_id: 'doc-1', uid: 'u-owner', role: 4 }, // duplicate of owner -> de-duped
     ])
     // Echo the single target back in delivered[] so each send counts as delivered.
     vi.stubGlobal(

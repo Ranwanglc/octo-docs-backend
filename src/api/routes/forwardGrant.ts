@@ -1,7 +1,7 @@
 /**
  * Forward-grant route (§2 / §9.1, doc_member max-merge).
  *
- *   POST /api/v1/docs/{docId}/forward-grant   { uid, role: "reader"|"writer" }
+ *   POST /api/v1/docs/{docId}/forward-grant   { uid, role: "reader"|"commenter"|"writer" }
  *
  * Single-uid granularity: the frontend calls this once per 1v1 recipient and,
  * for a group, loops over the host-expanded member-snapshot uids, aggregating
@@ -9,7 +9,7 @@
  *
  * Per-uid status contract:
  *   200 ok              — granted, upgraded, or already >= target (idempotent)
- *   400 bad request     — missing uid / role not reader|writer
+ *   400 bad request     — missing uid / role not reader|commenter|writer
  *   403 forbidden       — forwarder is NOT admin/owner (via requireDocRole(admin))
  *   404 user_not_found  — target uid is not a real octo user (anti ghost-member)
  *   404 not_found       — doc missing/deleted ; 409 conflict — archived
@@ -21,14 +21,14 @@
 import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
-import { roleToNumber } from '../../permission/role.js'
+import { roleToNumber, isForwardGrantRole } from '../../permission/role.js'
 import { grantForwardAccess } from '../services/grantForward.js'
 
 export const forwardGrantRouter: ExpressRouter = Router()
 
-/** Only reader|writer are grantable via forward (no commenter, admin not forward-grantable). */
-function parseGrantRole(v: unknown): 'reader' | 'writer' | null {
-  return v === 'reader' || v === 'writer' ? v : null
+/** Only reader|commenter|writer are grantable via forward (admin not forward-grantable). */
+function parseGrantRole(v: unknown): 'reader' | 'commenter' | 'writer' | null {
+  return isForwardGrantRole(v) ? v : null
 }
 
 forwardGrantRouter.post('/:docId/forward-grant', async (req: Request, res: Response) => {
@@ -44,7 +44,7 @@ forwardGrantRouter.post('/:docId/forward-grant', async (req: Request, res: Respo
   }
   const parsedRole = parseGrantRole(role)
   if (!parsedRole) {
-    res.status(400).json({ error: 'role must be reader|writer' })
+    res.status(400).json({ error: 'role must be reader|commenter|writer' })
     return
   }
 

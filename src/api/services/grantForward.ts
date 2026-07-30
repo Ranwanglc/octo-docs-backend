@@ -27,7 +27,7 @@ export interface GrantForwardParams {
   docId: string
   documentName: string
   uid: string
-  roleNum: number // 1=reader 2=writer (admin is not grantable via forward)
+  roleNum: number // ordered doc-role code: 1=reader 2=commenter 3=writer (admin is not grantable via forward)
   grantedBy: string
 }
 
@@ -39,6 +39,11 @@ export interface GrantForwardResult {
 }
 
 export async function grantForwardAccess(params: GrantForwardParams): Promise<GrantForwardResult> {
+  // Reject an illegal role number outright rather than silently coercing it —
+  // the write path must never persist an out-of-enum role (fail closed).
+  const requested = roleFromNumber(params.roleNum)
+  if (!requested) throw new Error(`grantForwardAccess: invalid roleNum ${params.roleNum}`)
+
   const current = await resolveRole(params.uid, params.docId)
   // owner (=> admin) or existing admin: keep as-is, no write, no misleading audit row.
   if (current === 'admin') {
@@ -55,7 +60,10 @@ export async function grantForwardAccess(params: GrantForwardParams): Promise<Gr
     await bumpEpoch(params.docId, params.documentName, params.uid)
   }
 
-  // Effective role = max(existing, granted). current is reader/writer/none here.
-  const finalNum = Math.max(roleRank(current), params.roleNum)
-  return { finalRole: roleFromNumber(finalNum) ?? 'reader', changed }
+  // Effective role = max(existing, granted). current is reader/commenter/writer/none
+  // here; compare by rank on the ordered encoding, then map the winner back to a
+  // role. GREATEST in the SQL already enforced the persisted max; this mirrors it
+  // for the response without a second read.
+  const finalRole: Role = roleRank(current) >= roleRank(requested) ? (current as Role) : requested
+  return { finalRole, changed }
 }

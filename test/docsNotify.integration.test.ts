@@ -27,11 +27,11 @@ vi.mock('../src/config/env.js', () => ({
   },
 }))
 vi.mock('../src/db/repos/docMemberRepo.js', () => ({
-  ROLE_ADMIN: 3,
+  ROLE_ADMIN: 4,
   docMemberRepo: {
     list: vi.fn(async () => [
-      { doc_id: 'doc-1', uid: 'u-admin', role: 3 },
-      { doc_id: 'doc-1', uid: 'u-owner', role: 3 },
+      { doc_id: 'doc-1', uid: 'u-admin', role: 4 },
+      { doc_id: 'doc-1', uid: 'u-owner', role: 4 },
     ]),
   },
 }))

@@ -9,14 +9,12 @@ import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { requireDocRole } from '../guard.js'
 import { bumpEpoch } from '../../permission/epoch.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
-import { roleToNumber, type Role } from '../../permission/role.js'
+import { roleFromNumber, roleToNumber, isMemberRole, type Role } from '../../permission/role.js'
 
 export const membersRouter: ExpressRouter = Router()
 
-const roleName = (n: number): string => (n === 3 ? 'admin' : n === 2 ? 'writer' : 'reader')
-
 function parseRole(v: unknown): Role | null {
-  return v === 'reader' || v === 'writer' || v === 'admin' ? v : null
+  return isMemberRole(v) ? v : null
 }
 
 /** GET members (needs admin). */
@@ -38,12 +36,18 @@ membersRouter.get('/:docId/members', async (req: Request, res: Response) => {
     // PUT that upserted the owner), drop it so the owner appears exactly once,
     // always as admin (owner is not downgradable), never as a duplicate row.
     .filter((m) => m.uid !== ownerId)
-    .map((m) => ({
-      uid: m.uid,
-      role: roleName(Number(m.role)),
-      source: m.source === 2 ? 'invite' : 'direct',
-      grantedBy: m.granted_by,
-    }))
+    .map((m) => {
+      // fail closed on an out-of-enum persisted value — never silently default
+      // to reader (which would mislabel/soft-open an unknown row).
+      const role = roleFromNumber(Number(m.role))
+      if (!role) throw new Error(`doc_member ${m.doc_id}/${m.uid} has invalid role ${m.role}`)
+      return {
+        uid: m.uid,
+        role,
+        source: m.source === 2 ? 'invite' : 'direct',
+        grantedBy: m.granted_by,
+      }
+    })
   res.status(200).json({
     items: [{ uid: ownerId, role: 'admin', source: 'owner', grantedBy: null }, ...directMembers],
   })
@@ -64,7 +68,7 @@ membersRouter.put('/:docId/members', async (req: Request, res: Response) => {
   }
   const parsedRole = parseRole(role)
   if (!parsedRole) {
-    res.status(400).json({ error: 'role must be reader|writer|admin' })
+    res.status(400).json({ error: 'role must be reader|commenter|writer|admin' })
     return
   }
   // verify target uid exists in octo (anti ghost-member). On the bot mount

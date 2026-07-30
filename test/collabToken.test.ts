@@ -45,6 +45,17 @@ describe('collab token sign/verify (§4.4)', () => {
     expect(() => verifyCollabToken('not-a-jwt')).toThrow()
   })
 
+  it('signs and verifies a commenter role (four-role encoding) round-trip', () => {
+    const { token, role } = signCollabToken({
+      uid: 'u_c',
+      documentName: 'octo:s_1:f_1:d_1',
+      role: 'commenter',
+      permission_epoch: 5,
+    })
+    expect(role).toBe('commenter')
+    expect(verifyCollabToken(token).role).toBe('commenter')
+  })
+
   it('signs and verifies a name claim (§4.7(b) / XIN-694) round-trip', () => {
     const result = signCollabToken({
       uid: 'u_12345',

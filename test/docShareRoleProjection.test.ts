@@ -37,12 +37,12 @@ beforeEach(() => {
 // The stored numerics the SQL inlines. Guard against a drift between the SQL
 // literals and the shared constants so the two can never diverge silently.
 describe('share-role projection constants stay pinned to shareScope.ts', () => {
-  it('anyone_in_space=1, edit=2, reader=1, writer=2, admin=3', () => {
+  it('anyone_in_space=1, edit=2, reader=1, writer=3, admin=4', () => {
     expect(SHARE_SCOPE_ANYONE).toBe(1)
     expect(SHARE_ROLE_EDIT).toBe(2)
     expect(ROLE_READER).toBe(1)
-    expect(ROLE_WRITER).toBe(2)
-    expect(ROLE_ADMIN).toBe(3)
+    expect(ROLE_WRITER).toBe(3)
+    expect(ROLE_ADMIN).toBe(4)
   })
 })
 
@@ -52,13 +52,13 @@ describe('docMetaRepo.listForUser — role CASE gains a share arm for a confirme
       uid: 'u_1', spaceId: 's1', isSpaceMember: true, page: 1, pageSize: 10, sort: 'updatedAt:desc',
     })
     const { sql, params } = itemsCall()
-    // owner short-circuits to admin(3); the share arm is RAISE-only over dm.role.
-    expect(sql).toMatch(/WHEN m\.owner_id = \? THEN 3/)
+    // owner short-circuits to admin(4); the share arm is RAISE-only over dm.role.
+    expect(sql).toMatch(/WHEN m\.owner_id = \? THEN 4/)
     expect(sql).toMatch(/GREATEST\(/)
     expect(sql).toMatch(/COALESCE\(dm\.role, 0\)/)
-    // anyone_in_space + EDIT => writer(2); any other share role => reader(1).
+    // anyone_in_space + EDIT => writer(3); any other share role => reader(1).
     expect(sql).toMatch(new RegExp(`m\\.share_scope = ${SHARE_SCOPE_ANYONE}`))
-    expect(sql).toMatch(new RegExp(`m\\.share_role = ${SHARE_ROLE_EDIT} THEN 2 ELSE 1`))
+    expect(sql).toMatch(new RegExp(`m\\.share_role = ${SHARE_ROLE_EDIT} THEN 3 ELSE 1`))
     // the share arm inlines numeric constants (no bind), so the SINGLE leading
     // owner-uid bind is unchanged — paging/args stay stable.
     expect(sql).not.toMatch(/m\.share_scope = \?/)
@@ -79,7 +79,7 @@ describe('docMetaRepo.listForUser — role CASE gains a share arm for a confirme
       uid: 'u_1', spaceId: 's1', isSpaceMember: false, page: 1, pageSize: 10, sort: 'updatedAt:desc',
     })
     const { sql } = itemsCall()
-    expect(sql).toMatch(/CASE WHEN m\.owner_id = \? THEN 3 ELSE dm\.role END/)
+    expect(sql).toMatch(/CASE WHEN m\.owner_id = \? THEN 4 ELSE dm\.role END/)
     expect(sql).not.toMatch(/GREATEST\(/)
     expect(sql).not.toMatch(/share_role/)
   })
@@ -98,13 +98,13 @@ describe('docViewHistoryRepo.listRecent — role CASE gains a same-space-guarded
   it('a member gets the share projection, guarded by m.space_id = v.space_id', async () => {
     await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', isSpaceMember: true, pageSize: 10 })
     const { sql, params } = itemsCall()
-    expect(sql).toMatch(/WHEN m\.owner_id = \? THEN 3/)
+    expect(sql).toMatch(/WHEN m\.owner_id = \? THEN 4/)
     expect(sql).toMatch(/GREATEST\(/)
     expect(sql).toMatch(/COALESCE\(dm\.role, 0\)/)
     // the recent list keeps the same-space guard on the share arm, matching the
     // visibility predicate: a doc shared in ANOTHER space never gets a label.
     expect(sql).toMatch(new RegExp(`m\\.share_scope = ${SHARE_SCOPE_ANYONE} AND m\\.space_id = v\\.space_id`))
-    expect(sql).toMatch(new RegExp(`m\\.share_role = ${SHARE_ROLE_EDIT} THEN 2 ELSE 1`))
+    expect(sql).toMatch(new RegExp(`m\\.share_role = ${SHARE_ROLE_EDIT} THEN 3 ELSE 1`))
     // items binds still lead with (role-CASE uid, join uid, ...) — arm adds none.
     expect(params[0]).toBe('u_1')
     expect(params[1]).toBe('u_1')
@@ -113,7 +113,7 @@ describe('docViewHistoryRepo.listRecent — role CASE gains a same-space-guarded
   it('a NON-member keeps the plain CASE — no share arm', async () => {
     await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', isSpaceMember: false, pageSize: 10 })
     const { sql } = itemsCall()
-    expect(sql).toMatch(/CASE WHEN m\.owner_id = \? THEN 3 ELSE dm\.role END/)
+    expect(sql).toMatch(/CASE WHEN m\.owner_id = \? THEN 4 ELSE dm\.role END/)
     expect(sql).not.toMatch(/GREATEST\(/)
     expect(sql).not.toMatch(/share_role/)
   })

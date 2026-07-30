@@ -111,7 +111,7 @@ describe('POST /:docId/forward-grant', () => {
     expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
   })
 
-  it('role=admin is rejected (only reader|writer forward-grantable) -> 400', async () => {
+  it('role=admin is rejected (only reader|commenter|writer forward-grantable) -> 400', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(okGuard)
     stubIdentity({ u_real: { uid: 'u_real', name: 'Real' } })
     const res = mockRes()
@@ -119,6 +119,35 @@ describe('POST /:docId/forward-grant', () => {
 
     expect(res.statusCode).toBe(400)
     expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
+  })
+
+  it('admin grants commenter to a real user -> 200, roleNum=2 (ordered code)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    stubIdentity({ u_real: { uid: 'u_real', name: 'Real' } })
+    vi.mocked(grantForwardAccess).mockResolvedValue({ finalRole: 'commenter', changed: true })
+    const res = mockRes()
+    await handler()(req({ uid: 'u_real', role: 'commenter' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toEqual({ ok: true, role: 'commenter', changed: true })
+    expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith({
+      docId: 'd_1',
+      documentName: 'doc-d_1',
+      uid: 'u_real',
+      roleNum: 2,
+      grantedBy: 'u_admin',
+    })
+  })
+
+  it('admin grants writer to a real user -> roleNum=3 (ordered code)', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    stubIdentity({ u_real: { uid: 'u_real', name: 'Real' } })
+    vi.mocked(grantForwardAccess).mockResolvedValue({ finalRole: 'writer', changed: true })
+    const res = mockRes()
+    await handler()(req({ uid: 'u_real', role: 'writer' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(vi.mocked(grantForwardAccess).mock.calls.at(-1)![0]).toMatchObject({ roleNum: 3 })
   })
 
   it('ghost uid (not a real octo user) -> 404 user_not_found', async () => {

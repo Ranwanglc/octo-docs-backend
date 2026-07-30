@@ -149,8 +149,39 @@ describe('POST /:docId/access-requests — submit', () => {
     expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith({
       docId: 'd_1',
       uid: 'u_applicant',
-      requestedRoleNum: 2,
+      requestedRoleNum: 3,
       reason: 'need edit',
+    })
+  })
+
+  it('commenter request -> 201 pending, requestedRoleNum=2 (ordered code)', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1' } as never)
+    vi.mocked(resolveRole).mockResolvedValue('reader')
+    vi.mocked(docAccessRequestRepo.submit).mockResolvedValue({ requestId: 'req_c', status: 1 })
+    const res = mockRes()
+    await submitHandler()(req({ requestedRole: 'commenter' }), res as never)
+    expect(res.statusCode).toBe(201)
+    expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith({
+      docId: 'd_1',
+      uid: 'u_applicant',
+      requestedRoleNum: 2,
+      reason: '',
+    })
+  })
+
+  it('admin request is not requestable -> falls back to reader (never admin)', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1' } as never)
+    vi.mocked(resolveRole).mockResolvedValue('none')
+    vi.mocked(docAccessRequestRepo.submit).mockResolvedValue({ requestId: 'req_a', status: 1 })
+    const res = mockRes()
+    await submitHandler()(req({ requestedRole: 'admin' }), res as never)
+    expect(res.statusCode).toBe(201)
+    // 'admin' is rejected by isAccessRequestRole -> default 'reader' (code 1).
+    expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith({
+      docId: 'd_1',
+      uid: 'u_applicant',
+      requestedRoleNum: 1,
+      reason: '',
     })
   })
 })
@@ -165,7 +196,7 @@ describe('GET /:docId/access-requests — list pending (admin)', () => {
       {
         doc_id: 'd_1',
         uid: 'u_applicant',
-        requested_role: 2,
+        requested_role: 3,
         reason: 'edit pls',
         status: 1,
         request_id: 'req_x',
@@ -221,7 +252,7 @@ describe('POST /:docId/access-requests/:requestId/approve', () => {
       docId: 'd_1',
       documentName: 'doc-d_1',
       uid: 'u_applicant',
-      roleNum: 2,
+      roleNum: 3,
       grantedBy: 'u_admin',
     })
     expect(vi.mocked(docAccessRequestRepo.decide)).toHaveBeenCalledWith({

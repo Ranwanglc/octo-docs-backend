@@ -10,7 +10,7 @@ import {
   SHARE_ROLE_READ,
   SHARE_ROLE_EDIT,
 } from '../src/permission/shareScope.js'
-import type { ResolvedRole } from '../src/permission/role.js'
+import { roleRank, type ResolvedRole } from '../src/permission/role.js'
 
 /**
  * effectiveRole unit matrix (#64, design §5.1 / §5.2). This is the single new
@@ -126,5 +126,24 @@ describe('share enum mappers — fail-safe names + strict wire parsing', () => {
     expect(parseShareRole('admin')).toBeNull()
     expect(parseShareRole(2)).toBeNull()
     expect(parseShareRole(undefined)).toBeNull()
+  })
+})
+
+// The share_role enum (1=read/2=edit) is INDEPENDENT of the four-level doc-role
+// recode: EDIT still DERIVES the string 'writer', which now ranks 3 in the
+// ordered encoding. A commenter direct role sits between reader and the derived
+// writer, so an edit share RAISES a commenter to writer, while a read share does
+// not lower a commenter.
+describe('share edit derives writer under the four-level encoding', () => {
+  it('edit share derives writer, and writer ranks 3', () => {
+    expect(effectiveRole('none', true, SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT)).toBe('writer')
+    expect(roleRank('writer')).toBe(3)
+    expect(roleRank('commenter')).toBe(2)
+  })
+  it('commenter direct + edit share => RAISED to writer (share wins by rank)', () => {
+    expect(effectiveRole('commenter', true, SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT)).toBe('writer')
+  })
+  it('commenter direct + read share => stays commenter (base wins, never lowered)', () => {
+    expect(effectiveRole('commenter', true, SHARE_SCOPE_ANYONE, SHARE_ROLE_READ)).toBe('commenter')
   })
 })

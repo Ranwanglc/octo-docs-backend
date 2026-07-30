@@ -11,7 +11,7 @@
 --
 -- Tables:
 --   doc_meta              business metadata (title/owner/space/folder/epoch)
---   doc_member            document-autonomous membership (reader/writer/admin)
+--   doc_member            document-autonomous membership (reader/commenter/writer/admin)
 --   doc_invite            link invites
 --   doc_invite_redemption invite redemption ledger (idempotency / audit)
 --   yjs_document          Y.Doc binary authoritative state (single merged row)
@@ -65,7 +65,7 @@ CREATE TABLE doc_meta (
 CREATE TABLE doc_member (
   doc_id        VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id
   uid           VARCHAR(64)  NOT NULL,            -- 被授权的 Octo user id（可信 uid，来源见 §4.4 / §4.6）
-  role          TINYINT      NOT NULL,            -- 1=reader 2=writer 3=admin
+  role          TINYINT      NOT NULL,            -- 有序编码：1=reader 2=commenter 3=writer 4=admin
   granted_by    VARCHAR(64)  NOT NULL,            -- 授权人 uid（直接添加为 owner/admin；链接邀请为 doc_invite.created_by）
   source        TINYINT      NOT NULL DEFAULT 1,  -- 1=direct(直接添加) 2=invite(经 doc_invite 接受)
   invite_token  VARCHAR(64)  NOT NULL DEFAULT '', -- 经邀请加入时记录来源 token（审计/回收），direct 为空
@@ -73,14 +73,15 @@ CREATE TABLE doc_member (
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (doc_id, uid),                      -- 一个 uid 对一个 doc 至多一行（role 升降走 UPDATE）
   KEY idx_uid (uid, role),                        -- 「我能访问哪些 doc」列表页/反查
-  KEY idx_doc_role (doc_id, role)
+  KEY idx_doc_role (doc_id, role),
+  CONSTRAINT chk_doc_member_role CHECK (role IN (1, 2, 3, 4))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 链接邀请（v2.0 新增）：一个 token 携带授予 role，仅【已注册 octo 用户】可接受（见 §4.6 接受流程）。
 CREATE TABLE doc_invite (
   invite_token  VARCHAR(64)  NOT NULL,            -- 邀请 token（高熵随机串，进 URL）
   doc_id        VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id
-  role          TINYINT      NOT NULL DEFAULT 2,  -- 授予 role：1=reader 2=writer(默认) 3=admin
+  role          TINYINT      NOT NULL DEFAULT 3,  -- 授予 role（有序编码）：1=reader 2=commenter 3=writer(默认) 4=admin
   max_uses      INT          NOT NULL DEFAULT 0,  -- 最大可用次数；0 表示不限次（按 expires_at 控制）
   used_count    INT          NOT NULL DEFAULT 0,  -- 已被接受次数（每成功 accept +1，原子自增并校验上限）
   expires_at    DATETIME(3)  NULL,                -- 过期时间；NULL 表示不过期（仍可被 revoke）
@@ -89,7 +90,8 @@ CREATE TABLE doc_invite (
   created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (invite_token),
-  KEY idx_doc (doc_id, status)
+  KEY idx_doc (doc_id, status),
+  CONSTRAINT chk_doc_invite_role CHECK (role IN (1, 2, 3, 4))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 可选：邀请接受流水（幂等去重 + 审计；防同一 uid 重复消耗 used_count）。
@@ -107,7 +109,7 @@ CREATE TABLE doc_invite_redemption (
 CREATE TABLE doc_access_request (
   doc_id         VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id
   uid            VARCHAR(64)  NOT NULL,            -- 申请人可信 uid（authMiddleware 注入，绝非请求体）
-  requested_role TINYINT      NOT NULL DEFAULT 1,  -- 1=reader 2=writer（无 commenter/admin 申请）
+  requested_role TINYINT      NOT NULL DEFAULT 1,  -- 有序编码：1=reader 2=commenter 3=writer（无 admin 申请）
   reason         VARCHAR(512) NOT NULL DEFAULT '',
   status         TINYINT      NOT NULL DEFAULT 1,  -- 1=pending 2=approved 3=denied 4=cancelled
   request_id     VARCHAR(64)  NOT NULL,            -- 高熵 id，供 approve/deny 路由寻址
@@ -117,7 +119,8 @@ CREATE TABLE doc_access_request (
   updated_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (doc_id, uid),                       -- 一个 uid 对一个 doc 至多一条申请（重复申请 UPDATE 复用）
   UNIQUE KEY uk_request_id (request_id),
-  KEY idx_doc_status (doc_id, status)              -- admin 拉「某文档 pending 申请」
+  KEY idx_doc_status (doc_id, status),             -- admin 拉「某文档 pending 申请」
+  CONSTRAINT chk_doc_access_request_role CHECK (requested_role IN (1, 2, 3))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 【迁移说明：doc_acl → doc_member】

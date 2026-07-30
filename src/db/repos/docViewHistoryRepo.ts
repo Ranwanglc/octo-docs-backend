@@ -20,6 +20,7 @@
  */
 import { query, transaction } from '../pool.js'
 import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
+import { ROLE_READER, ROLE_WRITER, ROLE_ADMIN } from '../../permission/role.js'
 
 /** A recent-view row joined with its doc_meta business columns. */
 export interface RecentViewItem {
@@ -117,12 +118,14 @@ function visibilityPredicate(isSpaceMember: boolean): string {
 
 /**
  * Role projection for the recent list — the read-side twin of `effectiveRole`
- * (shareScope.ts). owner => admin(3); otherwise the MAX of the direct doc_member
+ * (shareScope.ts). owner => admin(4); otherwise the MAX of the direct doc_member
  * role and the share-derived role. A doc that is visible ONLY via the space-share
  * branch has no doc_member row (dm.role NULL), so without the share arm its role
  * collapses to Number(null)=0 => reader in the route — mislabeling an EDIT-shared
  * doc as read-only. GREATEST(COALESCE(...)) keeps the share path RAISE-only, so a
- * direct writer/admin is never lowered by a reader share.
+ * direct writer/admin is never lowered by a reader share. The role numbers are
+ * the ORDERED doc-role codes (ROLE_*): owner => ROLE_ADMIN(4), an EDIT share
+ * derives ROLE_WRITER(3), any other share ROLE_READER(1).
  *
  * The share arm carries the SAME same-space guard as the visibility predicate
  * (`m.share_scope = ANYONE AND m.space_id = v.space_id`) and is only emitted when
@@ -133,14 +136,14 @@ function visibilityPredicate(isSpaceMember: boolean): string {
  */
 function roleProjection(isSpaceMember: boolean): string {
   return isSpaceMember
-    ? `CASE WHEN m.owner_id = ? THEN 3
+    ? `CASE WHEN m.owner_id = ? THEN ${ROLE_ADMIN}
             ELSE GREATEST(
               COALESCE(dm.role, 0),
               CASE WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id
-                   THEN (CASE WHEN m.share_role = ${SHARE_ROLE_EDIT} THEN 2 ELSE 1 END)
+                   THEN (CASE WHEN m.share_role = ${SHARE_ROLE_EDIT} THEN ${ROLE_WRITER} ELSE ${ROLE_READER} END)
                    ELSE 0 END
             ) END`
-    : 'CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END'
+    : `CASE WHEN m.owner_id = ? THEN ${ROLE_ADMIN} ELSE dm.role END`
 }
 
 export const docViewHistoryRepo = {

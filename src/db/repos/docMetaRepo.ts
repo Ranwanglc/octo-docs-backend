@@ -7,6 +7,7 @@
  */
 import { query, transaction, type Tx } from '../pool.js'
 import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
+import { ROLE_READER, ROLE_WRITER, ROLE_ADMIN } from '../../permission/role.js'
 
 /**
  * True when a thrown DB error is a duplicate-key violation. mysql2 surfaces it
@@ -247,7 +248,7 @@ export const docMetaRepo = {
    *
    * `owner: 'me'` (FEAT-B "my documents") tightens visibility to STRICTLY the
    * docs the caller owns (owner_id == uid) and drops the shared-with-me branch —
-   * role is then always admin(3). `q` (FEAT-B filename search) adds a
+   * role is then always admin(4). `q` (FEAT-B filename search) adds a
    * case-insensitive substring match on title with LIKE wildcards escaped so a
    * user-typed `%`/`_`/`\` matches literally. `types` (FEAT-B/XIN-1188 kind
    * filter) narrows to a multi-value OR set of `doc_type`s at the same layer as
@@ -273,7 +274,7 @@ export const docMetaRepo = {
     // their bind values in clause order so the full args array lines up
     // positionally with the SQL.
     const filterArgs: unknown[] = []
-    // role: owner => admin(3), else doc_member.role
+    // role: owner => admin(4), else doc_member.role
     // Space isolation (P1): listing is always scoped to the caller's space; the
     // space filter is unconditional now that spaceId is required (sourced from
     // the enforced X-Space-Id header). Docs in other spaces are never returned.
@@ -360,25 +361,28 @@ export const docMetaRepo = {
 
     // tie-break on doc_id keeps offset paging stable when rows share updated_at.
     // role projection MUST mirror the write side (effectiveRole, shareScope.ts):
-    // owner => admin(3); otherwise the MAX of the direct doc_member role and the
+    // owner => admin(4); otherwise the MAX of the direct doc_member role and the
     // share-derived role. When the caller is a confirmed Space member and the doc
-    // is anyone_in_space, an EDIT share yields writer(2) / any other share yields
+    // is anyone_in_space, an EDIT share yields writer(3) / any other share yields
     // reader(1) — so a share-only doc (no doc_member row => dm.role NULL) is
     // labeled writer, not silently reader (Number(null)=0). GREATEST(COALESCE...)
     // keeps the share path RAISE-only: a direct writer/admin is never lowered by a
     // reader share. The share arm is only present on the same includeSpaceShare
     // gate as the visibility predicate, so a non-member never gets a share label.
-    // SHARE_SCOPE_ANYONE / SHARE_ROLE_EDIT are numeric constants inlined (no bind),
-    // so the leading owner-uid bind is identical whether or not the arm is present.
+    // The role numbers are the ORDERED doc-role codes (ROLE_*), NOT the share_role
+    // enum: an EDIT share DERIVES writer=ROLE_WRITER(3), any other share yields
+    // ROLE_READER(1); owner => ROLE_ADMIN(4). SHARE_SCOPE_ANYONE / SHARE_ROLE_EDIT
+    // and the ROLE_* codes are numeric constants inlined (no bind), so the leading
+    // owner-uid bind is identical whether or not the arm is present.
     const roleExpr = includeSpaceShare
-      ? `CASE WHEN m.owner_id = ? THEN 3
+      ? `CASE WHEN m.owner_id = ? THEN ${ROLE_ADMIN}
               ELSE GREATEST(
                 COALESCE(dm.role, 0),
                 CASE WHEN m.share_scope = ${SHARE_SCOPE_ANYONE}
-                     THEN (CASE WHEN m.share_role = ${SHARE_ROLE_EDIT} THEN 2 ELSE 1 END)
+                     THEN (CASE WHEN m.share_role = ${SHARE_ROLE_EDIT} THEN ${ROLE_WRITER} ELSE ${ROLE_READER} END)
                      ELSE 0 END
               ) END`
-      : 'CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END'
+      : `CASE WHEN m.owner_id = ? THEN ${ROLE_ADMIN} ELSE dm.role END`
     const items = await query<DocMeta & { role: number }>(
       `SELECT m.*, ${roleExpr} AS role
        ${base}

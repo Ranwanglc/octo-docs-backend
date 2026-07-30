@@ -103,6 +103,45 @@ function reqWith(body: Record<string, unknown>) {
   } as never
 }
 
+describe('POST /api/v1/docs/:docId/invites — four-role parse (ordered codes)', () => {
+  beforeEach(() => {
+    vi.mocked(requireDocRole).mockResolvedValue({ meta: {}, role: 'admin' } as never)
+  })
+
+  // Pull the roleNum bound to docInviteRepo.create on its last call.
+  const lastRoleNum = () =>
+    (vi.mocked(docInviteRepo.create).mock.calls.at(-1)![0] as { roleNum: number }).roleNum
+
+  it('commenter -> roleNum 2, echoed role commenter', async () => {
+    const res = mockRes()
+    await createInviteHandler()(reqWith({ role: 'commenter' }), res as never)
+    expect(res.statusCode).toBe(201)
+    expect((res.body as Record<string, unknown>).role).toBe('commenter')
+    expect(lastRoleNum()).toBe(2)
+  })
+
+  it('writer -> roleNum 3', async () => {
+    const res = mockRes()
+    await createInviteHandler()(reqWith({ role: 'writer' }), res as never)
+    expect((res.body as Record<string, unknown>).role).toBe('writer')
+    expect(lastRoleNum()).toBe(3)
+  })
+
+  it('admin -> roleNum 4 (admin IS invitable, unlike forward/access)', async () => {
+    const res = mockRes()
+    await createInviteHandler()(reqWith({ role: 'admin' }), res as never)
+    expect((res.body as Record<string, unknown>).role).toBe('admin')
+    expect(lastRoleNum()).toBe(4)
+  })
+
+  it('unknown/missing role -> defaults to writer (roleNum 3)', async () => {
+    const res = mockRes()
+    await createInviteHandler()(reqWith({ role: 'bogus' }), res as never)
+    expect((res.body as Record<string, unknown>).role).toBe('writer')
+    expect(lastRoleNum()).toBe(3)
+  })
+})
+
 // Pull the expiresAt Date passed to docInviteRepo.create on its last call.
 function lastCreateExpiresAt(): Date {
   const call = vi.mocked(docInviteRepo.create).mock.calls.at(-1)!

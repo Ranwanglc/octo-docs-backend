@@ -50,6 +50,21 @@ describe('invite accept branches (§4.6 step 4)', () => {
     const d = decideAcceptBranch({ invite: invite({ role: 'reader' }), curRole: 'reader', redeemed: false, docExists: true, nowMs: NOW })
     expect(d).toEqual({ kind: 'noop', role: 'reader' })
   })
+
+  it('commenter invite, no current role => first accept as commenter', () => {
+    const d = decideAcceptBranch({ invite: invite({ role: 'commenter' }), curRole: 'none', redeemed: false, docExists: true, nowMs: NOW })
+    expect(d).toEqual({ kind: 'first', role: 'commenter' })
+  })
+
+  it('writer is NOT downgraded by a commenter invite (branch a: writer >= commenter)', () => {
+    const d = decideAcceptBranch({ invite: invite({ role: 'commenter' }), curRole: 'writer', redeemed: false, docExists: true, nowMs: NOW })
+    expect(d).toEqual({ kind: 'noop', role: 'writer' })
+  })
+
+  it('commenter is NOT auto-upgraded by a writer invite (branch b: commenter < writer, no auto-upgrade)', () => {
+    const d = decideAcceptBranch({ invite: invite({ role: 'writer' }), curRole: 'commenter', redeemed: false, docExists: true, nowMs: NOW })
+    expect(d).toEqual({ kind: 'noop', role: 'commenter' })
+  })
 })
 
 describe('invite accept gates (§4.6 step 2)', () => {

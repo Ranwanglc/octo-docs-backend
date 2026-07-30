@@ -134,6 +134,42 @@ describe('PUT /api/v1/docs/:docId/members — anti ghost-member check', () => {
     expect(res.statusCode).toBe(200)
     expect(getUser).toHaveBeenCalledWith('u_real', 'tok-xyz')
   })
+
+  it('accepts a commenter add (four-role) -> 200 ok with roleNum=2 (ordered code)', async () => {
+    stubIdentity({ u_real: { uid: 'u_real', name: 'Real User' } })
+    const res = mockRes()
+    await putMemberHandler()(req({ uid: 'u_real', role: 'commenter' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(vi.mocked(docMemberRepo.upsertDirect)).toHaveBeenCalledTimes(1)
+    // commenter is the ordered code 2 (reader=1 commenter=2 writer=3 admin=4).
+    expect(vi.mocked(docMemberRepo.upsertDirect).mock.calls[0]![0]).toMatchObject({
+      uid: 'u_real',
+      roleNum: 2,
+    })
+  })
+
+  it('accepts an admin add -> roleNum=4 (ordered code)', async () => {
+    stubIdentity({ u_real: { uid: 'u_real', name: 'Real User' } })
+    const res = mockRes()
+    await putMemberHandler()(req({ uid: 'u_real', role: 'admin' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(vi.mocked(docMemberRepo.upsertDirect).mock.calls[0]![0]).toMatchObject({
+      uid: 'u_real',
+      roleNum: 4,
+    })
+  })
+
+  it('rejects an unknown role -> 400 (fail closed, never defaults to reader)', async () => {
+    stubIdentity({ u_real: { uid: 'u_real', name: 'Real User' } })
+    const res = mockRes()
+    await putMemberHandler()(req({ uid: 'u_real', role: 'superuser' }), res as never)
+
+    expect(res.statusCode).toBe(400)
+    expect(res.body).toEqual({ error: 'role must be reader|commenter|writer|admin' })
+    expect(vi.mocked(docMemberRepo.upsertDirect)).not.toHaveBeenCalled()
+  })
 })
 
 // GET list-members synthesizes the implicit owner (§4.2). The owner is an
@@ -179,7 +215,7 @@ describe('GET /api/v1/docs/:docId/members — synthesized owner row', () => {
       // Historical PUT upserted the owner as a writer direct row — must NOT
       // surface as a second item, and must stay admin (owner not downgradable).
       vi.mocked(docMemberRepo.list).mockResolvedValue([
-        { uid: 'u_owner', role: 2, source: 1, granted_by: 'u_owner' },
+        { uid: 'u_owner', role: 3, source: 1, granted_by: 'u_owner' },
       ] as never)
       const res = mockRes()
       await getMembersHandler()(getReq(), res as never)
@@ -195,7 +231,8 @@ describe('GET /api/v1/docs/:docId/members — synthesized owner row', () => {
     for (const docType of docTypes) {
       guardWithOwner('u_owner', docType)
       vi.mocked(docMemberRepo.list).mockResolvedValue([
-        { uid: 'u_writer', role: 2, source: 1, granted_by: 'u_owner' }, // direct writer
+        { uid: 'u_writer', role: 3, source: 1, granted_by: 'u_owner' }, // direct writer (ordered code 3)
+        { uid: 'u_commenter', role: 2, source: 1, granted_by: 'u_owner' }, // direct commenter (ordered code 2)
         { uid: 'u_reader', role: 1, source: 2, granted_by: 'u_admin' }, // invite reader
       ] as never)
       const res = mockRes()
@@ -205,6 +242,7 @@ describe('GET /api/v1/docs/:docId/members — synthesized owner row', () => {
       expect((res.body as { items: unknown[] }).items).toEqual([
         { uid: 'u_owner', role: 'admin', source: 'owner', grantedBy: null },
         { uid: 'u_writer', role: 'writer', source: 'direct', grantedBy: 'u_owner' },
+        { uid: 'u_commenter', role: 'commenter', source: 'direct', grantedBy: 'u_owner' },
         { uid: 'u_reader', role: 'reader', source: 'invite', grantedBy: 'u_admin' },
       ])
     }

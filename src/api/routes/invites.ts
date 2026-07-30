@@ -9,16 +9,21 @@ import { Router, type Router as ExpressRouter, type Request, type Response } fro
 import { docInviteRepo } from '../../db/repos/docInviteRepo.js'
 import { requireDocRole } from '../guard.js'
 import { newInviteToken } from '../../util/ids.js'
-import { roleToNumber, type Role } from '../../permission/role.js'
+import { roleFromNumber, roleToNumber, isMemberRole, type Role } from '../../permission/role.js'
 import { acceptInvite, acceptInviteForUid } from '../services/acceptInvite.js'
 import { extractOctoToken } from '../middleware/auth.js'
 
 export const invitesRouter: ExpressRouter = Router()
 
-const roleName = (n: number): string => (n === 3 ? 'admin' : n === 2 ? 'writer' : 'reader')
+/** Serialize a persisted invite role number to its wire string; fail closed on an unknown value. */
+const roleName = (n: number): string => {
+  const role = roleFromNumber(n)
+  if (!role) throw new Error(`doc_invite has invalid role ${n}`)
+  return role
+}
 
 function parseRole(v: unknown): Role {
-  return v === 'reader' || v === 'admin' ? v : 'writer' // default writer (§4.6)
+  return isMemberRole(v) ? v : 'writer' // default writer (§4.6)
 }
 
 const DEFAULT_EXPIRES_IN_DAYS = 3

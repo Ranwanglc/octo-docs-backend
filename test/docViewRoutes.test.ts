@@ -89,10 +89,10 @@ describe('GET /docs/recent — listRecentHandler', () => {
       total: 2,
       nextCursor: 'CURSOR',
       items: [
-        { doc_id: 'd_1', title: 'A', owner_id: 'u_o', doc_type: 'doc', role: 2,
+        { doc_id: 'd_1', title: 'A', owner_id: 'u_o', doc_type: 'doc', role: 3,
           updated_at: new Date('2026-07-10T00:00:00.000Z'), updated_by: 'u_e1',
           viewed_at: new Date('2026-07-15T06:00:00.000Z') },
-        { doc_id: 'd_2', title: 'B', owner_id: 'u_1', doc_type: 'board', role: 3,
+        { doc_id: 'd_2', title: 'B', owner_id: 'u_1', doc_type: 'board', role: 4,
           updated_at: new Date('2026-07-11T00:00:00.000Z'), updated_by: 'u_e2',
           viewed_at: new Date('2026-07-15T05:00:00.000Z') },
       ],
