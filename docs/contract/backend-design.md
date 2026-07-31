@@ -413,12 +413,17 @@ CREATE TABLE doc_meta (
   KEY idx_owner (owner_id, status, updated_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+> 四角色编码是硬切换：先停止所有读写 role 的实例，再运行
+> `2026-07-30-recode-doc-roles.sql`，成功后才启动新实例。数据库以
+> `octo_schema_metadata.doc_role_encoding=v2` 为权威标记；缺失标记时只有三个
+> CHECK 精确呈现 v1 域才允许迁移，其他情况必须中止，不得从行值推测。
+
 -- 文档自治成员（v2.0 新增，替代 v1.x 的 doc_acl —— 见下方迁移说明）
 -- 把 uid 按 role 直接授到某 doc；resolveRole 仅查此表 + owner（§4.2），不再做 octo 群继承。
 CREATE TABLE doc_member (
   doc_id        VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id
   uid           VARCHAR(64)  NOT NULL,            -- 被授权的 Octo user id（可信 uid，来源见 §4.4 / §4.6）
-  role          TINYINT      NOT NULL,            -- 1=reader 2=writer 3=admin
+  role          TINYINT      NOT NULL,            -- 1=reader 2=commenter 3=writer 4=admin
   granted_by    VARCHAR(64)  NOT NULL,            -- 授权人 uid（直接添加为 owner/admin；链接邀请为 doc_invite.created_by）
   source        TINYINT      NOT NULL DEFAULT 1,  -- 1=direct(直接添加) 2=invite(经 doc_invite 接受)
   invite_token  VARCHAR(64)  NOT NULL DEFAULT '', -- 经邀请加入时记录来源 token（审计/回收），direct 为空
@@ -433,7 +438,7 @@ CREATE TABLE doc_member (
 CREATE TABLE doc_invite (
   invite_token  VARCHAR(64)  NOT NULL,            -- 邀请 token（高熵随机串，进 URL）
   doc_id        VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id
-  role          TINYINT      NOT NULL DEFAULT 2,  -- 授予 role：1=reader 2=writer(默认) 3=admin
+  role          TINYINT      NOT NULL DEFAULT 3,  -- 授予 role：1=reader 2=commenter 3=writer(默认) 4=admin
   max_uses      INT          NOT NULL DEFAULT 0,  -- 最大可用次数；0 表示不限次（按 expires_at 控制）
   used_count    INT          NOT NULL DEFAULT 0,  -- 已被接受次数（每成功 accept +1，原子自增并校验上限）
   expires_at    DATETIME(3)  NULL,                -- 过期时间；NULL 表示不过期（仍可被 revoke）

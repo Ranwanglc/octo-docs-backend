@@ -53,7 +53,7 @@ describe('docMetaRepo.listForUser — role CASE gains a share arm for a confirme
     })
     const { sql, params } = itemsCall()
     // owner short-circuits to admin(4); the share arm is RAISE-only over dm.role.
-    expect(sql).toMatch(/WHEN m\.owner_id = \? THEN 4/)
+    expect(sql).toMatch(/WHEN m\.owner_id IN \(\?\) THEN 4/)
     expect(sql).toMatch(/GREATEST\(/)
     expect(sql).toMatch(/COALESCE\(dm\.role, 0\)/)
     // anyone_in_space + EDIT => writer(3); any other share role => reader(1).
@@ -62,7 +62,7 @@ describe('docMetaRepo.listForUser — role CASE gains a share arm for a confirme
     // the share arm inlines numeric constants (no bind), so the SINGLE leading
     // owner-uid bind is unchanged — paging/args stay stable.
     expect(sql).not.toMatch(/m\.share_scope = \?/)
-    expect(params[0]).toBe('u_1')
+    expect(params).toEqual(['u_1', 'u_1', 's1', 'u_1'])
 
     // the share arm must add NO positional bind: a member's items binds match a
     // non-member's exactly (CASE owner uid + join uid + visibility owner uid).
@@ -79,7 +79,7 @@ describe('docMetaRepo.listForUser — role CASE gains a share arm for a confirme
       uid: 'u_1', spaceId: 's1', isSpaceMember: false, page: 1, pageSize: 10, sort: 'updatedAt:desc',
     })
     const { sql } = itemsCall()
-    expect(sql).toMatch(/CASE WHEN m\.owner_id = \? THEN 4 ELSE dm\.role END/)
+    expect(sql).toMatch(/CASE WHEN m\.owner_id IN \(\?\) THEN 4 ELSE dm\.role END/)
     expect(sql).not.toMatch(/GREATEST\(/)
     expect(sql).not.toMatch(/share_role/)
   })
@@ -91,6 +91,27 @@ describe('docMetaRepo.listForUser — role CASE gains a share arm for a confirme
     const { sql } = itemsCall()
     expect(sql).not.toMatch(/GREATEST\(/)
     expect(sql).not.toMatch(/share_role/)
+  })
+
+  it('owner=me projects caller-owned bot documents as admin with exact bind ordering', async () => {
+    await docMetaRepo.listForUser({
+      uid: 'u_1',
+      spaceId: 's1',
+      owner: 'me',
+      ownedBots: ['bot_1', 'u_1', '', 'bot_2', 'bot_1'],
+      isSpaceMember: true,
+      page: 1,
+      pageSize: 10,
+      sort: 'updatedAt:desc',
+    })
+    const { sql, params } = itemsCall()
+
+    expect(sql).toMatch(/CASE WHEN m\.owner_id IN \(\?, \?, \?\) THEN 4 ELSE dm\.role END/)
+    expect(sql).toMatch(/AND m\.owner_id IN \(\?, \?, \?\)/)
+    expect(sql).not.toMatch(/GREATEST\(/)
+    expect(sql).not.toMatch(/share_role/)
+    // Projection owner set, JOIN uid, space filter, then visibility owner set.
+    expect(params).toEqual(['u_1', 'bot_1', 'bot_2', 'u_1', 's1', 'u_1', 'bot_1', 'bot_2'])
   })
 })
 

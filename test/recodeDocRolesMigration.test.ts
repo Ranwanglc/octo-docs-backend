@@ -16,7 +16,7 @@ import {
 //   * the OLD-domain named CHECKs are DROPPED BEFORE the recode DML (else the
 //     admin 3->4 bump would violate the still-installed old-domain check),
 //   * the numbers are recoded exactly ONCE, transactionally gated by the marker,
-//   * the NEW-domain CHECKs are installed AFTER the DML,
+//   * the NEW-domain CHECKs are installed BEFORE the DML,
 //   * a crash-style DIRECT re-execution (no ledger, old checks already dropped)
 //     is a marker-gated no-op that leaves a genuine post-recode commenter(2) alone.
 
@@ -55,10 +55,7 @@ class RoleMigrationConn implements MigrationConnection {
   readonly ledger = new Map<string, string>()
   // Installed named CHECKs -> the domain each currently enforces.
   readonly checks = new Map<string, number[]>()
-  // Presence of the sentinel row is the "recode already committed" flag.
-  markerDone = false
-  // Whether the persistent marker table itself exists yet.
-  private markerTableExists = false
+  encoding: 'v1' | 'v2' | null
   // Ordered log of the phases the CALL performs, for exact-order assertions.
   readonly events: Event[] = []
 
@@ -69,10 +66,12 @@ class RoleMigrationConn implements MigrationConnection {
     // Whether the OLD-domain named CHECKs are already deployed (default: yes, the
     // realistic "existing deployment" case). Fresh installs pass false.
     oldChecksInstalled?: boolean
+    encoding?: 'v1' | 'v2' | null
   }) {
     this.docMember = seed.docMember.map((role) => ({ role }))
     this.docInvite = seed.docInvite.map((role) => ({ role }))
     this.docAccessRequest = seed.docAccessRequest.map((requested_role) => ({ requested_role }))
+    this.encoding = seed.encoding ?? null
     if (seed.oldChecksInstalled ?? true) {
       for (const [name, domain] of Object.entries(OLD_CHECK_DOMAINS)) this.checks.set(name, [...domain])
     }
@@ -91,16 +90,37 @@ class RoleMigrationConn implements MigrationConnection {
 
   /** Run the octo_recode_doc_roles() procedure body semantics, in order. */
   private runRecodeProcedure(): void {
-    // 1. Drop old named CHECKs if present (guarded) — BEFORE any DML.
+    if (this.encoding === 'v2') {
+      this.events.push({ kind: 'recode-skipped' })
+      return
+    }
+    const states = Object.fromEntries(Object.keys(OLD_CHECK_DOMAINS).map((name) => {
+      const actual = this.checks.get(name)
+      const state = actual === undefined ? 'missing'
+        : JSON.stringify(actual) === JSON.stringify(OLD_CHECK_DOMAINS[name]) ? 'old'
+          : JSON.stringify(actual) === JSON.stringify(NEW_CHECK_DOMAINS[name]) ? 'new' : 'unknown'
+      return [name, state]
+    }))
+    if (Object.values(states).includes('unknown'))
+      throw new Error('unknown role CHECK domain or name collision; migration aborted')
+    if (this.encoding === null && Object.values(states).some((state) => state !== 'old'))
+      throw new Error('ambiguous doc role encoding; migration aborted')
+
+    // Repair each CHECK independently so every implicit-commit DDL prefix retries.
     for (const name of Object.keys(OLD_CHECK_DOMAINS)) {
-      if (this.checks.has(name)) {
+      if (states[name] === 'old') {
         this.checks.delete(name)
         this.events.push({ kind: 'drop-check', name })
+      }
+      if (states[name] !== 'new') {
+        const domain = NEW_CHECK_DOMAINS[name]
+        this.checks.set(name, [...domain])
+        this.events.push({ kind: 'add-check', name })
       }
     }
 
     // 2. Recode once, gated by the persistent marker, inside one transaction.
-    if (!this.markerDone) {
+    if (this.encoding !== 'v2') {
       for (const r of this.docMember) if (r.role === 2 || r.role === 3) r.role = r.role === 3 ? 4 : 3
       this.assertInDomain('chk_doc_member_role', this.docMember.map((r) => r.role))
       for (const r of this.docInvite) if (r.role === 2 || r.role === 3) r.role = r.role === 3 ? 4 : 3
@@ -110,19 +130,12 @@ class RoleMigrationConn implements MigrationConnection {
         'chk_doc_access_request_role',
         this.docAccessRequest.map((r) => r.requested_role),
       )
-      this.markerDone = true // marker INSERT commits in the same transaction
+      this.encoding = 'v2' // authoritative marker commits with the recode
       this.events.push({ kind: 'recode' })
     } else {
       this.events.push({ kind: 'recode-skipped' })
     }
 
-    // 3. Install the NEW-domain CHECKs (guarded) — AFTER the DML.
-    for (const [name, domain] of Object.entries(NEW_CHECK_DOMAINS)) {
-      if (!this.checks.has(name)) {
-        this.checks.set(name, [...domain])
-        this.events.push({ kind: 'add-check', name })
-      }
-    }
   }
 
   async query(sql: string, params: unknown[] = []): Promise<[unknown, unknown]> {
@@ -140,19 +153,12 @@ class RoleMigrationConn implements MigrationConnection {
       return [[], []]
     }
 
-    // The persistent recode-progress marker table (idempotent create).
-    if (/^CREATE TABLE IF NOT EXISTS octo_recode_doc_roles_progress/i.test(n)) {
-      this.markerTableExists = true
-      return [[], []]
-    }
-
     // Constraint/recode procedure lifecycle. The proc BODY runs server-side in
     // real MySQL; the runner only emits DROP/CREATE PROCEDURE + CALL, so we model
     // the whole body's semantics (drop-old -> gated recode -> add-new) on CALL.
     if (/^DROP PROCEDURE IF EXISTS/i.test(n)) return [[], []]
     if (/^CREATE PROCEDURE/i.test(n)) return [[], []]
     if (/^CALL octo_recode_doc_roles/i.test(n)) {
-      if (!this.markerTableExists) throw new Error('CALL before marker table created')
       this.runRecodeProcedure()
       return [[], []]
     }
@@ -182,7 +188,7 @@ describe('four-role recode migration', () => {
     }
   })
 
-  it('drops old-domain checks BEFORE recoding, then installs new checks — exact order', async () => {
+  it('replaces old checks with v2-compatible checks before recoding — exact order', async () => {
     const conn = new RoleMigrationConn({
       docMember: [1, 2, 3, 2, 1],
       docInvite: [2, 3, 1],
@@ -192,9 +198,8 @@ describe('four-role recode migration', () => {
     const result = await runMigrations(connectionMigrationDb(conn), [file])
     expect(result.applied).toEqual([file.filename])
 
-    // Exact contract order: all three OLD checks dropped, THEN recode once, THEN
-    // all three NEW checks installed. (Every old check must be dropped before the
-    // single recode; every add must follow it.)
+    // Exact contract order: all three OLD checks dropped, all three NEW checks
+    // installed, THEN recode once.
     const dropIdx = conn.events.map((e, i) => (e.kind === 'drop-check' ? i : -1)).filter((i) => i >= 0)
     const recodeIdx = conn.events.findIndex((e) => e.kind === 'recode')
     const addIdx = conn.events.map((e, i) => (e.kind === 'add-check' ? i : -1)).filter((i) => i >= 0)
@@ -202,7 +207,7 @@ describe('four-role recode migration', () => {
     expect(addIdx.length).toBe(3)
     expect(recodeIdx).toBeGreaterThanOrEqual(0)
     expect(Math.max(...dropIdx)).toBeLessThan(recodeIdx)
-    expect(recodeIdx).toBeLessThan(Math.min(...addIdx))
+    expect(Math.max(...addIdx)).toBeLessThan(recodeIdx)
     expect(conn.events.filter((e) => e.kind === 'recode-skipped')).toEqual([])
 
     // Data recoded: reader stays 1; old writer 2 -> new writer 3; admin 3 -> 4.
@@ -279,7 +284,7 @@ describe('four-role recode migration', () => {
     // First direct execution of every statement (no ledger involved).
     for (const s of statements) await db.query(s)
     expect(conn.docMember.map((r) => r.role).sort()).toEqual([1, 3, 4])
-    expect(conn.markerDone).toBe(true)
+    expect(conn.encoding).toBe('v2')
     expect(conn.events.filter((e) => e.kind === 'recode')).toHaveLength(1)
 
     // New app writes a genuine commenter(2) after the recode committed.
@@ -296,20 +301,112 @@ describe('four-role recode migration', () => {
     expect(conn.checks.get('chk_doc_member_role')).toEqual([1, 2, 3, 4])
   })
 
-  it('fresh install (no old checks, empty tables) is a clean guarded no-op that ends with new checks', async () => {
+  it('fresh v2 install with all four roles and an empty migration ledger is an exact no-op', async () => {
     const conn = new RoleMigrationConn({
-      docMember: [],
-      docInvite: [],
-      docAccessRequest: [],
+      docMember: [1, 2, 3, 4],
+      docInvite: [1, 2, 3, 4],
+      docAccessRequest: [1, 2, 3],
       oldChecksInstalled: false,
+      encoding: 'v2',
     })
+    for (const [name, domain] of Object.entries(NEW_CHECK_DOMAINS)) conn.checks.set(name, [...domain])
     const file = await loadRecodeFile()
     const result = await runMigrations(connectionMigrationDb(conn), [file])
     expect(result.applied).toEqual([file.filename])
-    // Nothing to drop; recode ran once over empty tables; new checks installed.
+    // Marker wins even with no migration ledger: no data or constraints change.
     expect(conn.events.filter((e) => e.kind === 'drop-check')).toEqual([])
-    expect(conn.events.filter((e) => e.kind === 'add-check')).toHaveLength(3)
+    expect(conn.events.filter((e) => e.kind === 'add-check')).toHaveLength(0)
+    expect(conn.docMember.map((r) => r.role)).toEqual([1, 2, 3, 4])
     expect(conn.checks.get('chk_doc_member_role')).toEqual([1, 2, 3, 4])
     expect(conn.checks.get('chk_doc_access_request_role')).toEqual([1, 2, 3])
+  })
+
+  it('ambiguous unmarked state aborts without mutating rows or checks', async () => {
+    const conn = new RoleMigrationConn({
+      docMember: [1, 2, 3], docInvite: [2], docAccessRequest: [1, 2], oldChecksInstalled: false,
+    })
+    const before = JSON.stringify([conn.docMember, conn.docInvite, conn.docAccessRequest])
+    const file = await loadRecodeFile()
+    await expect(runMigrations(connectionMigrationDb(conn), [file])).rejects.toThrow(/ambiguous/)
+    expect(JSON.stringify([conn.docMember, conn.docInvite, conn.docAccessRequest])).toBe(before)
+    expect(conn.checks.size).toBe(0)
+    expect(conn.encoding).toBeNull()
+  })
+
+  it('explicit authoritative v1 migrates a historical schema with no named checks', async () => {
+    const conn = new RoleMigrationConn({
+      docMember: [1, 2, 3],
+      docInvite: [1, 2, 3],
+      docAccessRequest: [1, 2],
+      oldChecksInstalled: false,
+      encoding: 'v1',
+    })
+    const file = await loadRecodeFile()
+    await runMigrations(connectionMigrationDb(conn), [file])
+
+    expect(conn.events.filter((e) => e.kind === 'drop-check')).toEqual([])
+    expect(conn.events.filter((e) => e.kind === 'add-check')).toHaveLength(3)
+    expect(conn.events.findIndex((e) => e.kind === 'add-check')).toBeLessThan(
+      conn.events.findIndex((e) => e.kind === 'recode'),
+    )
+    expect(conn.encoding).toBe('v2')
+    expect(conn.docMember.map((r) => r.role)).toEqual([1, 3, 4])
+    expect(conn.docInvite.map((r) => r.role)).toEqual([1, 3, 4])
+    expect(conn.docAccessRequest.map((r) => r.requested_role)).toEqual([1, 3])
+    expect(conn.checks.get('chk_doc_member_role')).toEqual([1, 2, 3, 4])
+    expect(conn.checks.get('chk_doc_invite_role')).toEqual([1, 2, 3, 4])
+    expect(conn.checks.get('chk_doc_access_request_role')).toEqual([1, 2, 3])
+  })
+
+  it('retries from the explicit v1 phase after CHECK replacement', async () => {
+    const conn = new RoleMigrationConn({
+      docMember: [1, 2, 3],
+      docInvite: [2, 3],
+      docAccessRequest: [1, 2],
+      oldChecksInstalled: false,
+      encoding: 'v1',
+    })
+    for (const [name, domain] of Object.entries(NEW_CHECK_DOMAINS)) conn.checks.set(name, [...domain])
+    const file = await loadRecodeFile()
+    await runMigrations(connectionMigrationDb(conn), [file])
+    expect(conn.encoding).toBe('v2')
+    expect(conn.docMember.map((r) => r.role)).toEqual([1, 3, 4])
+    expect(conn.docInvite.map((r) => r.role)).toEqual([3, 4])
+    expect(conn.docAccessRequest.map((r) => r.requested_role)).toEqual([1, 3])
+  })
+
+  it('repairs every mixed per-table DDL state with an authoritative v1 marker', async () => {
+    const states = ['old', 'new', 'missing'] as const
+    const file = await loadRecodeFile()
+    for (const member of states) for (const invite of states) for (const request of states) {
+      const conn = new RoleMigrationConn({
+        docMember: [1, 2, 3], docInvite: [1, 2, 3], docAccessRequest: [1, 2],
+        oldChecksInstalled: false, encoding: 'v1',
+      })
+      for (const [name, state] of Object.entries({
+        chk_doc_member_role: member,
+        chk_doc_invite_role: invite,
+        chk_doc_access_request_role: request,
+      })) {
+        if (state === 'old') conn.checks.set(name, [...OLD_CHECK_DOMAINS[name]])
+        if (state === 'new') conn.checks.set(name, [...NEW_CHECK_DOMAINS[name]])
+      }
+
+      await runMigrations(connectionMigrationDb(conn), [file])
+      expect(conn.encoding, `${member}/${invite}/${request}`).toBe('v2')
+      for (const [name, domain] of Object.entries(NEW_CHECK_DOMAINS))
+        expect(conn.checks.get(name), `${member}/${invite}/${request}:${name}`).toEqual(domain)
+    }
+  })
+
+  it('rejects an unknown named CHECK domain before any DDL or DML', async () => {
+    const conn = new RoleMigrationConn({
+      docMember: [1, 2, 3], docInvite: [1, 2], docAccessRequest: [1, 2], encoding: 'v1',
+    })
+    conn.checks.set('chk_doc_invite_role', [1, 2, 3, 9])
+    const before = JSON.stringify([conn.docMember, conn.docInvite, conn.docAccessRequest])
+    await expect(runMigrations(connectionMigrationDb(conn), [await loadRecodeFile()])).rejects.toThrow(/unknown/)
+    expect(conn.events).toEqual([])
+    expect(JSON.stringify([conn.docMember, conn.docInvite, conn.docAccessRequest])).toBe(before)
   })
 })

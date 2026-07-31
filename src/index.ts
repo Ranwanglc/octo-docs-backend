@@ -21,6 +21,7 @@ import { epochInvalidateChannel, currentEpoch, invalidateEpochCache, type Invali
 import { closePool } from './db/pool.js'
 import { closeRedis } from './db/redis.js'
 import { closeKafkaProducer } from './db/kafka.js'
+import { requireCurrentRoleEncoding } from './db/roleEncoding.js'
 
 async function main(): Promise<void> {
   // B1 safety backstop: a stray throw/rejection inside an async hook (e.g. a
@@ -35,6 +36,8 @@ async function main(): Promise<void> {
     // eslint-disable-next-line no-console
     console.error('[octo-docs] unhandledRejection (non-fatal, still serving):', reason)
   })
+
+  await requireCurrentRoleEncoding()
 
   const hocuspocus = createServer()
 

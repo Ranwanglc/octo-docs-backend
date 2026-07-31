@@ -238,10 +238,17 @@ describe('docMetaRepo.listForUser owner=me spans caller + owned bots', () => {
     // bot uids were absent and bot-owned docs could never match.
     expect(countParams).toContain('bot_a')
     expect(countParams).toContain('bot_b')
-    // items bind order: CASE m.owner_id=? (self only), JOIN dm.uid, m.space_id,
-    // then the owner set. The CASE stays keyed on the human (bot docs get their
-    // role from dm.role, not owner=>admin).
-    expect(itemsParams).toEqual(['u_human', 'u_human', 's_1', 'u_human', 'bot_a', 'bot_b'])
+    // Projection reuses the identical owner set, so bot-owned rows are admin.
+    expect(itemsParams).toEqual([
+      'u_human',
+      'bot_a',
+      'bot_b',
+      'u_human',
+      's_1',
+      'u_human',
+      'bot_a',
+      'bot_b',
+    ])
   })
 
   it('empty ownedBots degrades to exactly the pre-feature single-owner behavior', async () => {
@@ -288,18 +295,24 @@ describe('docMetaRepo.listForUser owner=me spans caller + owned bots', () => {
       pageSize: 10,
       sort: 'updatedAt:desc',
     })
-    const { countSql, countParams, itemsSql, itemsParams } = ownerCall()
+    const { countSql, countParams, itemsParams } = ownerCall()
     // owner set collapses to [u_human, bot_a, bot_c] => 3 placeholders.
     const countPlaceholders = (countSql.match(/m\.owner_id IN \(([^)]*)\)/)![1].match(/\?/g) || [])
       .length
     // count query trailing binds after [joinUid, spaceId] are the owner set.
     expect(countParams.slice(2).length).toBe(countPlaceholders)
     expect(countParams).toEqual(['u_human', 's_1', 'u_human', 'bot_a', 'bot_c'])
-    // items query: leading CASE self bind + [joinUid, spaceId] + owner set.
-    const itemsPlaceholders = (itemsSql.match(/m\.owner_id IN \(([^)]*)\)/)![1].match(/\?/g) || [])
-      .length
-    expect(itemsParams.slice(3).length).toBe(itemsPlaceholders)
-    expect(itemsParams).toEqual(['u_human', 'u_human', 's_1', 'u_human', 'bot_a', 'bot_c'])
+    // items query: leading CASE owner set + [joinUid, spaceId] + owner set.
+    expect(itemsParams).toEqual([
+      'u_human',
+      'bot_a',
+      'bot_c',
+      'u_human',
+      's_1',
+      'u_human',
+      'bot_a',
+      'bot_c',
+    ])
   })
 
   it('folder + q + owner=me: bind count still matches across every placeholder', async () => {

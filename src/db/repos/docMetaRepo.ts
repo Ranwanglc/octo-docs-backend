@@ -315,14 +315,16 @@ export const docMetaRepo = {
     //      (cross-space leak). Non-member => collapses to owner OR doc_member.
     // SHARE_SCOPE_ANYONE is a numeric constant, inlined (no extra bind).
     const includeSpaceShare = params.owner !== 'me' && params.isSpaceMember === true
+    const ownerSet = [
+      params.uid,
+      ...(params.owner === 'me' ? (params.ownedBots ?? []) : []).filter(
+        (b) => typeof b === 'string' && b !== '',
+      ),
+    ].filter((v, i, arr) => arr.indexOf(v) === i)
     let visibility: string
     // Bind values contributed by the visibility clause, in placeholder order.
     const visibilityArgs: unknown[] = []
     if (params.owner === 'me') {
-      const ownerSet = [
-        params.uid,
-        ...(params.ownedBots ?? []).filter((b) => typeof b === 'string' && b !== ''),
-      ].filter((v, i, arr) => arr.indexOf(v) === i)
       // ownerSet always has >=1 element (params.uid); empty ownedBots => IN (?).
       visibility = `m.owner_id IN (${ownerSet.map(() => '?').join(', ')})`
       visibilityArgs.push(...ownerSet)
@@ -372,23 +374,24 @@ export const docMetaRepo = {
     // The role numbers are the ORDERED doc-role codes (ROLE_*), NOT the share_role
     // enum: an EDIT share DERIVES writer=ROLE_WRITER(3), any other share yields
     // ROLE_READER(1); owner => ROLE_ADMIN(4). SHARE_SCOPE_ANYONE / SHARE_ROLE_EDIT
-    // and the ROLE_* codes are numeric constants inlined (no bind), so the leading
-    // owner-uid bind is identical whether or not the arm is present.
+    // and the ROLE_* codes are numeric constants inlined (no bind). The owner
+    // predicate and binds reuse the exact ownerSet used for visibility.
+    const ownerRolePredicate = `m.owner_id IN (${ownerSet.map(() => '?').join(', ')})`
     const roleExpr = includeSpaceShare
-      ? `CASE WHEN m.owner_id = ? THEN ${ROLE_ADMIN}
+      ? `CASE WHEN ${ownerRolePredicate} THEN ${ROLE_ADMIN}
               ELSE GREATEST(
                 COALESCE(dm.role, 0),
                 CASE WHEN m.share_scope = ${SHARE_SCOPE_ANYONE}
                      THEN (CASE WHEN m.share_role = ${SHARE_ROLE_EDIT} THEN ${ROLE_WRITER} ELSE ${ROLE_READER} END)
                      ELSE 0 END
               ) END`
-      : `CASE WHEN m.owner_id = ? THEN ${ROLE_ADMIN} ELSE dm.role END`
+      : `CASE WHEN ${ownerRolePredicate} THEN ${ROLE_ADMIN} ELSE dm.role END`
     const items = await query<DocMeta & { role: number }>(
       `SELECT m.*, ${roleExpr} AS role
        ${base}
        ORDER BY m.updated_at ${order}, m.doc_id ${order}
        LIMIT ${pageSize} OFFSET ${offset}`,
-      [params.uid, ...args],
+      [...ownerSet, ...args],
     )
     return { total, items }
   },

@@ -18,6 +18,7 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "test": "vitest run",
+    "test:mysql8:role-migration": "bash test/recodeDocRolesMigration.mysql8.sh",
     "test:watch": "vitest",
     "migrate:fractional-index": "tsx scripts/repairFractionalIndices.ts",
     "license:check": "license-checker --onlyAllow 'MIT;ISC;BSD-2-Clause;BSD-3-Clause;Apache-2.0;CC0-1.0' --production"

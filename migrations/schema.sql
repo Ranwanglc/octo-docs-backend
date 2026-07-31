@@ -22,6 +22,18 @@
 --   card_action_receipt   signed card-action callback idempotency receipts
 --   doc_access_notify_card approver access-request card coordinates (decision card sync)
 
+-- Authoritative persisted-role encoding. Upgrade SQL must consult this value;
+-- overlapping role numbers are never sufficient evidence of a v1 database.
+CREATE TABLE octo_schema_metadata (
+  metadata_key   VARCHAR(128) NOT NULL,
+  metadata_value VARCHAR(128) NOT NULL,
+  updated_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (metadata_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT INTO octo_schema_metadata (metadata_key, metadata_value)
+VALUES ('doc_role_encoding', 'v2');
+
 -- 文档元数据（业务库）
 CREATE TABLE doc_meta (
   doc_id        VARCHAR(64)  NOT NULL,            -- 业务主键（如 d_abc123），由创建 API 生成
