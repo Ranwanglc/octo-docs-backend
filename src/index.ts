@@ -21,6 +21,7 @@ import { epochInvalidateChannel, currentEpoch, invalidateEpochCache, type Invali
 import { closePool } from './db/pool.js'
 import { closeRedis } from './db/redis.js'
 import { closeKafkaProducer } from './db/kafka.js'
+import { broadcastCommentMutation, commentEventsChannel } from './api/services/commentEvents.js'
 
 async function main(): Promise<void> {
   // B1 safety backstop: a stray throw/rejection inside an async hook (e.g. a
@@ -43,9 +44,10 @@ async function main(): Promise<void> {
   // connections (close 4403 / flip readOnly) is the next layer; the
   // beforeHandleMessage per-principal recheck (§4.5 step 4) is the backstop.
   const sub = new Redis({ host: config.redis.host, port: config.redis.port })
-  await sub.subscribe(epochInvalidateChannel())
-  sub.on('message', (_channel: string, message: string) => {
-    void handleInvalidate(message)
+  await sub.subscribe(epochInvalidateChannel(), commentEventsChannel())
+  sub.on('message', (channel: string, message: string) => {
+    if (channel === epochInvalidateChannel()) void handleInvalidate(message)
+    else if (channel === commentEventsChannel()) broadcastCommentMutation(message)
   })
 
   async function handleInvalidate(message: string): Promise<void> {
