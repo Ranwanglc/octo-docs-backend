@@ -76,7 +76,7 @@ function handlerFor(path: string, method: 'get' | 'post') {
 }
 
 const okGuard = {
-  meta: { doc_id: 'd_1', document_name: 'doc-d_1', owner_id: 'u_admin' },
+  meta: { doc_id: 'd_1', document_name: 'doc-d_1', owner_id: 'u_admin', doc_type: 'html' },
   role: 'admin',
 } as never
 
@@ -129,7 +129,7 @@ describe('POST /:docId/access-requests — submit', () => {
   })
 
   it('caller already >= requested role -> 200 already_granted, no row', async () => {
-    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1' } as never)
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1', doc_type: 'html' } as never)
     vi.mocked(resolveRole).mockResolvedValue('writer')
     const res = mockRes()
     await submitHandler()(req({ requestedRole: 'reader' }), res as never)
@@ -152,6 +152,56 @@ describe('POST /:docId/access-requests — submit', () => {
       requestedRoleNum: 2,
       reason: 'need edit',
     })
+  })
+
+  it('omitted requestedRole defaults to reader and creates a pending request', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1', doc_type: 'html' } as never)
+    vi.mocked(resolveRole).mockResolvedValue('none')
+    vi.mocked(docAccessRequestRepo.submit).mockResolvedValue({ requestId: 'req_r', status: 1 })
+
+    const res = mockRes()
+    await submitHandler()(req({}), res as never)
+
+    expect(res.statusCode).toBe(201)
+    expect(res.body).toEqual({ requestId: 'req_r', status: 'pending' })
+    expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith({
+      docId: 'd_1',
+      uid: 'u_applicant',
+      requestedRoleNum: 1,
+      reason: '',
+    })
+  })
+
+  it('explicit invalid requestedRole returns 400 without writing a row', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1', doc_type: 'html' } as never)
+
+    for (const requestedRole of ['admin', 'bogus', null]) {
+      const res = mockRes()
+      await submitHandler()(req({ requestedRole }), res as never)
+      expect(res.statusCode).toBe(400)
+      expect(res.body).toEqual({ error: 'requestedRole must be reader|commenter|writer' })
+    }
+
+    expect(vi.mocked(resolveRole)).not.toHaveBeenCalled()
+    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+  })
+
+  it('persists commenter for HTML and rejects commenter for non-HTML docs', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1', doc_type: 'html' } as never)
+    vi.mocked(resolveRole).mockResolvedValue('none')
+    vi.mocked(docAccessRequestRepo.submit).mockResolvedValue({ requestId: 'req_c', status: 1 })
+
+    const commenter = mockRes()
+    await submitHandler()(req({ requestedRole: 'commenter' }), commenter as never)
+    expect(commenter.statusCode).toBe(201)
+    expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenLastCalledWith(
+      expect.objectContaining({ requestedRoleNum: 4 }),
+    )
+
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1', doc_type: 'doc' } as never)
+    const nonHtml = mockRes()
+    await submitHandler()(req({ requestedRole: 'commenter' }), nonHtml as never)
+    expect(nonHtml.statusCode).toBe(409)
   })
 })
 
@@ -239,6 +289,24 @@ describe('POST /:docId/access-requests/:requestId/approve', () => {
     await approveHandler()(req({ role: 'reader' }), res as never)
     expect(res.statusCode).toBe(404)
     expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
+  })
+
+  it('approves commenter and rejects an explicit invalid override before deciding', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue({
+      doc_id: 'd_1', uid: 'u_applicant', requested_role: 4, reason: '', status: 1,
+      request_id: 'req_x', decided_by: '', created_at: new Date(0), updated_at: new Date(0),
+    })
+    const commenter = mockRes()
+    await approveHandler()(req({ role: 'commenter' }), commenter as never)
+    expect(commenter.statusCode).toBe(200)
+    expect(vi.mocked(grantForwardAccess)).toHaveBeenLastCalledWith(expect.objectContaining({ roleNum: 4 }))
+
+    vi.mocked(docAccessRequestRepo.decide).mockClear()
+    const invalid = mockRes()
+    await approveHandler()(req({ role: 'admin' }), invalid as never)
+    expect(invalid.statusCode).toBe(400)
+    expect(vi.mocked(docAccessRequestRepo.decide)).not.toHaveBeenCalled()
   })
 
   // Regression (§ review打回 blocker): grant MUST be gated on a genuine

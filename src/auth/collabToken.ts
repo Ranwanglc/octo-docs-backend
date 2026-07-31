@@ -113,7 +113,7 @@ export function verifyCollabToken(token: string): CollabClaims {
   if (
     typeof uid !== 'string' ||
     typeof documentName !== 'string' ||
-    (role !== 'reader' && role !== 'writer' && role !== 'admin') ||
+    (role !== 'reader' && role !== 'commenter' && role !== 'writer' && role !== 'admin') ||
     typeof permission_epoch !== 'number'
   ) {
     throw new Error('invalid collab token claims')

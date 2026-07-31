@@ -47,18 +47,18 @@ describe('share-role projection constants stay pinned to shareScope.ts', () => {
 })
 
 describe('docMetaRepo.listForUser — role CASE gains a share arm for a confirmed member (RC#1)', () => {
-  it('a member gets the RAISE-only share projection: owner=>admin, else GREATEST(dm.role, share)', async () => {
+  it('a member gets a rank-aware raise-only share projection', async () => {
     await docMetaRepo.listForUser({
       uid: 'u_1', spaceId: 's1', isSpaceMember: true, page: 1, pageSize: 10, sort: 'updatedAt:desc',
     })
     const { sql, params } = itemsCall()
     // owner short-circuits to admin(3); the share arm is RAISE-only over dm.role.
     expect(sql).toMatch(/WHEN m\.owner_id = \? THEN 3/)
-    expect(sql).toMatch(/GREATEST\(/)
-    expect(sql).toMatch(/COALESCE\(dm\.role, 0\)/)
+    expect(sql).not.toMatch(/GREATEST\(/)
+    expect(sql).toMatch(/dm\.role IN \(2, 3\)/)
     // anyone_in_space + EDIT => writer(2); any other share role => reader(1).
     expect(sql).toMatch(new RegExp(`m\\.share_scope = ${SHARE_SCOPE_ANYONE}`))
-    expect(sql).toMatch(new RegExp(`m\\.share_role = ${SHARE_ROLE_EDIT} THEN 2 ELSE 1`))
+    expect(sql).toMatch(new RegExp(`m\\.share_role = ${SHARE_ROLE_EDIT}`))
     // the share arm inlines numeric constants (no bind), so the SINGLE leading
     // owner-uid bind is unchanged — paging/args stay stable.
     expect(sql).not.toMatch(/m\.share_scope = \?/)
@@ -99,12 +99,12 @@ describe('docViewHistoryRepo.listRecent — role CASE gains a same-space-guarded
     await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', isSpaceMember: true, pageSize: 10 })
     const { sql, params } = itemsCall()
     expect(sql).toMatch(/WHEN m\.owner_id = \? THEN 3/)
-    expect(sql).toMatch(/GREATEST\(/)
-    expect(sql).toMatch(/COALESCE\(dm\.role, 0\)/)
+    expect(sql).not.toMatch(/GREATEST\(/)
+    expect(sql).toMatch(/dm\.role IN \(2, 3\)/)
     // the recent list keeps the same-space guard on the share arm, matching the
     // visibility predicate: a doc shared in ANOTHER space never gets a label.
     expect(sql).toMatch(new RegExp(`m\\.share_scope = ${SHARE_SCOPE_ANYONE} AND m\\.space_id = v\\.space_id`))
-    expect(sql).toMatch(new RegExp(`m\\.share_role = ${SHARE_ROLE_EDIT} THEN 2 ELSE 1`))
+    expect(sql).toMatch(new RegExp(`m\\.share_role = ${SHARE_ROLE_EDIT}`))
     // items binds still lead with (role-CASE uid, join uid, ...) — arm adds none.
     expect(params[0]).toBe('u_1')
     expect(params[1]).toBe('u_1')

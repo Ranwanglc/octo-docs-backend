@@ -17,6 +17,7 @@ import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { refreshAndPublish } from '../../permission/epoch.js'
 import { roleFromNumber, type ResolvedRole } from '../../permission/role.js'
 import { decideAcceptBranch } from './acceptDecision.js'
+import { HTML_DOC_TYPE } from '../../db/docType.js'
 
 export type AcceptResult =
   | { ok: true; status: 200; body: { docId?: string; documentName?: string; role: string } }
@@ -27,6 +28,7 @@ interface DocMetaTxRow {
   document_name: string
   owner_id: string
   status: number
+  doc_type: string
 }
 
 /**
@@ -93,11 +95,14 @@ export async function acceptInviteForUid(
 
     // step 3: read current state (doc meta + role).
     const metaRows = await tx.query<DocMetaTxRow>(
-      'SELECT doc_id, document_name, owner_id, status FROM doc_meta WHERE doc_id = ? LIMIT 1',
+      'SELECT doc_id, document_name, owner_id, status, doc_type FROM doc_meta WHERE doc_id = ? LIMIT 1 FOR UPDATE',
       [invite.doc_id],
     )
     const meta = metaRows[0]
     const docExists = !!meta && meta.status !== 0
+    if (inviteRole === 'commenter' && (!docExists || meta!.doc_type !== HTML_DOC_TYPE)) {
+      return { ok: false, status: 410, error: 'invite_invalid' }
+    }
     const curRole = docExists ? await resolveRoleTx(tx, meta!, uid) : 'none'
 
     // step 2 + step 4 decision (pure).

@@ -17,9 +17,10 @@ import type { Server } from 'node:http'
 //     token is rejected 401 by verifyBot before the accept service is touched.
 // vi.mock factories are hoisted above the module body, so the spies they close
 // over must be created via vi.hoisted (also hoisted) rather than plain consts.
-const { getForUpdateTx, upsertFromInviteTx } = vi.hoisted(() => ({
+const { getForUpdateTx, upsertFromInviteTx, txDocType } = vi.hoisted(() => ({
   getForUpdateTx: vi.fn(),
   upsertFromInviteTx: vi.fn(async () => {}),
+  txDocType: { value: 'html' },
 }))
 
 vi.mock('../src/db/pool.js', () => ({
@@ -30,7 +31,7 @@ vi.mock('../src/db/pool.js', () => ({
     fn({
       query: async (sql: string) => {
         if (/SELECT/i.test(sql) && /document_name/i.test(sql)) {
-          return [{ doc_id: 'd1', document_name: 'Doc', owner_id: 'owner', status: 1 }]
+          return [{ doc_id: 'd1', document_name: 'Doc', owner_id: 'owner', status: 1, doc_type: txDocType.value }]
         }
         if (/SELECT/i.test(sql) && /permission_epoch/i.test(sql)) {
           return [{ permission_epoch: 1 }]
@@ -123,6 +124,7 @@ afterAll(async () => {
 beforeEach(() => {
   getForUpdateTx.mockReset()
   upsertFromInviteTx.mockClear()
+  txDocType.value = 'html'
 })
 
 describe('bot invite accept /v1/bot/docs/invites/:token/accept (docs #61)', () => {
@@ -158,6 +160,18 @@ describe('bot invite accept /v1/bot/docs/invites/:token/accept (docs #61)', () =
       headers: { authorization: 'Bearer bot-tok' },
     })
 
+    expect(res.status).toBe(410)
+    expect(await res.json()).toEqual({ error: 'invite_invalid' })
+    expect(upsertFromInviteTx).not.toHaveBeenCalled()
+  })
+
+  it('transactionally rejects a stale commenter invite for a non-HTML document', async () => {
+    getForUpdateTx.mockResolvedValue({ ...validInvite(), role: 4 })
+    txDocType.value = 'doc'
+    setOctoIdentity(stub({ verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_bot' }) }))
+    const res = await fetch(`${base}/v1/bot/docs/invites/tok123/accept`, {
+      method: 'POST', headers: { authorization: 'Bearer bot-tok' },
+    })
     expect(res.status).toBe(410)
     expect(await res.json()).toEqual({ error: 'invite_invalid' })
     expect(upsertFromInviteTx).not.toHaveBeenCalled()

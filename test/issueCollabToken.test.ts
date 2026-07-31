@@ -291,6 +291,19 @@ describe('issueCollabToken (PR #93 blocking-1) — html docs clamp to read-only'
     expect(verifyCollabToken(out.result.token).role).toBe('reader')
   })
 
+  it('preserves an html commenter claim for read-only role-aware clients', async () => {
+    asUser('html_commenter')
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(htmlMeta('someone_else'))
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(htmlMeta('someone_else'))
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue('commenter')
+
+    const out = await issueCollabToken('octo_session_commenter', HTML_KEY)
+    expect(out.ok).toBe(true)
+    if (!out.ok) return
+    expect(out.result.role).toBe('commenter')
+    expect(verifyCollabToken(out.result.token).role).toBe('commenter')
+  })
+
   it('a non-member on an html doc is still 403 (clamp does not grant access)', async () => {
     asUser('html_stranger')
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(htmlMeta('someone_else'))

@@ -11,7 +11,7 @@ import { normalizeTypeFilter, HTML_DOC_TYPE } from '../../db/docType.js'
 import { buildDocumentName, buildHtmlDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { enqueueDocIndex, isSearchIndexedDoc } from '../../search/docIndexQueue.js'
 import { refreshAndPublish, bumpEpoch } from '../../permission/epoch.js'
-import { ROLE_ADMIN } from '../../permission/role.js'
+import { ROLE_ADMIN, roleFromNumber } from '../../permission/role.js'
 import {
   parseShareScope,
   parseShareRole,
@@ -33,8 +33,11 @@ export const docsRouter: ExpressRouter = Router()
 const DEFAULT_FOLDER = 'f_default'
 
 /** Serialize the numeric doc_member role to the wire string enum (§3 wire). */
-const roleName = (n: number): 'admin' | 'writer' | 'reader' =>
-  n === 3 ? 'admin' : n === 2 ? 'writer' : 'reader'
+const roleName = (n: number): string => {
+  const role = roleFromNumber(n)
+  if (!role) throw new Error(`invalid document role ${n}`)
+  return role
+}
 
 /** Normalize a repeated query param (`?creator=a&creator=b`) to a string[]. */
 function toStringArray(v: unknown): string[] {

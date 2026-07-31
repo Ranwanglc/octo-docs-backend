@@ -9,14 +9,22 @@ import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { requireDocRole } from '../guard.js'
 import { bumpEpoch } from '../../permission/epoch.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
-import { roleToNumber, type Role } from '../../permission/role.js'
+import { isMemberRole, roleToNumber, roleFromNumber, type Role } from '../../permission/role.js'
+import { HTML_DOC_TYPE } from '../../db/docType.js'
 
 export const membersRouter: ExpressRouter = Router()
 
-const roleName = (n: number): string => (n === 3 ? 'admin' : n === 2 ? 'writer' : 'reader')
+// Canonical stored-number -> role name (covers commenter=4; stored value != rank
+// ordinal, so use the shared map rather than a hand-rolled ternary). Falls back
+// to 'reader' only for an unknown/corrupt stored value.
+const roleName = (n: number): string => {
+  const role = roleFromNumber(n)
+  if (!role) throw new Error(`invalid member role ${n}`)
+  return role
+}
 
 function parseRole(v: unknown): Role | null {
-  return v === 'reader' || v === 'writer' || v === 'admin' ? v : null
+  return isMemberRole(v) ? v : null
 }
 
 /** GET members (needs admin). */
@@ -64,7 +72,11 @@ membersRouter.put('/:docId/members', async (req: Request, res: Response) => {
   }
   const parsedRole = parseRole(role)
   if (!parsedRole) {
-    res.status(400).json({ error: 'role must be reader|writer|admin' })
+    res.status(400).json({ error: 'role must be reader|commenter|writer|admin' })
+    return
+  }
+  if (parsedRole === 'commenter' && guard.meta.doc_type !== HTML_DOC_TYPE) {
+    res.status(409).json({ error: 'unsupported_doc_type' })
     return
   }
   // verify target uid exists in octo (anti ghost-member). On the bot mount

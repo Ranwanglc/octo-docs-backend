@@ -21,13 +21,13 @@
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { bumpEpoch } from '../../permission/epoch.js'
-import { roleFromNumber, roleRank, type Role } from '../../permission/role.js'
+import { roleAtLeast, roleFromNumber, type Role } from '../../permission/role.js'
 
 export interface GrantForwardParams {
   docId: string
   documentName: string
   uid: string
-  roleNum: number // 1=reader 2=writer (admin is not grantable via forward)
+  roleNum: number // 1=reader 2=writer 4=commenter (admin is not grantable via forward)
   grantedBy: string
 }
 
@@ -39,6 +39,8 @@ export interface GrantForwardResult {
 }
 
 export async function grantForwardAccess(params: GrantForwardParams): Promise<GrantForwardResult> {
+  const granted = roleFromNumber(params.roleNum)
+  if (!granted || granted === 'admin') throw new Error(`invalid forward role ${params.roleNum}`)
   const current = await resolveRole(params.uid, params.docId)
   // owner (=> admin) or existing admin: keep as-is, no write, no misleading audit row.
   if (current === 'admin') {
@@ -55,7 +57,10 @@ export async function grantForwardAccess(params: GrantForwardParams): Promise<Gr
     await bumpEpoch(params.docId, params.documentName, params.uid)
   }
 
-  // Effective role = max(existing, granted). current is reader/writer/none here.
-  const finalNum = Math.max(roleRank(current), params.roleNum)
-  return { finalRole: roleFromNumber(finalNum) ?? 'reader', changed }
+  // Effective role = the more privileged of existing vs granted (never a
+  // downgrade). Compare by rank ordinal, NOT the stored number, so this stays
+  // correct now that commenter's stored value (4) is not its rank position
+  // (see src/permission/role.ts). current is reader/commenter/writer/none here.
+  const finalRole: Role = roleAtLeast(current, granted) ? (current as Role) : granted
+  return { finalRole, changed }
 }

@@ -26,6 +26,7 @@ vi.mock('../src/db/repos/docMetaRepo.js', () => ({
       document_name: 'dn-1',
       title: 'T',
       status: 1,
+      doc_type: 'html',
     })),
   },
 }))
@@ -231,6 +232,37 @@ describe('cardActionDecideHandler (archived-doc guard)', () => {
     // The archived gate must short-circuit BEFORE any status transition or grant.
     expect(grantForwardAccess).not.toHaveBeenCalled()
     expect(docAccessRequestRepo.decide).not.toHaveBeenCalled()
+  })
+})
+
+describe('cardActionDecideHandler (commenter document-type guard)', () => {
+  it('does not decide or grant a commenter request for a non-HTML document', async () => {
+    const { docMetaRepo } = await import('../src/db/repos/docMetaRepo.js')
+    const { docAccessRequestRepo } = await import('../src/db/repos/docAccessRequestRepo.js')
+    const { grantForwardAccess } = await import('../src/api/services/grantForward.js')
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValueOnce({
+      doc_id: 'doc-1', space_id: 'space-1', document_name: 'dn-1', title: 'T', status: 1, doc_type: 'doc',
+    } as unknown as Awaited<ReturnType<typeof docMetaRepo.getByDocId>>)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValueOnce({
+      uid: 'req-u', requested_role: 4, status: 1,
+    } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
+    vi.mocked(docAccessRequestRepo.decide).mockClear()
+    vi.mocked(grantForwardAccess).mockClear()
+    const eventId = '4020'
+    const ts = String(Math.floor(Date.now() / 1000))
+    const body = JSON.stringify({
+      event_id: eventId, action_id: 'approval-approve', decision: 'approve', operator_uid: 'op-1',
+      inputs: {}, doc_id: 'doc-1', request_id: 'req-1', message_id: 'm-1', channel_id: 'notification',
+      channel_type: 1, space_id: 'space-1', acted_at: Number(ts),
+    })
+    const { req, res } = makeReqRes({
+      'X-Octo-Timestamp': ts, 'X-Octo-Event-ID': eventId,
+      'X-Octo-Signature': sign(CARD_ACTION_DECIDE_PATH, body, ts, eventId, HANDLER_SECRET),
+    }, body)
+    await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
+    expect((res.payload as { disposition: string }).disposition).toBe('conflict')
+    expect(docAccessRequestRepo.decide).not.toHaveBeenCalled()
+    expect(grantForwardAccess).not.toHaveBeenCalled()
   })
 })
 

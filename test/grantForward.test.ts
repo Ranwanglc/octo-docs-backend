@@ -81,6 +81,36 @@ describe('grantForwardAccess — only-up matrix (§7)', () => {
     expect(vi.mocked(bumpEpoch)).not.toHaveBeenCalled()
   })
 
+  it('reader + commenter -> upgrade, bump, commenter', async () => {
+    vi.mocked(resolveRole).mockResolvedValue('reader')
+    vi.mocked(docMemberRepo.upsertGrantMax).mockResolvedValue(true)
+    const out = await grantForwardAccess({ ...base, roleNum: roleToNumber('commenter') })
+
+    expect(out).toEqual({ finalRole: 'commenter', changed: true })
+    expect(vi.mocked(bumpEpoch)).toHaveBeenCalledTimes(1)
+  })
+
+  it('writer + commenter -> NO downgrade despite stored 4 > 2: stays writer', async () => {
+    // commenter's stored value (4) is higher than writer's (2), but its RANK is
+    // lower — granting commenter to a writer must never downgrade. The repo's
+    // rank-aware upsert reports no change (affectedRows 0).
+    vi.mocked(resolveRole).mockResolvedValue('writer')
+    vi.mocked(docMemberRepo.upsertGrantMax).mockResolvedValue(false)
+    const out = await grantForwardAccess({ ...base, roleNum: roleToNumber('commenter') })
+
+    expect(out).toEqual({ finalRole: 'writer', changed: false })
+    expect(vi.mocked(bumpEpoch)).not.toHaveBeenCalled()
+  })
+
+  it('commenter + writer -> upgrade, bump, writer', async () => {
+    vi.mocked(resolveRole).mockResolvedValue('commenter')
+    vi.mocked(docMemberRepo.upsertGrantMax).mockResolvedValue(true)
+    const out = await grantForwardAccess({ ...base, roleNum: roleToNumber('writer') })
+
+    expect(out).toEqual({ finalRole: 'writer', changed: true })
+    expect(vi.mocked(bumpEpoch)).toHaveBeenCalledTimes(1)
+  })
+
   it('reader + reader -> same level: no-op, no bump, stays reader', async () => {
     vi.mocked(resolveRole).mockResolvedValue('reader')
     vi.mocked(docMemberRepo.upsertGrantMax).mockResolvedValue(false)

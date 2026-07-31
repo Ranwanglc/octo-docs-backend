@@ -75,7 +75,7 @@ beforeEach(() => {
 
 describe('POST /api/v1/docs/:docId/invites — create response (#6)', () => {
   it('returns only { inviteToken, role } with no host-derived url', async () => {
-    vi.mocked(requireDocRole).mockResolvedValue({ meta: {}, role: 'admin' } as never)
+    vi.mocked(requireDocRole).mockResolvedValue({ meta: { doc_type: 'html' }, role: 'admin' } as never)
     const res = mockRes()
     await createInviteHandler()(req(), res as never)
 
@@ -90,6 +90,38 @@ describe('POST /api/v1/docs/:docId/invites — create response (#6)', () => {
     expect(body).not.toHaveProperty('url')
     expect(JSON.stringify(body)).not.toContain('attacker.example.com')
     expect(JSON.stringify(body)).not.toContain('http')
+  })
+
+  it('creates a commenter invite with stored role 4', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue({ meta: { doc_type: 'html' }, role: 'admin' } as never)
+    const res = mockRes()
+    await createInviteHandler()(reqWith({ role: 'commenter' }), res as never)
+    expect(res.statusCode).toBe(201)
+    expect(res.body).toMatchObject({ role: 'commenter' })
+    expect(vi.mocked(docInviteRepo.create)).toHaveBeenLastCalledWith(
+      expect.objectContaining({ roleNum: 4 }),
+    )
+  })
+
+  it('defaults an omitted role to writer but rejects explicit invalid roles', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue({ meta: { doc_type: 'html' }, role: 'admin' } as never)
+    const omitted = mockRes()
+    await createInviteHandler()(reqWith({}), omitted as never)
+    expect(omitted.statusCode).toBe(201)
+    expect(omitted.body).toMatchObject({ role: 'writer' })
+
+    const invalid = mockRes()
+    await createInviteHandler()(reqWith({ role: 'bogus' }), invalid as never)
+    expect(invalid.statusCode).toBe(400)
+  })
+
+  it('rejects commenter invites for non-HTML documents', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue({ meta: { doc_type: 'doc' }, role: 'admin' } as never)
+    const res = mockRes()
+    await createInviteHandler()(reqWith({ role: 'commenter' }), res as never)
+    expect(res.statusCode).toBe(409)
+    expect(res.body).toEqual({ error: 'unsupported_doc_type' })
+    expect(vi.mocked(docInviteRepo.create)).not.toHaveBeenCalled()
   })
 })
 
@@ -116,7 +148,7 @@ describe('POST /api/v1/docs/:docId/invites — expiresInDays policy', () => {
   const TOL_MS = 5_000
 
   beforeEach(() => {
-    vi.mocked(requireDocRole).mockResolvedValue({ meta: {}, role: 'admin' } as never)
+    vi.mocked(requireDocRole).mockResolvedValue({ meta: { doc_type: 'html' }, role: 'admin' } as never)
   })
 
   // expectedDays → assert stored expiresAt ≈ now + expectedDays, and never NULL.

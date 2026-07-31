@@ -21,14 +21,14 @@
 import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
-import { roleToNumber } from '../../permission/role.js'
+import { isForwardGrantRole, roleToNumber } from '../../permission/role.js'
 import { grantForwardAccess } from '../services/grantForward.js'
 
 export const forwardGrantRouter: ExpressRouter = Router()
 
-/** Only reader|writer are grantable via forward (no commenter, admin not forward-grantable). */
+/** Preserve the established Web forward contract. */
 function parseGrantRole(v: unknown): 'reader' | 'writer' | null {
-  return v === 'reader' || v === 'writer' ? v : null
+  return isForwardGrantRole(v) ? v : null
 }
 
 forwardGrantRouter.post('/:docId/forward-grant', async (req: Request, res: Response) => {

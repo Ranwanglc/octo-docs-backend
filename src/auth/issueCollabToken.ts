@@ -107,14 +107,9 @@ export async function issueCollabToken(
   const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
 
-  // Security clamp (chokepoint = token issuance, where meta.doc_type is known):
-  // an html doc's body is rendered by the external octo-doc service, so its Yjs
-  // collab channel must be read-only — a signed writable token would let a
-  // client mutate a body the backend does not own. Clamp any would-be writable
-  // role (author/admin/editor) to 'reader', the role authenticate.ts already
-  // treats as readOnly=true, so the whole downstream write-reject path engages
-  // with no further change.
-  const effRole = meta.doc_type === HTML_DOC_TYPE ? 'reader' : role
+  // HTML bodies remain read-only on this Yjs channel. Preserve commenter in the
+  // claim for role-aware clients; writer/admin are still clamped to reader.
+  const effRole = meta.doc_type === HTML_DOC_TYPE ? (role === 'commenter' ? role : 'reader') : role
 
   // FEAT-B recent-view fallback ingest (MF2, default-on). Every document open —
   // read-only INCLUDED — passes through here, so this is the reliable "open ==

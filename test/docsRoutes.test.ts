@@ -14,13 +14,14 @@ vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   docMetaRepo: {
     create: vi.fn(async () => undefined),
     getByDocId: vi.fn(async () => null),
+    listForUser: vi.fn(async () => ({ total: 0, items: [] })),
   },
 }))
 vi.mock('../src/util/ids.js', () => ({
   newDocId: vi.fn(() => 'd_fixed'),
 }))
 
-import { createDocHandler, getDocHandler } from '../src/api/routes/docs.js'
+import { createDocHandler, getDocHandler, docsRouter } from '../src/api/routes/docs.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
 
@@ -220,5 +221,48 @@ describe('POST /api/v1/docs — create key codec (XIN-83 hop-2 join 404)', () =>
     await createDocHandler(postReq({}, ''), res as never)
     expect(res.statusCode).toBe(400)
     expect((res.body as { error: string }).error).toBe('spaceId required')
+  })
+})
+
+// GET /api/v1/docs list serialization: the per-doc role label must reflect the
+// stored role via the canonical map. A commenter member is stored as 4 (stored
+// value != rank ordinal), so a hand-rolled ternary would mislabel it 'reader'.
+describe('GET /api/v1/docs — role label serialization', () => {
+  // Resolve the anonymous GET '/' handler from the router stack.
+  function getListHandler() {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    for (const layer of (docsRouter as unknown as { stack: any[] }).stack) {
+      const route = layer.route
+      if (route && route.path === '/' && route.methods?.get) {
+        return route.stack[route.stack.length - 1].handle as (req: unknown, res: unknown) => Promise<void>
+      }
+    }
+    throw new Error('list-docs handler not found')
+  }
+
+  function listReq() {
+    return { uid: 'u_1', spaceId: 's1', params: {}, body: undefined, query: {} } as never
+  }
+
+  it('labels a stored-4 member as commenter (not reader) in the doc list', async () => {
+    vi.mocked(docMetaRepo.listForUser).mockResolvedValue({
+      total: 4,
+      items: [
+        { doc_id: 'd_admin', title: 'A', owner_id: 'u_1', doc_type: 'doc', role: 3, updated_at: new Date(0) },
+        { doc_id: 'd_writer', title: 'W', owner_id: 'u_o', doc_type: 'doc', role: 2, updated_at: new Date(0) },
+        { doc_id: 'd_commenter', title: 'C', owner_id: 'u_o', doc_type: 'doc', role: 4, updated_at: new Date(0) },
+        { doc_id: 'd_reader', title: 'R', owner_id: 'u_o', doc_type: 'doc', role: 1, updated_at: new Date(0) },
+      ],
+    } as never)
+    const res = mockRes()
+    await getListHandler()(listReq(), res as never)
+    expect(res.statusCode).toBe(200)
+    const items = (res.body as { items: Array<{ docId: string; role: string }> }).items
+    expect(items.map((i) => [i.docId, i.role])).toEqual([
+      ['d_admin', 'admin'],
+      ['d_writer', 'writer'],
+      ['d_commenter', 'commenter'],
+      ['d_reader', 'reader'],
+    ])
   })
 })

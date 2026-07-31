@@ -18,7 +18,7 @@ export const REQUEST_STATUS_CANCELLED = 4
 export interface DocAccessRequestRow {
   doc_id: string
   uid: string
-  requested_role: number // 1=reader 2=writer
+  requested_role: number // 1=reader 2=writer 4=commenter
   reason: string
   status: number // 1=pending 2=approved 3=denied 4=cancelled
   request_id: string

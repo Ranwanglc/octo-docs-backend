@@ -360,24 +360,14 @@ export const docMetaRepo = {
 
     // tie-break on doc_id keeps offset paging stable when rows share updated_at.
     // role projection MUST mirror the write side (effectiveRole, shareScope.ts):
-    // owner => admin(3); otherwise the MAX of the direct doc_member role and the
-    // share-derived role. When the caller is a confirmed Space member and the doc
-    // is anyone_in_space, an EDIT share yields writer(2) / any other share yields
-    // reader(1) — so a share-only doc (no doc_member row => dm.role NULL) is
-    // labeled writer, not silently reader (Number(null)=0). GREATEST(COALESCE...)
-    // keeps the share path RAISE-only: a direct writer/admin is never lowered by a
-    // reader share. The share arm is only present on the same includeSpaceShare
-    // gate as the visibility predicate, so a non-member never gets a share label.
-    // SHARE_SCOPE_ANYONE / SHARE_ROLE_EDIT are numeric constants inlined (no bind),
-    // so the leading owner-uid bind is identical whether or not the arm is present.
+    // Stored commenter=4 is not privilege-ordered, so the share merge uses an
+    // explicit writer/admin set instead of a raw numeric GREATEST.
     const roleExpr = includeSpaceShare
       ? `CASE WHEN m.owner_id = ? THEN 3
-              ELSE GREATEST(
-                COALESCE(dm.role, 0),
-                CASE WHEN m.share_scope = ${SHARE_SCOPE_ANYONE}
-                     THEN (CASE WHEN m.share_role = ${SHARE_ROLE_EDIT} THEN 2 ELSE 1 END)
-                     ELSE 0 END
-              ) END`
+              WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.share_role = ${SHARE_ROLE_EDIT}
+                THEN CASE WHEN dm.role IN (2, 3) THEN dm.role ELSE 2 END
+              WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} THEN COALESCE(dm.role, 1)
+              ELSE dm.role END`
       : 'CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END'
     const items = await query<DocMeta & { role: number }>(
       `SELECT m.*, ${roleExpr} AS role

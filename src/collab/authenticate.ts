@@ -113,8 +113,10 @@ export async function authenticate(data: AuthInput): Promise<AuthContext> {
     throw forbidden() // 4403
   }
 
-  // 6. reader: set readOnly so writes are rejected BEFORE being applied (v4).
-  if (role === 'reader') {
+  // 6. reader/commenter: set readOnly so body writes are rejected BEFORE being
+  //    applied (v4). A commenter may comment via the REST API but must not edit
+  //    the doc body over the collab connection, so it is read-only here too.
+  if (role === 'reader' || role === 'commenter') {
     connectionConfig.readOnly = true
   }
 
