@@ -219,17 +219,23 @@ export async function createDocHandler(req: Request, res: Response) {
     await grantBotOwnerAdmin(req, meta.doc_id ?? docId, meta.document_name ?? documentName)
   }
 
-  // html docs are intentionally NOT fed to the search index this phase: board +
-  // html are excluded at the producer (isSearchIndexedDoc only accepts
-  // 'document'), and the consumer skips html anyway, so NO index signal is
-  // enqueued on this html registration/upsert path. (An html doc's body is
-  // owned/rendered by the external octo-doc service and never flows through the
-  // Yjs store hooks, so the collab afterStoreDocument feed can't see it either.)
+  // html docs are now indexed too: after registering the meta row (fresh
+  // create OR idempotent-recovery upsert), enqueue an index signal for the
+  // published documentName. Gated OFF by default; html goes through the SAME
+  // isSearchIndexedDoc + enqueueDocIndex path as the rename branch below, so
+  // the octo-doc-indexer picks it up and resolves the body by reading the
+  // latest `v<N>/index.html` from S3 (html has no Yjs body, so the collab
+  // afterStoreDocument feed cannot see it — this handler is the enqueue site).
+  // Best-effort / fire-and-forget: enqueue swallows its own errors so a Kafka
+  // outage does not fail the registration response.
   const responseDocId = resolvedDocType === HTML_DOC_TYPE ? (meta?.doc_id ?? docId) : docId
   const responseDocumentName = resolvedDocType === HTML_DOC_TYPE ? (meta?.document_name ?? documentName) : documentName
   const responseSpaceId = resolvedDocType === HTML_DOC_TYPE ? (meta?.space_id ?? spaceId) : spaceId
   const responseFolderId = resolvedDocType === HTML_DOC_TYPE ? (meta?.folder_id ?? folder) : folder
   const responseOwnerId = resolvedDocType === HTML_DOC_TYPE ? (meta?.owner_id ?? uid) : uid
+  if (resolvedDocType === HTML_DOC_TYPE && config.search.indexEnabled && isSearchIndexedDoc(responseDocumentName)) {
+    void enqueueDocIndex(responseDocumentName)
+  }
   res.status(201).json({
     docId: responseDocId,
     documentName: responseDocumentName,
@@ -612,7 +618,9 @@ async function renameDocById(req: Request, res: Response, docId: string): Promis
   // showing until an unrelated body edit reindexes. Enqueue a body signal: the
   // indexer re-reads the latest authoritative state (including title) by
   // documentName. Best-effort / fire-and-forget (enqueue swallows its own
-  // errors); gated OFF by default; html has no searchable body and is skipped.
+  // errors); gated OFF by default. html now flows through the same gate
+  // (isSearchIndexedDoc accepts 'html') — the indexer reads the S3 body for
+  // html docs; doc/sheet/board keep reading the Yjs body.
   if (config.search.indexEnabled) {
     const documentName = await docMetaRepo.resolveDocumentName(docId)
     if (documentName && isSearchIndexedDoc(documentName)) {
