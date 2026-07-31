@@ -213,7 +213,9 @@ export const config = {
   search: {
     // Master switch. false => POST /docs/search returns 503 (search unavailable).
     enabled: bool('SEARCH_ENABLED', false),
-    // OpenSearch node URL (single node; same cluster the indexer writes to).
+    // OpenSearch node URL(s). Accepts a single URL or a comma-separated list for
+    // a multi-node cluster (the SDK round-robins across them and fails over on
+    // per-request errors). Same cluster the indexer writes to.
     opensearchNode: str('OPENSEARCH_NODE', 'http://127.0.0.1:9200'),
     // Index the indexer writes doc bodies to.
     opensearchIndex: str('OPENSEARCH_INDEX', 'octo-doc'),

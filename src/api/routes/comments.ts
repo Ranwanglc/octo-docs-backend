@@ -32,21 +32,14 @@ import {
 } from '../../collab/anchorResolve.js'
 import { notifyDocMentioned } from '../services/docsNotify.js'
 import type { BlockPath } from '../../collab/docBodyEdit.js'
+import { isDocType } from '../../db/docType.js'
+import { validateExplicitCommentAnchors } from '../services/commentAnchors.js'
+import { publishCommentMutation } from '../services/commentEvents.js'
 
 export const commentsRouter: ExpressRouter = Router()
 
 const DEFAULT_LIMIT = 50
 const MAX_LIMIT = 100
-
-/**
- * Decoded anchor size cap. A Yjs RelativePosition encodes to a few dozen bytes;
- * 4KB is a very generous ceiling that keeps malformed/oversized payloads out of
- * the anchor BLOB columns.
- */
-const MAX_ANCHOR_BYTES = 4096
-
-/** Sentinel: anchor was present on the wire but is not well-formed/usable. */
-const INVALID_ANCHOR = Symbol('invalid_anchor')
 
 /**
  * The only doc_type whose live body is a ProseMirror fragment `anchorText` can be
@@ -80,30 +73,6 @@ function parseId(raw: unknown): number | null {
     return Number.isSafeInteger(n) && n > 0 ? n : null
   }
   return null
-}
-
-/**
- * Decode a base64 anchor string to a Buffer.
- *   - `undefined`        => anchor absent (caller maps to the "required" error)
- *   - `INVALID_ANCHOR`   => anchor present but malformed / empty / oversized
- *   - `Buffer`           => well-formed, within the size cap
- *
- * `Buffer.from(_, 'base64')` is too lax on its own — it silently drops invalid
- * characters (e.g. '@@@@' yields a near-empty buffer). We validate the input is
- * strict, canonical base64 BEFORE decoding, then bound the decoded size.
- */
-function decodeAnchor(raw: unknown): Buffer | undefined | typeof INVALID_ANCHOR {
-  if (raw === undefined || raw === null) return undefined
-  // Present but not a usable string => reject (an anchor must be non-empty).
-  if (typeof raw !== 'string' || raw === '') return INVALID_ANCHOR
-  // Strict base64: only the alphabet, optional 1-2 '=' padding, length a
-  // multiple of 4. This rejects '@@@@', embedded spaces, bad padding, etc.
-  if (raw.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(raw)) return INVALID_ANCHOR
-  const buf = Buffer.from(raw, 'base64')
-  // Re-encode check catches any remaining lax/non-canonical decodes.
-  if (buf.toString('base64') !== raw) return INVALID_ANCHOR
-  if (buf.length === 0 || buf.length > MAX_ANCHOR_BYTES) return INVALID_ANCHOR
-  return buf
 }
 
 /** Sentinel: a supplied disambiguation value is present but not well-formed. */
@@ -177,7 +146,56 @@ function serialize(c: DocComment) {
   }
 }
 
+commentsRouter.get('/:docId/comments/markers', listCommentMarkersHandler)
+commentsRouter.get('/:docId/comments/:id/thread', getCommentThreadHandler)
 commentsRouter.get('/:docId/comments', listCommentsHandler)
+
+/** Fetch one grouped root by marker id without walking paginated thread pages. */
+export async function getCommentThreadHandler(req: Request, res: Response): Promise<void> {
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  if (!guard) return
+  const id = parseId(req.params.id)
+  if (id === null) {
+    res.status(404).json({ error: 'not_found' })
+    return
+  }
+  const root = await docCommentRepo.getById(id)
+  if (!root || root.docId !== guard.meta.doc_id || root.parentId !== null || root.deleted) {
+    res.status(404).json({ error: 'not_found' })
+    return
+  }
+  const replies = await docCommentRepo.listReplies(id)
+  res.status(200).json({ ...serialize(root), replies: replies.map(serialize) })
+}
+
+/** Paginated lightweight marker feed; every page contains unresolved roots only. */
+export async function listCommentMarkersHandler(req: Request, res: Response): Promise<void> {
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  if (!guard) return
+  if (guard.meta.doc_type !== 'board') {
+    res.status(409).json({ error: 'unsupported_doc_type' })
+    return
+  }
+  const rawCursor = req.query.cursor
+  const cursor = rawCursor === undefined ? null : parseId(rawCursor)
+  if (rawCursor !== undefined && cursor === null) {
+    res.status(400).json({ error: 'invalid_cursor' })
+    return
+  }
+  const limitRaw = Number(req.query.limit ?? DEFAULT_LIMIT)
+  const limit = Math.min(MAX_LIMIT, Math.max(1, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : DEFAULT_LIMIT))
+  const roots = await docCommentRepo.listUnresolvedMarkers(guard.meta.doc_id, cursor, limit)
+  const items = roots.map((root) => ({
+    id: root.id,
+    anchorStart: root.anchorStart.toString('base64'),
+    anchorEnd: root.anchorEnd.toString('base64'),
+    anchorText: root.anchorText,
+    resolved: root.resolved,
+    updatedAt: root.updatedAt,
+  }))
+  const nextCursor = roots.length === limit ? roots[roots.length - 1]!.id : null
+  res.status(200).json({ items, nextCursor })
+}
 
 export async function listCommentsHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
@@ -231,29 +249,22 @@ export async function createCommentHandler(req: Request, res: Response): Promise
       res.status(400).json({ error: 'invalid parentId' })
       return
     }
-    const parent = await docCommentRepo.getById(pid)
-    // Hide cross-doc references behind 404 (do not leak existence).
-    if (!parent || parent.docId !== docId || parent.deleted) {
-      res.status(404).json({ error: 'not_found' })
-      return
-    }
-    if (parent.parentId !== null) {
-      // Single-level nesting only: cannot reply to a reply.
-      res.status(400).json({ error: 'parent is not a thread root' })
-      return
-    }
-    const id = await docCommentRepo.create({
+    // Validate and insert under one row lock so a concurrent root delete cannot create an orphan.
+    const id = await docCommentRepo.createReplyIfRoot({
       docId,
       documentName,
       parentId: pid,
       authorUid: req.uid!,
       body,
-      anchorStart: null,
-      anchorEnd: null,
-      anchorText: '',
     })
-    // Best-effort: notify anyone @-mentioned in the reply. Never blocks/fails the 201.
+    // Hide cross-doc, deleted, and nested parent references behind 404.
+    if (id === null) {
+      res.status(404).json({ error: 'not_found' })
+      return
+    }
+    // Best-effort: notify mentions and invalidate live comment views.
     void notifyDocMentioned({ docId, spaceId: req.spaceId!, title: guard.meta.title, authorUid: req.uid!, body })
+    void publishCommentMutation(documentName, docId, id, 'created')
     res.status(201).json({ id })
     return
   }
@@ -263,22 +274,27 @@ export async function createCommentHandler(req: Request, res: Response): Promise
   //   (b) bot — anchorText (+ optional blockPath/occurrence), resolved here.
   // Legacy explicit anchors always win, so the existing front-end flow (which
   // sends both anchors AND an anchorText snapshot) is untouched.
-  const startDec = decodeAnchor(anchorStart)
-  const endDec = decodeAnchor(anchorEnd)
-  // Present-but-malformed/oversized is rejected distinctly from absent, so a
-  // bad anchor is never silently stored as empty.
-  if (startDec === INVALID_ANCHOR || endDec === INVALID_ANCHOR) {
-    res.status(400).json({ error: 'invalid_anchor' })
-    return
-  }
+  const hasStart = anchorStart !== undefined && anchorStart !== null
+  const hasEnd = anchorEnd !== undefined && anchorEnd !== null
 
   let start: Buffer
   let end: Buffer
-  if (startDec && endDec) {
-    // (a) Legacy explicit anchors.
-    start = startDec
-    end = endDec
-  } else if (startDec === undefined && endDec === undefined && typeof anchorText === 'string' && anchorText.trim() !== '') {
+  if (hasStart && hasEnd) {
+    // (a) Explicit anchors. Board anchors are canonical versioned JSON; all
+    // other document types retain their existing opaque formats and reject the
+    // board namespace.
+    if (!isDocType(guard.meta.doc_type)) {
+      res.status(409).json({ error: 'unsupported_doc_type' })
+      return
+    }
+    const validated = validateExplicitCommentAnchors(guard.meta.doc_type, anchorStart, anchorEnd)
+    if (!validated.ok) {
+      res.status(400).json({ error: validated.error })
+      return
+    }
+    start = validated.start
+    end = validated.end
+  } else if (!hasStart && !hasEnd && typeof anchorText === 'string' && anchorText.trim() !== '') {
     // (b) Bot path: resolve anchorText against the live document.
     // Gate the doc_type BEFORE touching the live doc: a non-'doc' target stores a
     // non-ProseMirror Y.Doc, so the resolver's initProseMirrorDoc would throw.
@@ -330,8 +346,9 @@ export async function createCommentHandler(req: Request, res: Response): Promise
     anchorEnd: end,
     anchorText: typeof anchorText === 'string' ? anchorText.slice(0, 512) : '',
   })
-  // Best-effort: notify anyone @-mentioned in the comment. Never blocks/fails the 201.
+  // Best-effort: notify mentions and invalidate live comment views.
   void notifyDocMentioned({ docId, spaceId: req.spaceId!, title: guard.meta.title, authorUid: req.uid!, body })
+  void publishCommentMutation(documentName, docId, id, 'created')
   res.status(201).json({ id })
 }
 
@@ -353,7 +370,7 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
   }
   const comment = await docCommentRepo.getById(id)
   // Cross-doc / missing / deleted => 404 (do not leak existence).
-  if (!comment || comment.docId !== docId || comment.deleted) {
+  if (!comment || comment.docId !== guard.meta.doc_id || comment.deleted) {
     res.status(404).json({ error: 'not_found' })
     return
   }
@@ -375,6 +392,8 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
       return
     }
     await docCommentRepo.setResolved(id, resolved, req.uid!)
+    // Resolve/reopen changes both thread and marker visibility; clients refresh.
+    void publishCommentMutation(guard.meta.document_name, guard.meta.doc_id, id, 'updated')
     res.status(200).json({ id })
     return
   }
@@ -390,6 +409,7 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
       return
     }
     await docCommentRepo.updateBody(id, body)
+    void publishCommentMutation(guard.meta.document_name, guard.meta.doc_id, id, 'updated')
     res.status(200).json({ id })
     return
   }
@@ -412,7 +432,7 @@ export async function deleteCommentHandler(req: Request, res: Response): Promise
     return
   }
   const comment = await docCommentRepo.getById(id)
-  if (!comment || comment.docId !== docId || comment.deleted) {
+  if (!comment || comment.docId !== guard.meta.doc_id || comment.deleted) {
     res.status(404).json({ error: 'not_found' })
     return
   }
@@ -427,6 +447,7 @@ export async function deleteCommentHandler(req: Request, res: Response): Promise
     }
     // doc_id from the guard is authoritative; scopes the destructive cascade.
     await docCommentRepo.hardDelete(id, guard.meta.doc_id)
+    void publishCommentMutation(guard.meta.document_name, guard.meta.doc_id, id, 'deleted')
     res.status(200).json({ id })
     return
   }
@@ -437,5 +458,6 @@ export async function deleteCommentHandler(req: Request, res: Response): Promise
     return
   }
   await docCommentRepo.softDelete(id)
+  void publishCommentMutation(guard.meta.document_name, guard.meta.doc_id, id, 'deleted')
   res.status(200).json({ id })
 }

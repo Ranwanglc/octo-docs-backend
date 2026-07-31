@@ -21,6 +21,8 @@ vi.mock('../src/collab/anchorResolve.js', async () => {
 
 import {
   listCommentsHandler,
+  listCommentMarkersHandler,
+  getCommentThreadHandler,
   createCommentHandler,
   patchCommentHandler,
   deleteCommentHandler,
@@ -367,9 +369,12 @@ describe('POST create (reader can comment)', () => {
 
   it('creates a reply and stores NULL anchors (reply anchor invariant)', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
-    // getById(parent) -> an existing root in this doc.
-    vi.mocked(query).mockResolvedValueOnce([rootRow({ id: 10 })] as never)
     mockInsertId(200)
+    txQuery.mockImplementation(async (sql: string) => {
+      if (String(sql).includes('FOR UPDATE')) return [{ id: 10 }]
+      if (String(sql).includes('LAST_INSERT_ID')) return [{ id: 200 }]
+      return []
+    })
     const res = mockRes()
     await createCommentHandler(
       req({ params: { docId: 'd_1' }, body: { body: 'a reply', parentId: 10 } }),
@@ -381,24 +386,23 @@ describe('POST create (reader can comment)', () => {
     const insert = txQuery.mock.calls.find((c) => String(c[0]).includes('INSERT INTO doc_comment'))!
     const args = insert[1] as unknown[]
     expect(args[2]).toBe(10) // parent_id
-    expect(args[5]).toBeNull() // anchor_start
-    expect(args[6]).toBeNull() // anchor_end
+    expect(String(insert[0])).toContain('NULL, NULL')
   })
 
   it('rejects a reply to a non-root (single-level nesting only)', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
-    vi.mocked(query).mockResolvedValueOnce([rootRow({ id: 11, parent_id: 10 })] as never)
+    mockInsertId(0)
     const res = mockRes()
     await createCommentHandler(
       req({ params: { docId: 'd_1' }, body: { body: 'nested', parentId: 11 } }),
       res as never,
     )
-    expect(res.statusCode).toBe(400)
+    expect(res.statusCode).toBe(404)
   })
 
   it('404s when the reply parent belongs to a different doc (no leak)', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
-    vi.mocked(query).mockResolvedValueOnce([rootRow({ id: 12, doc_id: 'd_OTHER' })] as never)
+    mockInsertId(0)
     const res = mockRes()
     await createCommentHandler(
       req({ params: { docId: 'd_1' }, body: { body: 'x', parentId: 12 } }),
@@ -592,6 +596,8 @@ describe('DELETE soft / hard', () => {
       res as never,
     )
     expect(res.statusCode).toBe(200)
+    const lock = txQ.mock.calls.find((c) => String(c[0]).includes('FOR UPDATE'))
+    expect(lock?.[1]).toEqual([10, 'd_1'])
     const del = txQ.mock.calls.find((c) => String(c[0]).includes('DELETE FROM doc_comment'))
     expect(del).toBeTruthy()
     // The cascade is bounded by the authoritative doc_id from the guard.
@@ -671,6 +677,98 @@ describe('reader floor gate on body-edit / soft-delete (revoked author + doc sta
       res as never,
     )
     expect(res.statusCode).toBe(409)
+  })
+})
+
+describe('GET one grouped comment thread', () => {
+  it('returns a root and replies by marker id with reader access', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query)
+      .mockResolvedValueOnce([rootRow({ id: 10 })] as never)
+      .mockResolvedValueOnce([rootRow({ id: 11, parent_id: 10, anchor_start: null, anchor_end: null })] as never)
+    const res = mockRes()
+    await getCommentThreadHandler(req({ params: { docId: 'd_1', id: '10' } }), res as never)
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toMatchObject({ id: 10, replies: [{ id: 11, parentId: 10 }] })
+    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
+  })
+
+  it('404s cross-doc ids and reply ids without loading replies', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ doc_id: 'd_OTHER' })] as never)
+    const crossDoc = mockRes()
+    await getCommentThreadHandler(req({ params: { docId: 'd_1', id: '10' } }), crossDoc as never)
+    expect(crossDoc.statusCode).toBe(404)
+    expect(query).toHaveBeenCalledTimes(1)
+
+    vi.mocked(query).mockReset()
+    vi.mocked(query).mockResolvedValueOnce([rootRow({ id: 11, parent_id: 10 })] as never)
+    const reply = mockRes()
+    await getCommentThreadHandler(req({ params: { docId: 'd_1', id: '11' } }), reply as never)
+    expect(reply.statusCode).toBe(404)
+    expect(query).toHaveBeenCalledTimes(1)
+  })
+
+  it('applies the reader floor before looking up the comment', async () => {
+    forbidGuard()
+    const res = mockRes()
+    await getCommentThreadHandler(req({ params: { docId: 'd_1', id: '10' } }), res as never)
+    expect(res.statusCode).toBe(403)
+    expect(query).not.toHaveBeenCalled()
+  })
+})
+
+describe('GET board marker list', () => {
+  const boardGuard = {
+    meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1', doc_type: 'board' }, role: 'reader',
+  } as never
+
+  it('returns a lightweight cursor page of every unresolved root', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    vi.mocked(query).mockResolvedValueOnce([
+      rootRow({ id: 10 }), rootRow({ id: 20, anchor_text: 'second' }),
+    ] as never)
+    const res = mockRes()
+    await listCommentMarkersHandler(
+      req({ params: { docId: 'd_1' }, query: { cursor: '5', limit: '2' } }), res as never,
+    )
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toMatchObject({
+      items: [
+        { id: 10, anchorText: 'snap', resolved: false },
+        { id: 20, anchorText: 'second', resolved: false },
+      ],
+      nextCursor: 20,
+    })
+    const [sql, args] = vi.mocked(query).mock.calls[0]!
+    expect(String(sql)).toContain('parent_id IS NULL AND deleted = 0 AND resolved = 0 AND id > ?')
+    expect(args).toEqual(['d_1', 5])
+    expect(Object.keys((res.body as { items: Record<string, unknown>[] }).items[0]!)).toEqual([
+      'id', 'anchorStart', 'anchorEnd', 'anchorText', 'resolved', 'updatedAt',
+    ])
+  })
+
+  it('requires reader access before querying', async () => {
+    forbidGuard()
+    const res = mockRes()
+    await listCommentMarkersHandler(req({ params: { docId: 'd_1' } }), res as never)
+    expect(res.statusCode).toBe(403)
+    expect(query).not.toHaveBeenCalled()
+  })
+
+  it('rejects non-board docs and malformed cursors', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(readerGuard)
+    const wrongType = mockRes()
+    await listCommentMarkersHandler(req({ params: { docId: 'd_1' } }), wrongType as never)
+    expect(wrongType.statusCode).toBe(409)
+
+    vi.mocked(requireDocRole).mockResolvedValue(boardGuard)
+    const badCursor = mockRes()
+    await listCommentMarkersHandler(
+      req({ params: { docId: 'd_1' }, query: { cursor: 'bad' } }), badCursor as never,
+    )
+    expect(badCursor.statusCode).toBe(400)
+    expect(query).not.toHaveBeenCalled()
   })
 })
 
@@ -816,17 +914,20 @@ describe('docCommentRepo (§3.4)', () => {
     // Root target (id=10): the statement removes the root AND any row whose
     // parent_id is 10 (its replies) — no orphans left behind. Scoped to doc_id.
     await docCommentRepo.hardDelete(10, 'd_1')
-    expect(txQ).toHaveBeenCalledTimes(1)
-    const sql = String(txQ.mock.calls[0]![0])
+    expect(txQ).toHaveBeenCalledTimes(2)
+    expect(String(txQ.mock.calls[0]![0])).toContain('FOR UPDATE')
+    expect(txQ.mock.calls[0]![1]).toEqual([10, 'd_1'])
+    const sql = String(txQ.mock.calls[1]![0])
     expect(sql).toContain('DELETE FROM doc_comment')
     expect(sql).toContain('(id = ? OR parent_id = ?) AND doc_id = ?')
-    expect(txQ.mock.calls[0]![1]).toEqual([10, 10, 'd_1'])
+    expect(txQ.mock.calls[1]![1]).toEqual([10, 10, 'd_1'])
 
     // Reply target (id=11): same statement; since no row has parent_id = 11
     // (single-level nesting), only the reply row itself is deleted.
     txQ.mockClear()
     await docCommentRepo.hardDelete(11, 'd_1')
-    expect(txQ.mock.calls[0]![1]).toEqual([11, 11, 'd_1'])
+    expect(txQ.mock.calls[0]![1]).toEqual([11, 'd_1'])
+    expect(txQ.mock.calls[1]![1]).toEqual([11, 11, 'd_1'])
   })
 
   it('hardDelete cascade is doc-scoped: the doc_id bound makes it impossible to touch another doc', async () => {
@@ -839,8 +940,8 @@ describe('docCommentRepo (§3.4)', () => {
       fn({ query: txQ })) as never)
 
     await docCommentRepo.hardDelete(10, 'd_1')
-    const sql = String(txQ.mock.calls[0]![0])
-    const params = txQ.mock.calls[0]![1] as unknown[]
+    const sql = String(txQ.mock.calls[1]![0])
+    const params = txQ.mock.calls[1]![1] as unknown[]
     expect(sql).toContain('AND doc_id = ?')
     expect(params).toContain('d_1')
     // No other doc's id appears in the bound — the delete cannot reach d_OTHER.

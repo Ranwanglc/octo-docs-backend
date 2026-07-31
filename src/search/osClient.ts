@@ -40,10 +40,23 @@ export class VisibleTermsTooLargeError extends Error {
 export function getOsClient(): Client {
   if (!client) {
     const { opensearchNode, opensearchUsername, opensearchPassword } = config.search
-    // https + explicit opt-out => disable cert verification (escape hatch for an
-    // internal self-signed node). http or default (verify on) => no ssl override.
+    // Split comma-separated URLs into a list; a single URL parses to one entry
+    // (SDK accepts both `node: string` and `node: string[]`, we always hand it
+    // an array for uniformity). Empty entries (trailing comma, whitespace) are
+    // dropped so `"http://a,"` still parses as one node, not one node + empty.
+    const nodes = opensearchNode
+      .split(',')
+      .map((n) => n.trim())
+      .filter((n) => n !== '')
+    if (nodes.length === 0) {
+      throw new Error('config: OPENSEARCH_NODE must contain at least one URL')
+    }
+    // TLS opt-out applies when ANY configured node is https. The SDK uses one
+    // ssl config for the whole client; mixing http+https nodes is a config
+    // mistake we don't try to paper over.
+    const anyHttps = nodes.some((n) => n.startsWith('https:'))
     const ssl =
-      opensearchNode.startsWith('https:') && config.search.opensearchTlsRejectUnauthorized === false
+      anyHttps && config.search.opensearchTlsRejectUnauthorized === false
         ? { rejectUnauthorized: false }
         : undefined
     if (ssl) {
@@ -54,11 +67,13 @@ export function getOsClient(): Client {
       // typo path, this covers the intentional opt-out).
       // eslint-disable-next-line no-console -- one-time construction-time security signal, same opt-in as bootstrap logging in index.ts
       console.warn(
-        `[osClient] OPENSEARCH_TLS_REJECT_UNAUTHORIZED=false: TLS certificate verification is DISABLED for ${opensearchNode}. Only use this for a trusted internal endpoint.`,
+        `[osClient] OPENSEARCH_TLS_REJECT_UNAUTHORIZED=false: TLS certificate verification is DISABLED for ${nodes.join(',')}. Only use this for a trusted internal endpoint.`,
       )
     }
     client = new Client({
-      node: opensearchNode,
+      // Multi-node: SDK round-robins requests and fails over on per-request
+      // errors. Single-node deploys still work — nodes is just [oneUrl].
+      nodes,
       // Basic auth only when both parts are configured; otherwise omit the header
       // entirely so an unauthenticated dev cluster works with empty creds.
       ...(opensearchUsername !== '' && opensearchPassword !== ''

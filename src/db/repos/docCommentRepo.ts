@@ -67,6 +67,24 @@ function mapRow(row: DocCommentRow): DocComment {
   }
 }
 
+export interface DocCommentMarker {
+  id: number
+  anchorStart: Buffer
+  anchorEnd: Buffer
+  anchorText: string
+  resolved: boolean
+  updatedAt: Date
+}
+
+interface DocCommentMarkerRow {
+  id: number | string
+  anchor_start: Buffer
+  anchor_end: Buffer
+  anchor_text: string
+  resolved: number
+  updated_at: Date
+}
+
 export interface CreateCommentInput {
   docId: string
   documentName: string
@@ -113,6 +131,26 @@ export const docCommentRepo = {
     })
   },
 
+  async createReplyIfRoot(input: Omit<CreateCommentInput, 'anchorStart' | 'anchorEnd' | 'anchorText'>): Promise<number | null> {
+    return transaction(async (tx) => {
+      const roots = await tx.query<{ id: number | string }>(
+        `SELECT id FROM doc_comment
+          WHERE id = ? AND doc_id = ? AND parent_id IS NULL AND deleted = 0
+          FOR UPDATE`,
+        [input.parentId, input.docId],
+      )
+      if (!roots[0]) return null
+      await tx.query(
+        `INSERT INTO doc_comment
+           (doc_id, document_name, parent_id, author_uid, body, anchor_start, anchor_end, anchor_text)
+         VALUES (?, ?, ?, ?, ?, NULL, NULL, '')`,
+        [input.docId, input.documentName, input.parentId, input.authorUid, input.body],
+      )
+      const rows = await tx.query<{ id: number | string }>('SELECT LAST_INSERT_ID() AS id')
+      return Number(rows[0]?.id ?? 0)
+    })
+  },
+
   async getById(id: number): Promise<DocComment | null> {
     const rows = await query<DocCommentRow>('SELECT * FROM doc_comment WHERE id = ? LIMIT 1', [id])
     return rows[0] ? mapRow(rows[0]) : null
@@ -149,6 +187,28 @@ export const docCommentRepo = {
       [...args],
     )
     return rows.map(mapRow)
+  },
+
+  /** Lightweight unresolved roots for board marker hydration. */
+  async listUnresolvedMarkers(docId: string, cursor: number | null, limit: number): Promise<DocCommentMarker[]> {
+    const lim = Math.min(100, Math.max(1, Number.isInteger(limit) ? limit : 50))
+    const cursorClause = cursor == null ? '' : ' AND id > ?'
+    const args: unknown[] = cursor == null ? [docId] : [docId, cursor]
+    const rows = await query<DocCommentMarkerRow>(
+      `SELECT id, anchor_start, anchor_end, anchor_text, resolved, updated_at
+         FROM doc_comment
+        WHERE doc_id = ? AND parent_id IS NULL AND deleted = 0 AND resolved = 0${cursorClause}
+        ORDER BY id ASC LIMIT ${lim}`,
+      args,
+    )
+    return rows.map((row) => ({
+      id: Number(row.id),
+      anchorStart: row.anchor_start,
+      anchorEnd: row.anchor_end,
+      anchorText: row.anchor_text,
+      resolved: row.resolved === 1,
+      updatedAt: row.updated_at,
+    }))
   },
 
   /** Non-deleted replies of a thread root, oldest first. */
@@ -219,6 +279,13 @@ export const docCommentRepo = {
    */
   async hardDelete(id: number, docId: string): Promise<void> {
     await transaction(async (tx) => {
+      // Serialize with createReplyIfRoot's root lock. If reply creation wins,
+      // this delete waits and then removes the committed reply; if deletion
+      // wins, the reply path waits and subsequently finds no valid root.
+      await tx.query(
+        'SELECT id FROM doc_comment WHERE id = ? AND doc_id = ? FOR UPDATE',
+        [id, docId],
+      )
       await tx.query(
         'DELETE FROM doc_comment WHERE (id = ? OR parent_id = ?) AND doc_id = ?',
         [id, id, docId],

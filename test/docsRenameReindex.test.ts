@@ -30,8 +30,13 @@ vi.mock('../src/db/repos/docMetaRepo.js', () => ({
 const { enqueueDocIndexMock } = vi.hoisted(() => ({ enqueueDocIndexMock: vi.fn(async () => true) }))
 vi.mock('../src/search/docIndexQueue.js', () => ({
   enqueueDocIndex: enqueueDocIndexMock,
-  // Real gate: document (4-seg) has a searchable body, html (5-seg) does not.
-  isSearchIndexedDoc: (name: string) => name.split(':').length === 4,
+  // Real gate: document (4-seg), whiteboard (:wb:), and html (5-seg) all
+  // qualify as searchable now. Match the real function shape closely enough
+  // for these rename tests (segment count is a reliable proxy here).
+  isSearchIndexedDoc: (name: string) => {
+    const segs = name.split(':')
+    return segs.length === 4 || segs.length === 5
+  },
 }))
 
 import { docsRouter } from '../src/api/routes/docs.js'
@@ -118,15 +123,15 @@ describe('rename -> search reindex signal (§3.3a)', () => {
     expect(enqueueDocIndexMock).not.toHaveBeenCalled()
   })
 
-  it('does NOT enqueue for an html doc (no searchable body)', async () => {
+  it('DOES enqueue for an html doc — body resolved from octo-docs-html S3 by the indexer', async () => {
     vi.mocked(requireDocRole).mockResolvedValue({ role: 'admin' } as never)
-    // 5-seg html key -> isSearchIndexedDoc returns false.
+    // 5-seg html key -> isSearchIndexedDoc now returns true; rename should enqueue.
     vi.mocked(docMetaRepo.resolveDocumentName).mockResolvedValue('octo:s1:f_default:html:d_1')
 
     const res = mockRes()
     await callRenameByDocId(req('d_1', 'New Title'), res)
 
     expect(res.statusCode).toBe(200)
-    expect(enqueueDocIndexMock).not.toHaveBeenCalled()
+    expect(enqueueDocIndexMock).toHaveBeenCalledOnce()
   })
 })
