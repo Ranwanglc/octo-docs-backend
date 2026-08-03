@@ -115,13 +115,12 @@ describe('POST /api/v1/docs/:docId/invites — create response (#6)', () => {
     expect(invalid.statusCode).toBe(400)
   })
 
-  it('rejects commenter invites for non-HTML documents', async () => {
+  it('creates commenter invites for non-HTML documents', async () => {
     vi.mocked(requireDocRole).mockResolvedValue({ meta: { doc_type: 'doc' }, role: 'admin' } as never)
     const res = mockRes()
     await createInviteHandler()(reqWith({ role: 'commenter' }), res as never)
-    expect(res.statusCode).toBe(409)
-    expect(res.body).toEqual({ error: 'unsupported_doc_type' })
-    expect(vi.mocked(docInviteRepo.create)).not.toHaveBeenCalled()
+    expect(res.statusCode).toBe(201)
+    expect(vi.mocked(docInviteRepo.create)).toHaveBeenCalledWith(expect.objectContaining({ roleNum: 4 }))
   })
 })
 

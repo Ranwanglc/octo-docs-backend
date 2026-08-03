@@ -11,6 +11,7 @@
 --
 -- Tables:
 --   doc_meta              business metadata (title/owner/space/folder/epoch)
+--   docs_metadata         deployment-level compatibility markers
 --   doc_member            document-autonomous membership (reader/commenter/writer/admin)
 --   doc_invite            link invites
 --   doc_invite_redemption invite redemption ledger (idempotency / audit)
@@ -59,6 +60,17 @@ CREATE TABLE doc_meta (
   CONSTRAINT chk_doc_meta_share_scope CHECK (share_scope IN (0, 1)),
   CONSTRAINT chk_doc_meta_share_role  CHECK (share_role  IN (1, 2))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Deployment-level compatibility markers. Role values use append-v1:
+-- reader=1, writer=2, admin=3, commenter=4 (comparison rank is separate).
+CREATE TABLE docs_metadata (
+  meta_key   VARCHAR(64)  NOT NULL,
+  meta_value VARCHAR(255) NOT NULL,
+  updated_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (meta_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT INTO docs_metadata (meta_key, meta_value) VALUES ('role_encoding', 'append-v1');
 
 -- 文档自治成员（v2.0 新增，替代 v1.x 的 doc_acl —— 见下方迁移说明）
 -- 把 uid 按 role 直接授到某 doc；resolveRole 仅查此表 + owner（§4.2），不再做 octo 群继承。

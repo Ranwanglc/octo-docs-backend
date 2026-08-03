@@ -33,11 +33,7 @@ export const docsRouter: ExpressRouter = Router()
 const DEFAULT_FOLDER = 'f_default'
 
 /** Serialize the numeric doc_member role to the wire string enum (§3 wire). */
-const roleName = (n: number): string => {
-  const role = roleFromNumber(n)
-  if (!role) throw new Error(`invalid document role ${n}`)
-  return role
-}
+const roleName = (n: number): string => roleFromNumber(n) ?? 'reader'
 
 /** Normalize a repeated query param (`?creator=a&creator=b`) to a string[]. */
 function toStringArray(v: unknown): string[] {

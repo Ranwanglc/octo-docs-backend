@@ -132,11 +132,14 @@ function roleProjection(isSpaceMember: boolean): string {
     ? `CASE WHEN m.owner_id = ? THEN 3
             WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id
                  AND m.share_role = ${SHARE_ROLE_EDIT}
-              THEN CASE WHEN dm.role IN (2, 3) THEN dm.role ELSE 2 END
+              THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 ELSE 2 END
             WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id
-              THEN COALESCE(dm.role, 1)
-            ELSE dm.role END`
-    : 'CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END'
+              THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1 ELSE 1 END
+            WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
+            ELSE NULL END`
+    : `CASE WHEN m.owner_id = ? THEN 3
+            WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
+            ELSE NULL END`
 }
 
 export const docViewHistoryRepo = {

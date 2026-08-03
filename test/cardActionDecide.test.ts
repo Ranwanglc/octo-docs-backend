@@ -235,8 +235,8 @@ describe('cardActionDecideHandler (archived-doc guard)', () => {
   })
 })
 
-describe('cardActionDecideHandler (commenter document-type guard)', () => {
-  it('does not decide or grant a commenter request for a non-HTML document', async () => {
+describe('cardActionDecideHandler (commenter on every document type)', () => {
+  it('decides and grants a commenter request for a non-HTML document', async () => {
     const { docMetaRepo } = await import('../src/db/repos/docMetaRepo.js')
     const { docAccessRequestRepo } = await import('../src/db/repos/docAccessRequestRepo.js')
     const { grantForwardAccess } = await import('../src/api/services/grantForward.js')
@@ -260,9 +260,9 @@ describe('cardActionDecideHandler (commenter document-type guard)', () => {
       'X-Octo-Signature': sign(CARD_ACTION_DECIDE_PATH, body, ts, eventId, HANDLER_SECRET),
     }, body)
     await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
-    expect((res.payload as { disposition: string }).disposition).toBe('conflict')
-    expect(docAccessRequestRepo.decide).not.toHaveBeenCalled()
-    expect(grantForwardAccess).not.toHaveBeenCalled()
+    expect((res.payload as { disposition: string }).disposition).toBe('applied')
+    expect(docAccessRequestRepo.decide).toHaveBeenCalled()
+    expect(grantForwardAccess).toHaveBeenCalledWith(expect.objectContaining({ roleNum: 4 }))
   })
 })
 

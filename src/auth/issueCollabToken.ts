@@ -23,7 +23,7 @@ import { resolveRole, resolveDocMetaByName } from '../permission/resolveRole.js'
 import { docViewHistoryRepo } from '../db/repos/docViewHistoryRepo.js'
 import { config } from '../config/env.js'
 import { effectiveRole, SHARE_SCOPE_ANYONE } from '../permission/shareScope.js'
-import { HTML_DOC_TYPE } from '../db/docType.js'
+
 
 export type IssueResult =
   | { ok: true; result: CollabTokenResult }
@@ -107,9 +107,6 @@ export async function issueCollabToken(
   const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
 
-  // HTML bodies remain read-only on this Yjs channel. Preserve commenter in the
-  // claim for role-aware clients; writer/admin are still clamped to reader.
-  const effRole = meta.doc_type === HTML_DOC_TYPE ? (role === 'commenter' ? role : 'reader') : role
 
   // FEAT-B recent-view fallback ingest (MF2, default-on). Every document open —
   // read-only INCLUDED — passes through here, so this is the reliable "open ==
@@ -149,7 +146,9 @@ export async function issueCollabToken(
   const result = signCollabToken({
     uid,
     documentName,
-    role: effRole,
+    // Preserve the authoritative role for every document type. Authentication
+    // makes reader/commenter read-only while writer/admin remain writable.
+    role,
     permission_epoch: meta.permission_epoch,
     ...(displayName !== '' ? { name: displayName } : {}),
     ...(spaceMember ? { space_member: true } : {}),

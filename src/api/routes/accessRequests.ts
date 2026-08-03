@@ -31,7 +31,7 @@ import { grantForwardAccess } from '../services/grantForward.js'
 import { notifyDocAccessRequested } from '../services/docsNotify.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
 import { isAccessRequestRole, roleAtLeast, roleToNumber, roleFromNumber } from '../../permission/role.js'
-import { HTML_DOC_TYPE } from '../../db/docType.js'
+
 
 export const accessRequestsRouter: ExpressRouter = Router()
 
@@ -89,10 +89,7 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
     res.status(400).json({ error: 'requestedRole must be reader|commenter|writer' })
     return
   }
-  if (requestedRole === 'commenter' && meta.doc_type !== HTML_DOC_TYPE) {
-    res.status(409).json({ error: 'unsupported_doc_type' })
-    return
-  }
+
   const reasonRaw = (req.body ?? {}).reason
   const reason = typeof reasonRaw === 'string' ? reasonRaw.slice(0, 512) : ''
 
@@ -183,10 +180,7 @@ accessRequestsRouter.post(
       res.status(400).json({ error: 'role must be reader|commenter|writer' })
       return
     }
-    if (grantRole === 'commenter' && guard.meta.doc_type !== HTML_DOC_TYPE) {
-      res.status(409).json({ error: 'unsupported_doc_type' })
-      return
-    }
+
 
     // Transition pending -> approved first; grant only on a genuine transition.
     const decided = await docAccessRequestRepo.decide({

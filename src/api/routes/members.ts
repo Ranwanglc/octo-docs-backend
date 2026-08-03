@@ -10,7 +10,7 @@ import { requireDocRole } from '../guard.js'
 import { bumpEpoch } from '../../permission/epoch.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { isMemberRole, roleToNumber, roleFromNumber, type Role } from '../../permission/role.js'
-import { HTML_DOC_TYPE } from '../../db/docType.js'
+
 
 export const membersRouter: ExpressRouter = Router()
 
@@ -75,10 +75,7 @@ membersRouter.put('/:docId/members', async (req: Request, res: Response) => {
     res.status(400).json({ error: 'role must be reader|commenter|writer|admin' })
     return
   }
-  if (parsedRole === 'commenter' && guard.meta.doc_type !== HTML_DOC_TYPE) {
-    res.status(409).json({ error: 'unsupported_doc_type' })
-    return
-  }
+
   // verify target uid exists in octo (anti ghost-member). On the bot mount
   // (req.botToken set by verifyBot) resolve with the bot's own token via the
   // bot user-info route; on the human path resolve with the caller/service

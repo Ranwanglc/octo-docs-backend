@@ -127,16 +127,15 @@ describe('PUT /api/v1/docs/:docId/members — anti ghost-member check', () => {
     expect(vi.mocked(docMemberRepo.upsertDirect).mock.calls.at(-1)![0]).toMatchObject({ roleNum: 4 })
   })
 
-  it('rejects commenter on a non-HTML document', async () => {
+  it('supports commenter on a non-HTML document', async () => {
     vi.mocked(requireDocRole).mockResolvedValue({
       meta: { doc_id: 'd_1', document_name: 'doc-d_1', owner_id: 'u_admin', doc_type: 'doc' }, role: 'admin',
     } as never)
     stubIdentity({ u_real: { uid: 'u_real', name: 'Real User' } })
     const res = mockRes()
     await putMemberHandler()(req({ uid: 'u_real', role: 'commenter' }), res as never)
-    expect(res.statusCode).toBe(409)
-    expect(res.body).toEqual({ error: 'unsupported_doc_type' })
-    expect(vi.mocked(docMemberRepo.upsertDirect)).not.toHaveBeenCalled()
+    expect(res.statusCode).toBe(200)
+    expect(vi.mocked(docMemberRepo.upsertDirect)).toHaveBeenCalledWith(expect.objectContaining({ roleNum: 4 }))
   })
 
   it('rejects an unknown role -> 400', async () => {

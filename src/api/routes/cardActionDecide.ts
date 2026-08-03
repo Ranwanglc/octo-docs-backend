@@ -31,7 +31,7 @@ import { grantForwardAccess } from '../services/grantForward.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
 import { buildDecisionDisplay, buildDecisionDisplayAt } from '../services/decisionDisplay.js'
 import { isAccessRequestRole, roleFromNumber } from '../../permission/role.js'
-import { HTML_DOC_TYPE } from '../../db/docType.js'
+
 
 /**
  * Exact callback path. octo-server signs the canonical over the PATH of the
@@ -206,9 +206,7 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
   if (!isAccessRequestRole(requestedRole)) {
     return { disposition: 'conflict', state: statusToState(request.status), requester_uid: request.uid }
   }
-  if (req.decision === 'approve' && requestedRole === 'commenter' && meta.doc_type !== HTML_DOC_TYPE) {
-    return { disposition: 'conflict', state: statusToState(request.status), requester_uid: request.uid }
-  }
+
 
   // operator_uid is an authenticated identity assertion, NOT authorization —
   // re-check the operator is currently an admin/owner of this doc.

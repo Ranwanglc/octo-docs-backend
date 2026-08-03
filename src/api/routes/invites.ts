@@ -12,7 +12,7 @@ import { newInviteToken } from '../../util/ids.js'
 import { roleToNumber, roleFromNumber, type Role } from '../../permission/role.js'
 import { acceptInvite, acceptInviteForUid } from '../services/acceptInvite.js'
 import { extractOctoToken } from '../middleware/auth.js'
-import { HTML_DOC_TYPE } from '../../db/docType.js'
+
 
 export const invitesRouter: ExpressRouter = Router()
 
@@ -53,10 +53,7 @@ invitesRouter.post('/:docId/invites', async (req: Request, res: Response) => {
     res.status(400).json({ error: 'role must be reader|commenter|writer|admin' })
     return
   }
-  if (roleVal === 'commenter' && guard.meta.doc_type !== HTML_DOC_TYPE) {
-    res.status(409).json({ error: 'unsupported_doc_type' })
-    return
-  }
+
   const maxUsesNum = Number.isInteger(maxUses) && maxUses >= 0 ? Number(maxUses) : 0
   // Backend-enforced lifetime: always a real Date (never a permanent NULL link).
   const days = resolveExpiresInDays(expiresInDays)

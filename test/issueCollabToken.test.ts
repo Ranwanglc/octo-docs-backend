@@ -250,16 +250,14 @@ describe('issueCollabToken (§4.7(b) / XIN-694) — display name threading', () 
   })
 })
 
-describe('issueCollabToken (PR #93 blocking-1) — html docs clamp to read-only', () => {
+describe('issueCollabToken — preserves real role for every document type', () => {
   beforeEach(() => {
     vi.mocked(docMetaRepo.getByDocId).mockReset()
     vi.mocked(docMetaRepo.getByDocumentName).mockReset()
     vi.mocked(docMemberRepo.getRole).mockReset()
   })
 
-  it('clamps an html doc OWNER (would-be admin) to a read-only reader token', async () => {
-    // Security: an html doc's body is rendered by octo-doc, so its collab channel
-    // must never be writable. The owner would otherwise resolve to admin.
+  it('preserves an html doc owner as admin', async () => {
     asUser('html_owner')
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(htmlMeta('html_owner'))
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(htmlMeta('html_owner'))
@@ -268,16 +266,13 @@ describe('issueCollabToken (PR #93 blocking-1) — html docs clamp to read-only'
 
     expect(out.ok).toBe(true)
     if (!out.ok) return
-    // Clamped: not 'admin'. The signed token carries the read-only 'reader' role
-    // that authenticate.ts turns into readOnly=true. Reverting the clamp makes
-    // this assert 'admin' and fail.
-    expect(out.result.role).toBe('reader')
+    expect(out.result.role).toBe('admin')
     const claims = verifyCollabToken(out.result.token)
-    expect(claims.role).toBe('reader')
+    expect(claims.role).toBe('admin')
     expect(claims.documentName).toBe(HTML_KEY)
   })
 
-  it('clamps an html doc WRITER member to a read-only reader token', async () => {
+  it('preserves an html doc writer member as writer', async () => {
     asUser('html_writer')
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(htmlMeta('someone_else'))
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(htmlMeta('someone_else'))
@@ -287,8 +282,8 @@ describe('issueCollabToken (PR #93 blocking-1) — html docs clamp to read-only'
 
     expect(out.ok).toBe(true)
     if (!out.ok) return
-    expect(out.result.role).toBe('reader')
-    expect(verifyCollabToken(out.result.token).role).toBe('reader')
+    expect(out.result.role).toBe('writer')
+    expect(verifyCollabToken(out.result.token).role).toBe('writer')
   })
 
   it('preserves an html commenter claim for read-only role-aware clients', async () => {

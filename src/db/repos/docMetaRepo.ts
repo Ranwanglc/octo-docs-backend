@@ -315,10 +315,11 @@ export const docMetaRepo = {
     // SHARE_SCOPE_ANYONE is a numeric constant, inlined (no extra bind).
     const includeSpaceShare = params.owner !== 'me' && params.isSpaceMember === true
     let visibility: string
+    let ownerSet: string[] | null = null
     // Bind values contributed by the visibility clause, in placeholder order.
     const visibilityArgs: unknown[] = []
     if (params.owner === 'me') {
-      const ownerSet = [
+      ownerSet = [
         params.uid,
         ...(params.ownedBots ?? []).filter((b) => typeof b === 'string' && b !== ''),
       ].filter((v, i, arr) => arr.indexOf(v) === i)
@@ -362,19 +363,27 @@ export const docMetaRepo = {
     // role projection MUST mirror the write side (effectiveRole, shareScope.ts):
     // Stored commenter=4 is not privilege-ordered, so the share merge uses an
     // explicit writer/admin set instead of a raw numeric GREATEST.
+    const roleOwnerPredicate = ownerSet
+      ? `m.owner_id IN (${ownerSet.map(() => '?').join(', ')})`
+      : 'm.owner_id = ?'
+    const roleOwnerArgs: unknown[] = ownerSet ?? [params.uid]
     const roleExpr = includeSpaceShare
-      ? `CASE WHEN m.owner_id = ? THEN 3
+      ? `CASE WHEN ${roleOwnerPredicate} THEN 3
               WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.share_role = ${SHARE_ROLE_EDIT}
-                THEN CASE WHEN dm.role IN (2, 3) THEN dm.role ELSE 2 END
-              WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} THEN COALESCE(dm.role, 1)
-              ELSE dm.role END`
-      : 'CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END'
+                THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 ELSE 2 END
+              WHEN m.share_scope = ${SHARE_SCOPE_ANYONE}
+                THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1 ELSE 1 END
+              WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
+              ELSE NULL END`
+      : `CASE WHEN ${roleOwnerPredicate} THEN 3
+              WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
+              ELSE NULL END`
     const items = await query<DocMeta & { role: number }>(
       `SELECT m.*, ${roleExpr} AS role
        ${base}
        ORDER BY m.updated_at ${order}, m.doc_id ${order}
        LIMIT ${pageSize} OFFSET ${offset}`,
-      [params.uid, ...args],
+      [...roleOwnerArgs, ...args],
     )
     return { total, items }
   },

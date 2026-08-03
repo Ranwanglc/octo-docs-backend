@@ -186,7 +186,7 @@ describe('POST /:docId/access-requests — submit', () => {
     expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
   })
 
-  it('persists commenter for HTML and rejects commenter for non-HTML docs', async () => {
+  it('persists commenter for HTML and non-HTML docs', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1', doc_type: 'html' } as never)
     vi.mocked(resolveRole).mockResolvedValue('none')
     vi.mocked(docAccessRequestRepo.submit).mockResolvedValue({ requestId: 'req_c', status: 1 })
@@ -201,7 +201,10 @@ describe('POST /:docId/access-requests — submit', () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1', doc_type: 'doc' } as never)
     const nonHtml = mockRes()
     await submitHandler()(req({ requestedRole: 'commenter' }), nonHtml as never)
-    expect(nonHtml.statusCode).toBe(409)
+    expect(nonHtml.statusCode).toBe(201)
+    expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenLastCalledWith(
+      expect.objectContaining({ requestedRoleNum: 4 }),
+    )
   })
 })
 

@@ -165,16 +165,16 @@ describe('bot invite accept /v1/bot/docs/invites/:token/accept (docs #61)', () =
     expect(upsertFromInviteTx).not.toHaveBeenCalled()
   })
 
-  it('transactionally rejects a stale commenter invite for a non-HTML document', async () => {
+  it('accepts a commenter invite for a non-HTML document', async () => {
     getForUpdateTx.mockResolvedValue({ ...validInvite(), role: 4 })
     txDocType.value = 'doc'
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_bot' }) }))
     const res = await fetch(`${base}/v1/bot/docs/invites/tok123/accept`, {
       method: 'POST', headers: { authorization: 'Bearer bot-tok' },
     })
-    expect(res.status).toBe(410)
-    expect(await res.json()).toEqual({ error: 'invite_invalid' })
-    expect(upsertFromInviteTx).not.toHaveBeenCalled()
+    expect(res.status).toBe(200)
+    expect(await res.json()).toMatchObject({ role: 'commenter' })
+    expect(upsertFromInviteTx).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ roleNum: 4 }))
   })
 
   it('rejects an invalid bot token with 401 (verifyBot) before touching the accept service', async () => {

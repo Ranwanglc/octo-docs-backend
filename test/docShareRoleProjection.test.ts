@@ -55,7 +55,8 @@ describe('docMetaRepo.listForUser — role CASE gains a share arm for a confirme
     // owner short-circuits to admin(3); the share arm is RAISE-only over dm.role.
     expect(sql).toMatch(/WHEN m\.owner_id = \? THEN 3/)
     expect(sql).not.toMatch(/GREATEST\(/)
-    expect(sql).toMatch(/dm\.role IN \(2, 3\)/)
+    expect(sql).toMatch(/dm\.role = 3 THEN 3 WHEN dm\.role = 2 THEN 2/)
+    expect(sql).toMatch(/dm\.role = 4 THEN 4/)
     // anyone_in_space + EDIT => writer(2); any other share role => reader(1).
     expect(sql).toMatch(new RegExp(`m\\.share_scope = ${SHARE_SCOPE_ANYONE}`))
     expect(sql).toMatch(new RegExp(`m\\.share_role = ${SHARE_ROLE_EDIT}`))
@@ -79,7 +80,7 @@ describe('docMetaRepo.listForUser — role CASE gains a share arm for a confirme
       uid: 'u_1', spaceId: 's1', isSpaceMember: false, page: 1, pageSize: 10, sort: 'updatedAt:desc',
     })
     const { sql } = itemsCall()
-    expect(sql).toMatch(/CASE WHEN m\.owner_id = \? THEN 3 ELSE dm\.role END/)
+    expect(sql).toMatch(/CASE WHEN m\.owner_id = \? THEN 3[\s\S]*dm\.role = 4 THEN 4[\s\S]*ELSE NULL END/)
     expect(sql).not.toMatch(/GREATEST\(/)
     expect(sql).not.toMatch(/share_role/)
   })
@@ -100,7 +101,8 @@ describe('docViewHistoryRepo.listRecent — role CASE gains a same-space-guarded
     const { sql, params } = itemsCall()
     expect(sql).toMatch(/WHEN m\.owner_id = \? THEN 3/)
     expect(sql).not.toMatch(/GREATEST\(/)
-    expect(sql).toMatch(/dm\.role IN \(2, 3\)/)
+    expect(sql).toMatch(/dm\.role = 3 THEN 3 WHEN dm\.role = 2 THEN 2/)
+    expect(sql).toMatch(/dm\.role = 4 THEN 4/)
     // the recent list keeps the same-space guard on the share arm, matching the
     // visibility predicate: a doc shared in ANOTHER space never gets a label.
     expect(sql).toMatch(new RegExp(`m\\.share_scope = ${SHARE_SCOPE_ANYONE} AND m\\.space_id = v\\.space_id`))
@@ -113,7 +115,7 @@ describe('docViewHistoryRepo.listRecent — role CASE gains a same-space-guarded
   it('a NON-member keeps the plain CASE — no share arm', async () => {
     await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's1', isSpaceMember: false, pageSize: 10 })
     const { sql } = itemsCall()
-    expect(sql).toMatch(/CASE WHEN m\.owner_id = \? THEN 3 ELSE dm\.role END/)
+    expect(sql).toMatch(/CASE WHEN m\.owner_id = \? THEN 3[\s\S]*dm\.role = 4 THEN 4[\s\S]*ELSE NULL END/)
     expect(sql).not.toMatch(/GREATEST\(/)
     expect(sql).not.toMatch(/share_role/)
   })
