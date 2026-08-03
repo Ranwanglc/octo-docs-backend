@@ -250,67 +250,35 @@ describe('issueCollabToken (§4.7(b) / XIN-694) — display name threading', () 
   })
 })
 
-describe('issueCollabToken — preserves real role for every document type', () => {
+describe('issueCollabToken — HTML has no collaboration channel', () => {
   beforeEach(() => {
     vi.mocked(docMetaRepo.getByDocId).mockReset()
     vi.mocked(docMetaRepo.getByDocumentName).mockReset()
     vi.mocked(docMemberRepo.getRole).mockReset()
   })
 
-  it('preserves an html doc owner as admin', async () => {
-    asUser('html_owner')
-    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(htmlMeta('html_owner'))
-    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(htmlMeta('html_owner'))
+  it.each([
+    ['owner', 'html_owner', undefined],
+    ['admin', 'html_admin', 'admin'],
+    ['writer', 'html_writer', 'writer'],
+    ['commenter', 'html_commenter', 'commenter'],
+    ['reader', 'html_reader', 'reader'],
+    ['non-member', 'html_stranger', undefined],
+  ] as const)('rejects an html %s before role resolution', async (_label, uid, memberRole) => {
+    asUser(uid)
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(
+      htmlMeta(uid === 'html_owner' ? uid : 'someone_else'),
+    )
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue(memberRole)
 
-    const out = await issueCollabToken('octo_session_owner', HTML_KEY)
+    const out = await issueCollabToken(`octo_session_${uid}`, HTML_KEY)
 
-    expect(out.ok).toBe(true)
-    if (!out.ok) return
-    expect(out.result.role).toBe('admin')
-    const claims = verifyCollabToken(out.result.token)
-    expect(claims.role).toBe('admin')
-    expect(claims.documentName).toBe(HTML_KEY)
+    expect(out).toEqual({ ok: false, status: 422, error: 'unsupported_document_type' })
+    expect(docMetaRepo.getByDocId).not.toHaveBeenCalled()
+    expect(docMemberRepo.getRole).not.toHaveBeenCalled()
   })
 
-  it('preserves an html doc writer member as writer', async () => {
-    asUser('html_writer')
-    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(htmlMeta('someone_else'))
-    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(htmlMeta('someone_else'))
-    vi.mocked(docMemberRepo.getRole).mockResolvedValue('writer')
-
-    const out = await issueCollabToken('octo_session_writer', HTML_KEY)
-
-    expect(out.ok).toBe(true)
-    if (!out.ok) return
-    expect(out.result.role).toBe('writer')
-    expect(verifyCollabToken(out.result.token).role).toBe('writer')
-  })
-
-  it('preserves an html commenter claim for read-only role-aware clients', async () => {
-    asUser('html_commenter')
-    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(htmlMeta('someone_else'))
-    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(htmlMeta('someone_else'))
-    vi.mocked(docMemberRepo.getRole).mockResolvedValue('commenter')
-
-    const out = await issueCollabToken('octo_session_commenter', HTML_KEY)
-    expect(out.ok).toBe(true)
-    if (!out.ok) return
-    expect(out.result.role).toBe('commenter')
-    expect(verifyCollabToken(out.result.token).role).toBe('commenter')
-  })
-
-  it('a non-member on an html doc is still 403 (clamp does not grant access)', async () => {
-    asUser('html_stranger')
-    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(htmlMeta('someone_else'))
-    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(htmlMeta('someone_else'))
-    vi.mocked(docMemberRepo.getRole).mockResolvedValue(undefined)
-
-    const out = await issueCollabToken('octo_session_x', HTML_KEY)
-    expect(out).toEqual({ ok: false, status: 403, error: 'forbidden' })
-  })
-
-  it('does NOT clamp a normal rich-text doc: an owner still gets an admin token', async () => {
-    // Guard against over-clamping: only doc_type==='html' is affected.
+  it('keeps a normal rich-text doc owner collaboration token unchanged', async () => {
     asUser('doc_owner')
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(docMeta('doc_owner'))
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta('doc_owner'))
