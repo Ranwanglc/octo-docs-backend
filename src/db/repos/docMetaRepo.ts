@@ -7,6 +7,7 @@
  */
 import { query, transaction, type Tx } from '../pool.js'
 import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
+import { STORED_ROLE_VALUES } from '../../permission/role.js'
 
 /**
  * True when a thrown DB error is a duplicate-key violation. mysql2 surfaces it
@@ -73,6 +74,9 @@ export interface CreateDocInput {
   octoDocSlug?: string
   createdBy: string
 }
+
+const VALID_STORED_ROLES_SQL = STORED_ROLE_VALUES.join(', ')
+const validMemberRole = `dm.role IN (${VALID_STORED_ROLES_SQL})`
 
 export const docMetaRepo = {
   async create(input: CreateDocInput): Promise<void> {
@@ -327,10 +331,10 @@ export const docMetaRepo = {
       visibility = `m.owner_id IN (${ownerSet.map(() => '?').join(', ')})`
       visibilityArgs.push(...ownerSet)
     } else if (includeSpaceShare) {
-      visibility = `(m.owner_id = ? OR dm.uid IS NOT NULL OR m.share_scope = ${SHARE_SCOPE_ANYONE})`
+      visibility = `(m.owner_id = ? OR ${validMemberRole} OR m.share_scope = ${SHARE_SCOPE_ANYONE})`
       visibilityArgs.push(params.uid)
     } else {
-      visibility = '(m.owner_id = ? OR dm.uid IS NOT NULL)'
+      visibility = `(m.owner_id = ? OR ${validMemberRole})`
       visibilityArgs.push(params.uid)
     }
     // Placeholders in `base`, in order: JOIN `dm.uid = ?`, then the optional
@@ -451,7 +455,7 @@ export const docMetaRepo = {
     // isn't in this set, so it can't be searched even if OS still holds a stale
     // copy. SHARE_SCOPE_ANYONE is a numeric constant, inlined (no extra bind).
     const spaceShare = params.isSpaceMember === true ? ` OR m.share_scope = ${SHARE_SCOPE_ANYONE}` : ''
-    where.push(`(m.owner_id IN (${ownerPlaceholders}) OR dm.uid IS NOT NULL${spaceShare})`)
+    where.push(`(m.owner_id IN (${ownerPlaceholders}) OR ${validMemberRole}${spaceShare})`)
     args.push(...ownerSet)
 
     // Cap rows at limit+1 (when a limit is given) so overflow is detectable by

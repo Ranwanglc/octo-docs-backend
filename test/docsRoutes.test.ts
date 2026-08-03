@@ -244,14 +244,15 @@ describe('GET /api/v1/docs — role label serialization', () => {
     return { uid: 'u_1', spaceId: 's1', params: {}, body: undefined, query: {} } as never
   }
 
-  it('labels a stored-4 member as commenter (not reader) in the doc list', async () => {
+  it('labels all canonical stored roles and drops an anomalous projection', async () => {
     vi.mocked(docMetaRepo.listForUser).mockResolvedValue({
-      total: 4,
+      total: 5,
       items: [
         { doc_id: 'd_admin', title: 'A', owner_id: 'u_1', doc_type: 'doc', role: 3, updated_at: new Date(0) },
         { doc_id: 'd_writer', title: 'W', owner_id: 'u_o', doc_type: 'doc', role: 2, updated_at: new Date(0) },
         { doc_id: 'd_commenter', title: 'C', owner_id: 'u_o', doc_type: 'doc', role: 4, updated_at: new Date(0) },
         { doc_id: 'd_reader', title: 'R', owner_id: 'u_o', doc_type: 'doc', role: 1, updated_at: new Date(0) },
+        { doc_id: 'd_corrupt', title: 'X', owner_id: 'u_o', doc_type: 'doc', role: 99, updated_at: new Date(0) },
       ],
     } as never)
     const res = mockRes()

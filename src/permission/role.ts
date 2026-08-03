@@ -24,6 +24,9 @@ export const ROLE_WRITER = 2
 export const ROLE_ADMIN = 3
 export const ROLE_COMMENTER = 4
 
+/** Canonical persisted values, also used by SQL visibility gates. */
+export const STORED_ROLE_VALUES = [ROLE_READER, ROLE_WRITER, ROLE_ADMIN, ROLE_COMMENTER] as const
+
 const NUM_TO_ROLE: Record<number, Role> = {
   [ROLE_READER]: 'reader',
   [ROLE_WRITER]: 'writer',

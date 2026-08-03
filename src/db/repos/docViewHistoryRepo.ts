@@ -20,6 +20,10 @@
  */
 import { query, transaction } from '../pool.js'
 import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
+import { STORED_ROLE_VALUES } from '../../permission/role.js'
+
+const VALID_STORED_ROLES_SQL = STORED_ROLE_VALUES.join(', ')
+const validMemberRole = `dm.role IN (${VALID_STORED_ROLES_SQL})`
 
 /** A recent-view row joined with its doc_meta business columns. */
 export interface RecentViewItem {
@@ -111,8 +115,8 @@ function escapeLike(s: string): string {
  */
 function visibilityPredicate(isSpaceMember: boolean): string {
   return isSpaceMember
-    ? `(m.owner_id = ? OR dm.uid IS NOT NULL OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id))`
-    : '(m.owner_id = ? OR dm.uid IS NOT NULL)'
+    ? `(m.owner_id = ? OR ${validMemberRole} OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id))`
+    : `(m.owner_id = ? OR ${validMemberRole})`
 }
 
 /**

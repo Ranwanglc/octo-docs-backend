@@ -174,7 +174,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     // recognizes the space-scoped share source, so an anyone_in_space doc a member
     // opened (written by POST /view's effectiveRole guard) is no longer dropped.
     expect(itemsSql).toContain(
-      '(m.owner_id = ? OR dm.uid IS NOT NULL OR (m.share_scope = 1 AND m.space_id = v.space_id))',
+      '(m.owner_id = ? OR dm.role IN (1, 2, 3, 4) OR (m.share_scope = 1 AND m.space_id = v.space_id))',
     )
     expect(itemsSql).toMatch(/ORDER BY v\.viewed_at DESC, v\.doc_id DESC/)
   })
@@ -220,7 +220,7 @@ describe('docViewHistoryRepo.listRecent — query-time filter + keyset paging', 
     await docViewHistoryRepo.listRecent({ uid: 'u_1', spaceId: 's_trident', isSpaceMember: false, pageSize: 20 })
     const itemsSql = mockQuery.mock.calls.at(-1)![0] as string
     expect(itemsSql).not.toContain('share_scope')
-    expect(itemsSql).toContain('(m.owner_id = ? OR dm.uid IS NOT NULL)')
+    expect(itemsSql).toContain('(m.owner_id = ? OR dm.role IN (1, 2, 3, 4))')
     // isSpaceMember omitted (undefined) is fail-closed too: no share branch.
     mockQuery.mockResolvedValueOnce([{ cnt: 0 }] as never)
     mockQuery.mockResolvedValueOnce([] as never)
@@ -364,7 +364,7 @@ describe('docViewHistoryRepo.listCreators — pre-facet distinct owners', () => 
     // branch for a member, so a shared-doc owner shows up in the filter dropdown too
     // — and it stays same-space-guarded (no cross-space leak into the facet).
     expect(sql).toContain(
-      '(m.owner_id = ? OR dm.uid IS NOT NULL OR (m.share_scope = 1 AND m.space_id = v.space_id))',
+      '(m.owner_id = ? OR dm.role IN (1, 2, 3, 4) OR (m.share_scope = 1 AND m.space_id = v.space_id))',
     )
     expect(sql).toContain("LIKE ? ESCAPE '\\\\'") // respects q
     expect(sql).not.toContain('owner_id IN') // NOT the creator filter
@@ -378,7 +378,7 @@ describe('docViewHistoryRepo.listCreators — pre-facet distinct owners', () => 
     // Same asymmetry fix as listRecent: no share source in the facet for a
     // non-member, so a share-only doc's owner never leaks into the dropdown.
     expect(sql).not.toContain('share_scope')
-    expect(sql).toContain('(m.owner_id = ? OR dm.uid IS NOT NULL)')
+    expect(sql).toContain('(m.owner_id = ? OR dm.role IN (1, 2, 3, 4))')
   })
 })
 

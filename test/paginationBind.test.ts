@@ -230,7 +230,7 @@ describe('docMetaRepo.listForUser owner=me spans caller + owned bots', () => {
     const { countSql, countParams, itemsSql, itemsParams } = ownerCall()
     // Visibility widened to an IN over the caller + their bots (3 placeholders).
     expect(countSql).toMatch(/m\.owner_id IN \(\?, \?, \?\)/)
-    // Shared-with-me is still excluded (no OR dm.uid IS NOT NULL on owner=me).
+    // Shared-with-me is still excluded (no OR dm.role IN (1, 2, 3, 4) on owner=me).
     expect(countSql).not.toMatch(/dm\.uid IS NOT NULL/)
     // COUNT bind order: JOIN dm.uid, m.space_id, then the owner set.
     expect(countParams).toEqual(['u_human', 's_1', 'u_human', 'bot_a', 'bot_b'])

@@ -101,7 +101,7 @@ describe('docMetaRepo.listForUser always filters by space (P1 isolation)', () =>
       expect(params).toContain('s_trident')
       // NO share branch: the visibility predicate is owner OR doc_member only.
       expect(sql).not.toContain('share_scope')
-      expect(sql).toContain('(m.owner_id = ? OR dm.uid IS NOT NULL)')
+      expect(sql).toContain('(m.owner_id = ? OR dm.role IN (1, 2, 3, 4))')
     }
     // paging binds unchanged vs the member case (share branch carries no bind).
     expect((mockQuery.mock.calls[0]![1] ?? []) as unknown[]).toEqual(['u_1', 's_trident', 'u_1'])
