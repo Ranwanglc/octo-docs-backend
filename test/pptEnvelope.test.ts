@@ -221,6 +221,23 @@ describe('PPT envelope is scoped to /api/v1/ppt (integration)', () => {
     expect((body as { error: unknown }).error).not.toBe('doc_too_large')
   })
 
+  it('a malformed JSON body on a CASE-VARIANT /api/v1/PPT path also returns the C-style envelope', async () => {
+    // Express mount matching is case-insensitive, so /api/v1/PPT is served by the
+    // PPT router; the global-parser skip is case-insensitive to match, so the
+    // envelope holds on case variants too (no casing-selected leak).
+    for (const variant of ['/api/v1/PPT/docs/x', '/api/v1/Ppt/docs/x']) {
+      const res = await fetch(`${base}${variant}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{bad-json',
+      })
+      expect(res.status).toBe(400)
+      const body = (await res.json()) as { error: { code: string } }
+      expect(body.error.code).toBe('VALIDATION_ERROR')
+      expect((body as { error: unknown }).error).not.toBe('invalid_body')
+    }
+  })
+
   it('legacy /v1/bot/docs errors stay BARE JSON (not envelope-wrapped)', async () => {
     // A malformed body on a legacy route is rejected by the global bare-JSON
     // handler as { error: 'invalid_body' } — proving the envelope did not leak

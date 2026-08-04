@@ -40,7 +40,7 @@ import { docSceneRouter } from './routes/docScene.js'
 import { exportRouter } from './routes/export.js'
 import { boardExportRouter } from './routes/boardExport.js'
 import { importRouter } from './routes/import.js'
-import { createPptRouter } from './ppt/envelope.js'
+import { createPptRouter, pptErrorHandler } from './ppt/envelope.js'
 import { sanitizeUrlForLog } from './accessLog.js'
 
 export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: boolean | number | string } = {}): Express {
@@ -137,7 +137,13 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
     // parser ran here it would throw before the PPT mount and the central
     // bare-JSON handler would emit `{ error: 'invalid_body' }`, leaking the
     // legacy shape into the PPT contract.
-    if (req.path === '/api/v1/ppt' || req.path.startsWith('/api/v1/ppt/')) return next()
+    //
+    // Match Express's OWN mount semantics: `app.use('/api/v1/ppt', …)` is
+    // case-insensitive by default, so the skip MUST be too — otherwise a
+    // case-variant path (`/api/v1/PPT/…`) is served by the PPT router but its
+    // body is parsed by the global parser here, and the leak persists on exactly
+    // the routes the router serves.
+    if (/^\/api\/v1\/ppt(\/|$)/i.test(req.path)) return next()
     return jsonBodyParser(req, res, next)
   })
 
@@ -235,6 +241,14 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   pptApi.use(createRateLimiter(opts.rateLimit))
   pptApi.use(createPptRouter())
   app.use('/api/v1/ppt', pptApi)
+  // Belt-and-braces: register the envelope error handler at app level too, scoped
+  // to the same prefix. A mounted Router has arity 3, so an error raised by any
+  // app-level middleware BEFORE the mount would otherwise skip the router-scoped
+  // handler and fall through to the global bare-JSON handler. This app-level
+  // registration uses Express's own case-insensitive mount matching (no path
+  // string of our own to keep in sync) and renders ANY pre-mount error for a PPT
+  // path as the C-style envelope, not just the body-parser types.
+  app.use('/api/v1/ppt', pptErrorHandler)
 
   // central error handler — unexpected errors => 500 (§8.4 error table).
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
