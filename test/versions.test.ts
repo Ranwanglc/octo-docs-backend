@@ -43,6 +43,7 @@ import {
   KIND_RESTORE_MARKER,
 } from '../src/db/repos/docVersionRepo.js'
 import { restoreVersion } from '../src/api/services/restoreVersion.js'
+import * as restoreVersionModule from '../src/api/services/restoreVersion.js'
 import { readLiveDocState } from '../src/collab/liveDocRead.js'
 import { applyRestoreToLiveDoc, applyBoardRestoreToLiveDoc } from '../src/collab/liveRestore.js'
 import { query, transaction } from '../src/db/pool.js'
@@ -1459,5 +1460,73 @@ describe('XIN-656 restore leg — safety snapshot sources the live scene', () =>
 
     createSpy.mockRestore()
     vi.mocked(docVersionRepo.getStateById).mockRestore()
+  })
+})
+
+// ── html_ppt wrong-kind rejection on the Yjs version routes (§1.3) ────────────
+//
+// A `html_ppt` doc's versions are BentoDoc / rendered-HTML blobs in `ppt_version`,
+// NOT Yjs `doc_version` rows. The three Yjs handlers (create / state / restore)
+// must reject a `html_ppt` doc with 422 `unsupported_document_type` BEFORE any
+// decode/live path runs, so a BentoDoc blob can never reach
+// readLiveDocState / docVersionRepo.getStateById / the restoreVersion service.
+describe('version routes — html_ppt wrong-kind guard (422 unsupported_document_type)', () => {
+  // Guard for a html_ppt doc; the only field the guards read before the
+  // wrong-kind check is doc_type, but keep the doc identity fields for parity.
+  const pptGuard = {
+    meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:ppt:d_1', doc_type: 'html_ppt', permission_epoch: 7 },
+    role: 'admin',
+  } as never
+
+  it('createVersionHandler rejects html_ppt with 422 and never reads the live doc', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(pptGuard)
+    vi.mocked(readLiveDocState).mockClear()
+    const createSpy = vi.spyOn(docVersionRepo, 'create')
+
+    const res = mockRes()
+    await createVersionHandler(req({ docId: 'd_1' }, { body: { label: 'x' } }), res as never)
+
+    expect(res.statusCode).toBe(422)
+    expect(res.body).toEqual({ error: 'unsupported_document_type' })
+    // No snapshot decode path: neither the live-doc read nor the row insert ran.
+    expect(readLiveDocState).not.toHaveBeenCalled()
+    expect(createSpy).not.toHaveBeenCalled()
+
+    createSpy.mockRestore()
+  })
+
+  it('getVersionStateHandler rejects html_ppt with 422 and never loads a version row', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(pptGuard)
+    const getStateSpy = vi.spyOn(docVersionRepo, 'getStateById')
+
+    const res = mockRes()
+    await getVersionStateHandler(req({ docId: 'd_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(422)
+    expect(res.body).toEqual({ error: 'unsupported_document_type' })
+    // No decode path: the version row is never fetched, so no blob is decoded.
+    expect(getStateSpy).not.toHaveBeenCalled()
+
+    getStateSpy.mockRestore()
+  })
+
+  it('restoreVersionHandler rejects html_ppt with 422 and never enters the restore service', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(pptGuard)
+    const restoreSpy = vi.spyOn(restoreVersionModule, 'restoreVersion')
+    const getStateSpy = vi.spyOn(docVersionRepo, 'getStateById')
+
+    const res = mockRes()
+    await restoreVersionHandler(req({ docId: 'd_1', versionId: '5' }), res as never)
+
+    expect(res.statusCode).toBe(422)
+    expect(res.body).toEqual({ error: 'unsupported_document_type' })
+    // No decode/reconcile path: the restore service (and its transaction + row
+    // read) is never invoked, so the BentoDoc blob is never forward-reconciled.
+    expect(restoreSpy).not.toHaveBeenCalled()
+    expect(getStateSpy).not.toHaveBeenCalled()
+    expect(transaction).not.toHaveBeenCalled()
+
+    restoreSpy.mockRestore()
+    getStateSpy.mockRestore()
   })
 })

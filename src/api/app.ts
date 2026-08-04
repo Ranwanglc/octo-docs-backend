@@ -131,6 +131,13 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
     // reject malformed UTF-8/JSON and enforce its own byte boundary before
     // walking the untrusted scene. Leave only that route for express.raw.
     if (req.path.endsWith('/import/excalidraw')) return next()
+    // The PPT surface parses its own body INSIDE createPptRouter so that a
+    // malformed-JSON body error is caught by the router-scoped pptErrorHandler
+    // and rendered as the C-style VALIDATION_ERROR envelope. If the global
+    // parser ran here it would throw before the PPT mount and the central
+    // bare-JSON handler would emit `{ error: 'invalid_body' }`, leaking the
+    // legacy shape into the PPT contract.
+    if (req.path === '/api/v1/ppt' || req.path.startsWith('/api/v1/ppt/')) return next()
     return jsonBodyParser(req, res, next)
   })
 

@@ -185,6 +185,26 @@ describe('PPT envelope is scoped to /api/v1/ppt (integration)', () => {
     expect(await res.json()).toEqual({ error: { code: 'NOT_FOUND', message: 'resource not found' } })
   })
 
+  it('a malformed JSON body on /api/v1/ppt returns the C-style VALIDATION_ERROR envelope, not the global invalid_body', async () => {
+    // Regression for the envelope-order bug: the global express.json parser
+    // (mounted before the PPT router) used to catch the parse error first and
+    // emit the legacy bare-JSON `{ error: 'invalid_body' }`. The PPT router now
+    // parses its own body, so `entity.parse.failed` is caught by the
+    // router-scoped pptErrorHandler and rendered as the C-style envelope.
+    const res = await fetch(`${base}/api/v1/ppt/docs/x`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{bad-json',
+    })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: { code: string; message: string } }
+    expect(body.error.code).toBe('VALIDATION_ERROR')
+    expect(typeof body.error.message).toBe('string')
+    // It must NOT leak the legacy bare-JSON shape.
+    expect(body).not.toHaveProperty('error.0')
+    expect((body as { error: unknown }).error).not.toBe('invalid_body')
+  })
+
   it('legacy /v1/bot/docs errors stay BARE JSON (not envelope-wrapped)', async () => {
     // A malformed body on a legacy route is rejected by the global bare-JSON
     // handler as { error: 'invalid_body' } — proving the envelope did not leak

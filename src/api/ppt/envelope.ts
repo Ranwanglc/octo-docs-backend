@@ -24,7 +24,7 @@
  * responses stay byte-for-byte unchanged; nothing here touches the global
  * bare-JSON error handler.
  */
-import { Router, type Request, type Response, type NextFunction } from 'express'
+import { Router, json, type Request, type Response, type NextFunction } from 'express'
 
 /**
  * Fixed HTTP-status-to-code map. The first ten codes are C's enum verbatim; the
@@ -181,6 +181,13 @@ export function pptErrorHandler(err: unknown, _req: Request, res: Response, next
  */
 export function createPptRouter(): Router {
   const router = Router()
+
+  // Body parsing is scoped to THIS router (the global express.json in
+  // api/app.ts deliberately skips `/api/v1/ppt/**`). Parsing here means a
+  // malformed-JSON body raises `entity.parse.failed` INSIDE the router, so the
+  // router-scoped pptErrorHandler below renders it as the C-style
+  // VALIDATION_ERROR envelope instead of the global bare-JSON `invalid_body`.
+  router.use(json({ limit: '1mb' }))
 
   // R2+ endpoint routers mount here.
 
