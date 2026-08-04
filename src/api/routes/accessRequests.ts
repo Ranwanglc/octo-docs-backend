@@ -30,16 +30,18 @@ import { resolveRole } from '../../permission/resolveRole.js'
 import { grantForwardAccess } from '../services/grantForward.js'
 import { notifyDocAccessRequested } from '../services/docsNotify.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
-import { roleAtLeast, roleToNumber, type Role } from '../../permission/role.js'
+import { isAccessRequestRole, roleAtLeast, roleToNumber, roleFromNumber } from '../../permission/role.js'
+
 
 export const accessRequestsRouter: ExpressRouter = Router()
 
-const roleName = (n: number): string => (n === 2 ? 'writer' : 'reader')
-
-/** Only reader|writer can be requested / approved (no commenter/admin). */
-function parseReqRole(v: unknown, fallback: 'reader' | 'writer' = 'reader'): 'reader' | 'writer' {
-  return v === 'reader' || v === 'writer' ? v : fallback
+const roleName = (n: number): 'reader' | 'commenter' | 'writer' => {
+  const role = roleFromNumber(n)
+  if (!isAccessRequestRole(role)) throw new Error(`invalid requested_role ${n}`)
+  return role
 }
+
+type AccessRequestRole = 'reader' | 'commenter' | 'writer'
 
 /**
  * The decider's own session token, when this request carries one. The REST
@@ -81,7 +83,13 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
     return
   }
 
-  const requestedRole: Role = parseReqRole((req.body ?? {}).requestedRole)
+  const suppliedRole = (req.body ?? {}).requestedRole
+  const requestedRole = suppliedRole === undefined ? 'reader' : suppliedRole
+  if (!isAccessRequestRole(requestedRole)) {
+    res.status(400).json({ error: 'requestedRole must be reader|commenter|writer' })
+    return
+  }
+
   const reasonRaw = (req.body ?? {}).reason
   const reason = typeof reasonRaw === 'string' ? reasonRaw.slice(0, 512) : ''
 
@@ -161,8 +169,18 @@ accessRequestsRouter.post(
       res.status(404).json({ error: 'not_found' })
       return
     }
-    // Approver picks the level; default to what was requested.
-    const grantRole = parseReqRole((req.body ?? {}).role, roleName(Number(request.requested_role)) as 'reader' | 'writer')
+    // Omitted role approves the requested tier; an explicit invalid tier fails closed.
+    const suppliedRole = (req.body ?? {}).role
+    let grantRole: AccessRequestRole
+    if (suppliedRole === undefined) {
+      grantRole = roleName(Number(request.requested_role))
+    } else if (isAccessRequestRole(suppliedRole)) {
+      grantRole = suppliedRole
+    } else {
+      res.status(400).json({ error: 'role must be reader|commenter|writer' })
+      return
+    }
+
 
     // Transition pending -> approved first; grant only on a genuine transition.
     const decided = await docAccessRequestRepo.decide({

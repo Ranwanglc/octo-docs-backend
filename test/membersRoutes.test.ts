@@ -98,7 +98,7 @@ beforeEach(() => {
   vi.mocked(requireDocRole).mockReset()
   vi.mocked(docMemberRepo.upsertDirect).mockClear()
   vi.mocked(requireDocRole).mockResolvedValue({
-    meta: { doc_id: 'd_1', document_name: 'doc-d_1', owner_id: 'u_admin' },
+    meta: { doc_id: 'd_1', document_name: 'doc-d_1', owner_id: 'u_admin', doc_type: 'html' },
     role: 'admin',
   } as never)
 })
@@ -114,6 +114,37 @@ describe('PUT /api/v1/docs/:docId/members — anti ghost-member check', () => {
     expect(vi.mocked(docMemberRepo.upsertDirect)).toHaveBeenCalledTimes(1)
     // The doc guard is scoped to req.spaceId (4th arg).
     expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
+  })
+
+  it('add member with role=commenter -> 200 ok (commentable tier assignable)', async () => {
+    stubIdentity({ u_real: { uid: 'u_real', name: 'Real User' } })
+    const res = mockRes()
+    await putMemberHandler()(req({ uid: 'u_real', role: 'commenter' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toEqual({ ok: true })
+    // commenter stored value is 4 (rank ordinal != stored number).
+    expect(vi.mocked(docMemberRepo.upsertDirect).mock.calls.at(-1)![0]).toMatchObject({ roleNum: 4 })
+  })
+
+  it('supports commenter on a non-HTML document', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue({
+      meta: { doc_id: 'd_1', document_name: 'doc-d_1', owner_id: 'u_admin', doc_type: 'doc' }, role: 'admin',
+    } as never)
+    stubIdentity({ u_real: { uid: 'u_real', name: 'Real User' } })
+    const res = mockRes()
+    await putMemberHandler()(req({ uid: 'u_real', role: 'commenter' }), res as never)
+    expect(res.statusCode).toBe(200)
+    expect(vi.mocked(docMemberRepo.upsertDirect)).toHaveBeenCalledWith(expect.objectContaining({ roleNum: 4 }))
+  })
+
+  it('rejects an unknown role -> 400', async () => {
+    stubIdentity({ u_real: { uid: 'u_real', name: 'Real User' } })
+    const res = mockRes()
+    await putMemberHandler()(req({ uid: 'u_real', role: 'superuser' }), res as never)
+
+    expect(res.statusCode).toBe(400)
+    expect(vi.mocked(docMemberRepo.upsertDirect)).not.toHaveBeenCalled()
   })
 
   it('add member with an unresolvable uid -> 404 user_not_found', async () => {
@@ -196,6 +227,7 @@ describe('GET /api/v1/docs/:docId/members — synthesized owner row', () => {
       guardWithOwner('u_owner', docType)
       vi.mocked(docMemberRepo.list).mockResolvedValue([
         { uid: 'u_writer', role: 2, source: 1, granted_by: 'u_owner' }, // direct writer
+        { uid: 'u_commenter', role: 4, source: 1, granted_by: 'u_owner' }, // direct commenter (stored 4)
         { uid: 'u_reader', role: 1, source: 2, granted_by: 'u_admin' }, // invite reader
       ] as never)
       const res = mockRes()
@@ -205,6 +237,7 @@ describe('GET /api/v1/docs/:docId/members — synthesized owner row', () => {
       expect((res.body as { items: unknown[] }).items).toEqual([
         { uid: 'u_owner', role: 'admin', source: 'owner', grantedBy: null },
         { uid: 'u_writer', role: 'writer', source: 'direct', grantedBy: 'u_owner' },
+        { uid: 'u_commenter', role: 'commenter', source: 'direct', grantedBy: 'u_owner' },
         { uid: 'u_reader', role: 'reader', source: 'invite', grantedBy: 'u_admin' },
       ])
     }

@@ -124,6 +124,12 @@ When adopting the runner on a database previously migrated by hand, its first
 run will re-run the idempotent upgrade files once to populate the
 `schema_migrations` ledger.
 
+At runtime the service verifies, before opening the WebSocket or REST listeners,
+that `docs_metadata.role_encoding` is exactly `append-v1`. A missing table/row,
+an older encoding, or an unknown value aborts startup. Run the migrations to add
+the marker; the service never changes the marker or re-encodes role rows, and an
+existing conflicting marker is deliberately not overwritten by the migration.
+
 ## PDF export (Typst)
 
 Documents are exported to PDF server-side by rendering the persisted document to

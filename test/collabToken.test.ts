@@ -45,6 +45,14 @@ describe('collab token sign/verify (§4.4)', () => {
     expect(() => verifyCollabToken('not-a-jwt')).toThrow()
   })
 
+  it('round-trips a commenter claim', () => {
+    const result = signCollabToken({
+      uid: 'u_commenter', documentName: 'octo:s:f:d', role: 'commenter', permission_epoch: 4,
+    })
+    expect(result.role).toBe('commenter')
+    expect(verifyCollabToken(result.token).role).toBe('commenter')
+  })
+
   it('signs and verifies a name claim (§4.7(b) / XIN-694) round-trip', () => {
     const result = signCollabToken({
       uid: 'u_12345',

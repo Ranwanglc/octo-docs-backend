@@ -9,16 +9,24 @@ import { Router, type Router as ExpressRouter, type Request, type Response } fro
 import { docInviteRepo } from '../../db/repos/docInviteRepo.js'
 import { requireDocRole } from '../guard.js'
 import { newInviteToken } from '../../util/ids.js'
-import { roleToNumber, type Role } from '../../permission/role.js'
+import { roleToNumber, roleFromNumber, type Role } from '../../permission/role.js'
 import { acceptInvite, acceptInviteForUid } from '../services/acceptInvite.js'
 import { extractOctoToken } from '../middleware/auth.js'
 
+
 export const invitesRouter: ExpressRouter = Router()
 
-const roleName = (n: number): string => (n === 3 ? 'admin' : n === 2 ? 'writer' : 'reader')
+// Canonical stored-number -> role name (shared serializer; covers commenter=4).
+// Stored value != rank ordinal, so never open-code the mapping per-file.
+const roleName = (n: number): string => {
+  const role = roleFromNumber(n)
+  if (!role) throw new Error(`invalid invite role ${n}`)
+  return role
+}
 
-function parseRole(v: unknown): Role {
-  return v === 'reader' || v === 'admin' ? v : 'writer' // default writer (§4.6)
+function parseRole(v: unknown): Role | null {
+  if (v === undefined) return 'writer'
+  return v === 'reader' || v === 'commenter' || v === 'writer' || v === 'admin' ? v : null
 }
 
 const DEFAULT_EXPIRES_IN_DAYS = 3
@@ -41,6 +49,11 @@ invitesRouter.post('/:docId/invites', async (req: Request, res: Response) => {
   if (!guard) return
   const { role, expiresInDays, maxUses } = req.body ?? {}
   const roleVal = parseRole(role)
+  if (!roleVal) {
+    res.status(400).json({ error: 'role must be reader|commenter|writer|admin' })
+    return
+  }
+
   const maxUsesNum = Number.isInteger(maxUses) && maxUses >= 0 ? Number(maxUses) : 0
   // Backend-enforced lifetime: always a real Date (never a permanent NULL link).
   const days = resolveExpiresInDays(expiresInDays)

@@ -27,7 +27,7 @@ import { HTML_DOC_TYPE } from '../db/docType.js'
 
 export type IssueResult =
   | { ok: true; result: CollabTokenResult }
-  | { ok: false; status: 401 | 403 | 404; error: string }
+  | { ok: false; status: 401 | 403 | 404 | 422; error: string }
 
 /**
  * Issue a collab token for (octoToken, documentName).
@@ -90,6 +90,16 @@ export async function issueCollabToken(
     return { ok: false, status: 404, error: 'not_found' }
   }
 
+  // HTML has its own body/comment backend and no Yjs collaboration design.
+  // Reject before role resolution so no HTML role can mint a Hocuspocus token.
+  if (meta.doc_type === HTML_DOC_TYPE) {
+    // eslint-disable-next-line no-console
+    console.warn('[octo-docs] collab-token rejected: HTML does not support collaboration', {
+      docId: meta.doc_id,
+    })
+    return { ok: false, status: 422, error: 'unsupported_document_type' }
+  }
+
   // Authorization: resolveRole = doc_member + owner (same model for docs/boards).
   const direct = await resolveRole(uid, meta.doc_id)
 
@@ -106,15 +116,6 @@ export async function issueCollabToken(
   }
   const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
-
-  // Security clamp (chokepoint = token issuance, where meta.doc_type is known):
-  // an html doc's body is rendered by the external octo-doc service, so its Yjs
-  // collab channel must be read-only — a signed writable token would let a
-  // client mutate a body the backend does not own. Clamp any would-be writable
-  // role (author/admin/editor) to 'reader', the role authenticate.ts already
-  // treats as readOnly=true, so the whole downstream write-reject path engages
-  // with no further change.
-  const effRole = meta.doc_type === HTML_DOC_TYPE ? 'reader' : role
 
   // FEAT-B recent-view fallback ingest (MF2, default-on). Every document open —
   // read-only INCLUDED — passes through here, so this is the reliable "open ==
@@ -154,7 +155,7 @@ export async function issueCollabToken(
   const result = signCollabToken({
     uid,
     documentName,
-    role: effRole,
+    role,
     permission_epoch: meta.permission_epoch,
     ...(displayName !== '' ? { name: displayName } : {}),
     ...(spaceMember ? { space_member: true } : {}),

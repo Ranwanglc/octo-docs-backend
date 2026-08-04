@@ -11,7 +11,7 @@ import { normalizeTypeFilter, HTML_DOC_TYPE } from '../../db/docType.js'
 import { buildDocumentName, buildHtmlDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { enqueueDocIndex, isSearchIndexedDoc } from '../../search/docIndexQueue.js'
 import { refreshAndPublish, bumpEpoch } from '../../permission/epoch.js'
-import { ROLE_ADMIN } from '../../permission/role.js'
+import { ROLE_ADMIN, roleFromNumber, type Role } from '../../permission/role.js'
 import {
   parseShareScope,
   parseShareRole,
@@ -32,9 +32,8 @@ export const docsRouter: ExpressRouter = Router()
 
 const DEFAULT_FOLDER = 'f_default'
 
-/** Serialize the numeric doc_member role to the wire string enum (§3 wire). */
-const roleName = (n: number): 'admin' | 'writer' | 'reader' =>
-  n === 3 ? 'admin' : n === 2 ? 'writer' : 'reader'
+/** Serialize a validated persisted role to the wire enum. */
+const roleName = (n: number): Role | undefined => roleFromNumber(n)
 
 /** Normalize a repeated query param (`?creator=a&creator=b`) to a string[]. */
 function toStringArray(v: unknown): string[] {
@@ -323,18 +322,20 @@ export async function listDocsHandler(req: Request, res: Response) {
   const isSpaceMember = owner === 'me' ? false : await resolveViewerSpaceMembership(req)
 
   const { total, items } = await docMetaRepo.listForUser({ uid, spaceId, isSpaceMember, folderId, owner, ownedBots, q, types, page, pageSize, sort })
-  res.status(200).json({
-    total,
-    items: items.map((d) => ({
+  const visibleItems = items.flatMap((d) => {
+    const role = roleName(Number(d.role))
+    if (!role) return []
+    return [{
       docId: d.doc_id,
       title: d.title,
       ownerId: d.owner_id,
       docType: d.doc_type,
       ...(d.octo_doc_slug ? { octoDocSlug: d.octo_doc_slug } : {}),
-      role: roleName(Number(d.role)),
+      role,
       updatedAt: d.updated_at,
-    })),
+    }]
   })
+  res.status(200).json({ total, items: visibleItems })
 }
 
 docsRouter.get('/', listDocsHandler)
@@ -531,24 +532,25 @@ export async function listRecentHandler(req: Request, res: Response) {
       if (name !== '') editorNameByUid.set(u.uid, name)
     }
   }
-  res.status(200).json({
-    total: result.total,
-    items: result.items.map((d) => ({
+  const visibleItems = result.items.flatMap((d) => {
+    const role = roleName(Number(d.role))
+    if (!role) return []
+    return [{
       docId: d.doc_id,
       title: d.title,
       ownerId: d.owner_id,
       docType: d.doc_type,
       ...(d.octo_doc_slug ? { octoDocSlug: d.octo_doc_slug } : {}),
-      role: roleName(Number(d.role)),
+      role,
       updatedAt: d.updated_at,
       updatedBy:
         d.updated_by === ''
           ? null
           : { uid: d.updated_by, name: editorNameByUid.get(d.updated_by) ?? d.updated_by },
       viewedAt: new Date(d.viewed_at).toISOString(),
-    })),
-    nextCursor: result.nextCursor,
+    }]
   })
+  res.status(200).json({ total: result.total, items: visibleItems, nextCursor: result.nextCursor })
 }
 
 docsRouter.get('/recent', listRecentHandler)

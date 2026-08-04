@@ -18,7 +18,8 @@ import { config } from './config/env.js'
 import { createServer, setEpochWatermark } from './collab/server.js'
 import { createApp } from './api/app.js'
 import { epochInvalidateChannel, currentEpoch, invalidateEpochCache, type InvalidateEvent } from './permission/epoch.js'
-import { closePool } from './db/pool.js'
+import { closePool, query } from './db/pool.js'
+import { assertAppendV1RoleEncoding } from './db/roleEncodingMarker.js'
 import { closeRedis } from './db/redis.js'
 import { closeKafkaProducer } from './db/kafka.js'
 import { broadcastCommentMutation, commentEventsChannel } from './api/services/commentEvents.js'
@@ -35,6 +36,13 @@ async function main(): Promise<void> {
   process.on('unhandledRejection', (reason) => {
     // eslint-disable-next-line no-console
     console.error('[octo-docs] unhandledRejection (non-fatal, still serving):', reason)
+  })
+
+  // Role integers are security-sensitive persisted data. Verify their encoding
+  // before constructing either permission-serving endpoint; missing migrations,
+  // legacy encodings, and unreadable marker state all abort startup.
+  await assertAppendV1RoleEncoding({
+    query: (sql, params) => query<Record<string, unknown>>(sql, params),
   })
 
   const hocuspocus = createServer()

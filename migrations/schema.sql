@@ -11,7 +11,8 @@
 --
 -- Tables:
 --   doc_meta              business metadata (title/owner/space/folder/epoch)
---   doc_member            document-autonomous membership (reader/writer/admin)
+--   docs_metadata         deployment-level compatibility markers
+--   doc_member            document-autonomous membership (reader/commenter/writer/admin)
 --   doc_invite            link invites
 --   doc_invite_redemption invite redemption ledger (idempotency / audit)
 --   yjs_document          Y.Doc binary authoritative state (single merged row)
@@ -60,12 +61,23 @@ CREATE TABLE doc_meta (
   CONSTRAINT chk_doc_meta_share_role  CHECK (share_role  IN (1, 2))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- Deployment-level compatibility markers. Role values use append-v1:
+-- reader=1, writer=2, admin=3, commenter=4 (comparison rank is separate).
+CREATE TABLE docs_metadata (
+  meta_key   VARCHAR(64)  NOT NULL,
+  meta_value VARCHAR(255) NOT NULL,
+  updated_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (meta_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT INTO docs_metadata (meta_key, meta_value) VALUES ('role_encoding', 'append-v1');
+
 -- 文档自治成员（v2.0 新增，替代 v1.x 的 doc_acl —— 见下方迁移说明）
 -- 把 uid 按 role 直接授到某 doc；resolveRole 仅查此表 + owner（§4.2），不再做 octo 群继承。
 CREATE TABLE doc_member (
   doc_id        VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id
   uid           VARCHAR(64)  NOT NULL,            -- 被授权的 Octo user id（可信 uid，来源见 §4.4 / §4.6）
-  role          TINYINT      NOT NULL,            -- 1=reader 2=writer 3=admin
+  role          TINYINT      NOT NULL,            -- 1=reader 2=writer 3=admin 4=commenter
   granted_by    VARCHAR(64)  NOT NULL,            -- 授权人 uid（直接添加为 owner/admin；链接邀请为 doc_invite.created_by）
   source        TINYINT      NOT NULL DEFAULT 1,  -- 1=direct(直接添加) 2=invite(经 doc_invite 接受)
   invite_token  VARCHAR(64)  NOT NULL DEFAULT '', -- 经邀请加入时记录来源 token（审计/回收），direct 为空
@@ -80,7 +92,7 @@ CREATE TABLE doc_member (
 CREATE TABLE doc_invite (
   invite_token  VARCHAR(64)  NOT NULL,            -- 邀请 token（高熵随机串，进 URL）
   doc_id        VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id
-  role          TINYINT      NOT NULL DEFAULT 2,  -- 授予 role：1=reader 2=writer(默认) 3=admin
+  role          TINYINT      NOT NULL DEFAULT 2,  -- 授予 role：1=reader 2=writer(默认) 3=admin 4=commenter
   max_uses      INT          NOT NULL DEFAULT 0,  -- 最大可用次数；0 表示不限次（按 expires_at 控制）
   used_count    INT          NOT NULL DEFAULT 0,  -- 已被接受次数（每成功 accept +1，原子自增并校验上限）
   expires_at    DATETIME(3)  NULL,                -- 过期时间；NULL 表示不过期（仍可被 revoke）
@@ -107,7 +119,7 @@ CREATE TABLE doc_invite_redemption (
 CREATE TABLE doc_access_request (
   doc_id         VARCHAR(64)  NOT NULL,            -- 关联 doc_meta.doc_id
   uid            VARCHAR(64)  NOT NULL,            -- 申请人可信 uid（authMiddleware 注入，绝非请求体）
-  requested_role TINYINT      NOT NULL DEFAULT 1,  -- 1=reader 2=writer（无 commenter/admin 申请）
+  requested_role TINYINT      NOT NULL DEFAULT 1,  -- 1=reader 2=writer 4=commenter（无 admin 申请）
   reason         VARCHAR(512) NOT NULL DEFAULT '',
   status         TINYINT      NOT NULL DEFAULT 1,  -- 1=pending 2=approved 3=denied 4=cancelled
   request_id     VARCHAR(64)  NOT NULL,            -- 高熵 id，供 approve/deny 路由寻址

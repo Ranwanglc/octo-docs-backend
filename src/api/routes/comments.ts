@@ -1,8 +1,8 @@
 /**
  * Inline-comment endpoints (feature #3 — doc_comment).
  *   GET    /api/v1/docs/{docId}/comments        (reader)  list thread roots + replies
- *   POST   /api/v1/docs/{docId}/comments        (reader)  create root or reply
- *   PATCH  /api/v1/docs/{docId}/comments/{id}    body edit -> author; resolve -> writer
+ *   POST   /api/v1/docs/{docId}/comments        (commenter) create root or reply
+ *   PATCH  /api/v1/docs/{docId}/comments/{id}    body edit -> author+writer; resolve -> writer
  *   DELETE /api/v1/docs/{docId}/comments/{id}    soft -> author; hard -> admin
  *
  * Comments live entirely out-of-band from the Y.Doc. Anchors are opaque encoded
@@ -17,9 +17,8 @@
  * always takes precedence, so the existing front-end selection flow is not
  * affected.
  *
- * Product decision: read => can comment, so creating a comment only needs the
- * reader role. Resolving/reopening a thread needs writer; deleting your own
- * comment (soft) needs to be its author; hard delete needs admin.
+ * Readers are read-only. Creating/replying and deleting one's own comment need
+ * commenter; body edits and resolve/reopen need writer; hard delete needs admin.
  */
 import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
@@ -228,8 +227,7 @@ export async function listCommentsHandler(req: Request, res: Response): Promise<
 commentsRouter.post('/:docId/comments', createCommentHandler)
 
 export async function createCommentHandler(req: Request, res: Response): Promise<void> {
-  // Product decision: read => can comment.
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'commenter', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
 
   const { body, anchorStart, anchorEnd, anchorText, parentId } = req.body ?? {}
@@ -356,11 +354,11 @@ commentsRouter.patch('/:docId/comments/:id', patchCommentHandler)
 
 export async function patchCommentHandler(req: Request, res: Response): Promise<void> {
   const docId = req.params.docId!
-  // Doc-access floor: a reader role is the minimum to touch any comment here.
+  // Mutation floor: readers may list comments but cannot change them.
   // This runs FIRST so it 404s on missing/deleted docs, 409s on archived ones,
   // and 403s a caller whose role is 'none' (e.g. revoked author) — before the
   // author check below ever gets a chance to allow a write.
-  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'commenter', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
 
   const id = parseId(req.params.id)
@@ -398,9 +396,9 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
     return
   }
 
-  // Body edit — requires the author (the reader floor above is already enforced).
+  // Body edit remains a writer operation; writers may edit only their own comments.
   if (body !== undefined) {
-    if (comment.authorUid !== req.uid) {
+    if (comment.authorUid !== req.uid || !roleAtLeast(guard.role, 'writer')) {
       res.status(403).json({ error: 'forbidden' })
       return
     }
@@ -421,9 +419,9 @@ commentsRouter.delete('/:docId/comments/:id', deleteCommentHandler)
 
 export async function deleteCommentHandler(req: Request, res: Response): Promise<void> {
   const docId = req.params.docId!
-  // Doc-access floor (see patchCommentHandler): blocks revoked authors and
+  // Commenter floor (see patchCommentHandler): blocks readers/revoked authors and
   // enforces doc-status 404/409 semantics before the author check below.
-  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'commenter', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
 
   const id = parseId(req.params.id)

@@ -20,6 +20,10 @@
  */
 import { query, transaction } from '../pool.js'
 import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
+import { STORED_ROLE_VALUES } from '../../permission/role.js'
+
+const VALID_STORED_ROLES_SQL = STORED_ROLE_VALUES.join(', ')
+const validMemberRole = `dm.role IN (${VALID_STORED_ROLES_SQL})`
 
 /** A recent-view row joined with its doc_meta business columns. */
 export interface RecentViewItem {
@@ -28,7 +32,7 @@ export interface RecentViewItem {
   owner_id: string
   doc_type: string
   octo_doc_slug: string | null
-  role: number // 1=reader 2=writer 3=admin (owner => 3)
+  role: number // stored role code; owner => admin(3), commenter => 4
   updated_at: Date
   updated_by: string // last editor uid (doc_meta.updated_by; '' when never edited)
   viewed_at: Date
@@ -111,18 +115,14 @@ function escapeLike(s: string): string {
  */
 function visibilityPredicate(isSpaceMember: boolean): string {
   return isSpaceMember
-    ? `(m.owner_id = ? OR dm.uid IS NOT NULL OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id))`
-    : '(m.owner_id = ? OR dm.uid IS NOT NULL)'
+    ? `(m.owner_id = ? OR ${validMemberRole} OR (m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id))`
+    : `(m.owner_id = ? OR ${validMemberRole})`
 }
 
 /**
  * Role projection for the recent list — the read-side twin of `effectiveRole`
- * (shareScope.ts). owner => admin(3); otherwise the MAX of the direct doc_member
- * role and the share-derived role. A doc that is visible ONLY via the space-share
- * branch has no doc_member row (dm.role NULL), so without the share arm its role
- * collapses to Number(null)=0 => reader in the route — mislabeling an EDIT-shared
- * doc as read-only. GREATEST(COALESCE(...)) keeps the share path RAISE-only, so a
- * direct writer/admin is never lowered by a reader share.
+ * (shareScope.ts). Stored commenter=4 is not privilege-ordered, so the merge
+ * tests writer/admin explicitly instead of using numeric GREATEST.
  *
  * The share arm carries the SAME same-space guard as the visibility predicate
  * (`m.share_scope = ANYONE AND m.space_id = v.space_id`) and is only emitted when
@@ -134,13 +134,16 @@ function visibilityPredicate(isSpaceMember: boolean): string {
 function roleProjection(isSpaceMember: boolean): string {
   return isSpaceMember
     ? `CASE WHEN m.owner_id = ? THEN 3
-            ELSE GREATEST(
-              COALESCE(dm.role, 0),
-              CASE WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id
-                   THEN (CASE WHEN m.share_role = ${SHARE_ROLE_EDIT} THEN 2 ELSE 1 END)
-                   ELSE 0 END
-            ) END`
-    : 'CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END'
+            WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id
+                 AND m.share_role = ${SHARE_ROLE_EDIT}
+              THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 ELSE 2 END
+            WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.space_id = v.space_id
+              THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1 ELSE 1 END
+            WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
+            ELSE NULL END`
+    : `CASE WHEN m.owner_id = ? THEN 3
+            WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
+            ELSE NULL END`
 }
 
 export const docViewHistoryRepo = {

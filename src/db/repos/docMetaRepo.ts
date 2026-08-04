@@ -7,6 +7,7 @@
  */
 import { query, transaction, type Tx } from '../pool.js'
 import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
+import { STORED_ROLE_VALUES } from '../../permission/role.js'
 
 /**
  * True when a thrown DB error is a duplicate-key violation. mysql2 surfaces it
@@ -73,6 +74,9 @@ export interface CreateDocInput {
   octoDocSlug?: string
   createdBy: string
 }
+
+const VALID_STORED_ROLES_SQL = STORED_ROLE_VALUES.join(', ')
+const validMemberRole = `dm.role IN (${VALID_STORED_ROLES_SQL})`
 
 export const docMetaRepo = {
   async create(input: CreateDocInput): Promise<void> {
@@ -315,10 +319,11 @@ export const docMetaRepo = {
     // SHARE_SCOPE_ANYONE is a numeric constant, inlined (no extra bind).
     const includeSpaceShare = params.owner !== 'me' && params.isSpaceMember === true
     let visibility: string
+    let ownerSet: string[] | null = null
     // Bind values contributed by the visibility clause, in placeholder order.
     const visibilityArgs: unknown[] = []
     if (params.owner === 'me') {
-      const ownerSet = [
+      ownerSet = [
         params.uid,
         ...(params.ownedBots ?? []).filter((b) => typeof b === 'string' && b !== ''),
       ].filter((v, i, arr) => arr.indexOf(v) === i)
@@ -326,10 +331,10 @@ export const docMetaRepo = {
       visibility = `m.owner_id IN (${ownerSet.map(() => '?').join(', ')})`
       visibilityArgs.push(...ownerSet)
     } else if (includeSpaceShare) {
-      visibility = `(m.owner_id = ? OR dm.uid IS NOT NULL OR m.share_scope = ${SHARE_SCOPE_ANYONE})`
+      visibility = `(m.owner_id = ? OR ${validMemberRole} OR m.share_scope = ${SHARE_SCOPE_ANYONE})`
       visibilityArgs.push(params.uid)
     } else {
-      visibility = '(m.owner_id = ? OR dm.uid IS NOT NULL)'
+      visibility = `(m.owner_id = ? OR ${validMemberRole})`
       visibilityArgs.push(params.uid)
     }
     // Placeholders in `base`, in order: JOIN `dm.uid = ?`, then the optional
@@ -360,31 +365,29 @@ export const docMetaRepo = {
 
     // tie-break on doc_id keeps offset paging stable when rows share updated_at.
     // role projection MUST mirror the write side (effectiveRole, shareScope.ts):
-    // owner => admin(3); otherwise the MAX of the direct doc_member role and the
-    // share-derived role. When the caller is a confirmed Space member and the doc
-    // is anyone_in_space, an EDIT share yields writer(2) / any other share yields
-    // reader(1) — so a share-only doc (no doc_member row => dm.role NULL) is
-    // labeled writer, not silently reader (Number(null)=0). GREATEST(COALESCE...)
-    // keeps the share path RAISE-only: a direct writer/admin is never lowered by a
-    // reader share. The share arm is only present on the same includeSpaceShare
-    // gate as the visibility predicate, so a non-member never gets a share label.
-    // SHARE_SCOPE_ANYONE / SHARE_ROLE_EDIT are numeric constants inlined (no bind),
-    // so the leading owner-uid bind is identical whether or not the arm is present.
+    // Stored commenter=4 is not privilege-ordered, so the share merge uses an
+    // explicit writer/admin set instead of a raw numeric GREATEST.
+    const roleOwnerPredicate = ownerSet
+      ? `m.owner_id IN (${ownerSet.map(() => '?').join(', ')})`
+      : 'm.owner_id = ?'
+    const roleOwnerArgs: unknown[] = ownerSet ?? [params.uid]
     const roleExpr = includeSpaceShare
-      ? `CASE WHEN m.owner_id = ? THEN 3
-              ELSE GREATEST(
-                COALESCE(dm.role, 0),
-                CASE WHEN m.share_scope = ${SHARE_SCOPE_ANYONE}
-                     THEN (CASE WHEN m.share_role = ${SHARE_ROLE_EDIT} THEN 2 ELSE 1 END)
-                     ELSE 0 END
-              ) END`
-      : 'CASE WHEN m.owner_id = ? THEN 3 ELSE dm.role END'
+      ? `CASE WHEN ${roleOwnerPredicate} THEN 3
+              WHEN m.share_scope = ${SHARE_SCOPE_ANYONE} AND m.share_role = ${SHARE_ROLE_EDIT}
+                THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 ELSE 2 END
+              WHEN m.share_scope = ${SHARE_SCOPE_ANYONE}
+                THEN CASE WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1 ELSE 1 END
+              WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
+              ELSE NULL END`
+      : `CASE WHEN ${roleOwnerPredicate} THEN 3
+              WHEN dm.role = 3 THEN 3 WHEN dm.role = 2 THEN 2 WHEN dm.role = 4 THEN 4 WHEN dm.role = 1 THEN 1
+              ELSE NULL END`
     const items = await query<DocMeta & { role: number }>(
       `SELECT m.*, ${roleExpr} AS role
        ${base}
        ORDER BY m.updated_at ${order}, m.doc_id ${order}
        LIMIT ${pageSize} OFFSET ${offset}`,
-      [params.uid, ...args],
+      [...roleOwnerArgs, ...args],
     )
     return { total, items }
   },
@@ -452,7 +455,7 @@ export const docMetaRepo = {
     // isn't in this set, so it can't be searched even if OS still holds a stale
     // copy. SHARE_SCOPE_ANYONE is a numeric constant, inlined (no extra bind).
     const spaceShare = params.isSpaceMember === true ? ` OR m.share_scope = ${SHARE_SCOPE_ANYONE}` : ''
-    where.push(`(m.owner_id IN (${ownerPlaceholders}) OR dm.uid IS NOT NULL${spaceShare})`)
+    where.push(`(m.owner_id IN (${ownerPlaceholders}) OR ${validMemberRole}${spaceShare})`)
     args.push(...ownerSet)
 
     // Cap rows at limit+1 (when a limit is given) so overflow is detectable by

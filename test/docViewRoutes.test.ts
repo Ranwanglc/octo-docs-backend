@@ -116,6 +116,21 @@ describe('GET /docs/recent — listRecentHandler', () => {
     expect(arg.cursor).toBe('X')
   })
 
+  it('drops an anomalous role projection instead of exposing it as reader', async () => {
+    vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({
+      total: 1,
+      nextCursor: null,
+      items: [
+        { doc_id: 'd_corrupt', title: 'X', owner_id: 'u_o', doc_type: 'doc', role: 99,
+          updated_at: new Date('2026-07-10T00:00:00.000Z'), updated_by: '',
+          viewed_at: new Date('2026-07-15T06:00:00.000Z') },
+      ],
+    } as never)
+    const res = mockRes()
+    await listRecentHandler(req({ query: {} }), res as never)
+    expect((res.body as { items: unknown[] }).items).toEqual([])
+  })
+
   it('surfaces octo_doc_slug as octoDocSlug on html rows (so the front-end can fetch the body) and omits it on non-html rows', async () => {
     vi.mocked(docViewHistoryRepo.listRecent).mockResolvedValue({
       total: 2,
