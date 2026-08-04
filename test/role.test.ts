@@ -4,6 +4,7 @@ import {
   roleAtLeast,
   roleToNumber,
   roleFromNumber,
+  isForwardGrantRole,
   ROLE_COMMENTER,
 } from '../src/permission/role.js'
 
@@ -38,5 +39,12 @@ describe('role ordering (commenter between reader and writer)', () => {
     expect(roleFromNumber(1)).toBe('reader')
     expect(roleFromNumber(2)).toBe('writer')
     expect(roleFromNumber(3)).toBe('admin')
+  })
+
+  it('allows non-admin forward grants only', () => {
+    expect(isForwardGrantRole('reader')).toBe(true)
+    expect(isForwardGrantRole('commenter')).toBe(true)
+    expect(isForwardGrantRole('writer')).toBe(true)
+    expect(isForwardGrantRole('admin')).toBe(false)
   })
 })

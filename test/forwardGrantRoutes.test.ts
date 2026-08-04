@@ -92,14 +92,15 @@ describe('POST /:docId/forward-grant', () => {
     })
   })
 
-  it('rejects commenter because the forward-grant contract accepts only reader|writer', async () => {
+  it('grants commenter to a real user', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(grantForwardAccess).mockResolvedValueOnce({ finalRole: 'commenter', changed: true })
     stubIdentity({ u_real: { uid: 'u_real', name: 'Real' } })
     const res = mockRes()
     await handler()(req({ uid: 'u_real', role: 'commenter' }), res as never)
-    expect(res.statusCode).toBe(400)
-    expect(res.body).toEqual({ error: 'role must be reader|writer' })
-    expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toEqual({ ok: true, role: 'commenter', changed: true })
+    expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith(expect.objectContaining({ roleNum: 4 }))
   })
 
   it('blocked guard (non admin/owner) short-circuits: no grant attempted', async () => {
@@ -128,6 +129,7 @@ describe('POST /:docId/forward-grant', () => {
     await handler()(req({ uid: 'u_real', role: 'admin' }), res as never)
 
     expect(res.statusCode).toBe(400)
+    expect(res.body).toEqual({ error: 'role must be reader|commenter|writer' })
     expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
   })
 
