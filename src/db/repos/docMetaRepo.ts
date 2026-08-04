@@ -6,6 +6,7 @@
  * persistence key, unique). See appendix B for the naming convention.
  */
 import { query, transaction, type Tx } from '../pool.js'
+import { docTypeUsesOctoDocSlug } from '../docType.js'
 import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
 import { STORED_ROLE_VALUES } from '../../permission/role.js'
 
@@ -92,13 +93,23 @@ export const docMetaRepo = {
         input.spaceId,
         input.folderId,
         input.docType,
-        input.docType === 'html' ? (input.octoDocSlug ?? null) : null,
+        // octo_doc_slug is persisted for the slug-registered kinds (html and
+        // html_ppt bot rows) and NULL for everything else. Human-created rows of
+        // either kind pass no slug, so they also store NULL. Using the shared
+        // predicate (not a hardcoded 'html') keeps a future bot PPT registration
+        // from silently dropping its slug here.
+        docTypeUsesOctoDocSlug(input.docType) ? (input.octoDocSlug ?? null) : null,
         input.createdBy,
       ],
     )
   },
 
   async upsertHtmlByOctoDocSlug(input: CreateDocInput & { octoDocSlug: string }): Promise<{ meta: DocMeta; created: boolean }> {
+    // NOTE (R1 scope): the `doc_type = 'html'` predicates in this method and in
+    // getByOctoDocSlug are INTENTIONALLY html-only. PPT bot register (R2-B2)
+    // adds a `doc_type`-parametrized slug-upsert path; broadening these clauses
+    // to also match html_ppt now would let an html create resolve a PPT row (or
+    // vice-versa) sharing a slug, so they stay kind-scoped until R2 wires PPT.
     // Tenant isolation (P0): resolve the slug WITHIN the caller's space only. A
     // slug is unique per (space_id, octo_doc_slug), so a same-slug row in another
     // space is invisible here and can never be updated/revived across tenants.

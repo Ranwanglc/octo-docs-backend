@@ -23,7 +23,7 @@ import { resolveRole, resolveDocMetaByName } from '../permission/resolveRole.js'
 import { docViewHistoryRepo } from '../db/repos/docViewHistoryRepo.js'
 import { config } from '../config/env.js'
 import { effectiveRole, SHARE_SCOPE_ANYONE } from '../permission/shareScope.js'
-import { HTML_DOC_TYPE } from '../db/docType.js'
+import { HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../db/docType.js'
 
 export type IssueResult =
   | { ok: true; result: CollabTokenResult }
@@ -91,11 +91,15 @@ export async function issueCollabToken(
   }
 
   // HTML has its own body/comment backend and no Yjs collaboration design.
-  // Reject before role resolution so no HTML role can mint a Hocuspocus token.
-  if (meta.doc_type === HTML_DOC_TYPE) {
+  // html_ppt (Bento slide-deck) is an EXPLICIT sibling here: it uses the Bento
+  // frame protocol over its OWN relay + `POST /api/v1/ppt/docs/collab-token`
+  // endpoint, never the Hocuspocus/Yjs token. Reject BOTH before role resolution
+  // so no html / html_ppt role can mint a Hocuspocus token (§1.2 / §6).
+  if (meta.doc_type === HTML_DOC_TYPE || meta.doc_type === HTML_PPT_DOC_TYPE) {
     // eslint-disable-next-line no-console
-    console.warn('[octo-docs] collab-token rejected: HTML does not support collaboration', {
+    console.warn('[octo-docs] collab-token rejected: doc type does not support Hocuspocus collaboration', {
       docId: meta.doc_id,
+      docType: meta.doc_type,
     })
     return { ok: false, status: 422, error: 'unsupported_document_type' }
   }

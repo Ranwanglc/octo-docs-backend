@@ -40,6 +40,7 @@ import { docSceneRouter } from './routes/docScene.js'
 import { exportRouter } from './routes/export.js'
 import { boardExportRouter } from './routes/boardExport.js'
 import { importRouter } from './routes/import.js'
+import { createPptRouter } from './ppt/envelope.js'
 import { sanitizeUrlForLog } from './accessLog.js'
 
 export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: boolean | number | string } = {}): Express {
@@ -208,6 +209,13 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   botApi.use(boardExportRouter) // /v1/bot/docs/:docId/export (whiteboard PNG/SVG, W3)
   botApi.use(importRouter) // /v1/bot/docs/:docId/import/{docx|markdown|xlsx}
   app.use('/v1/bot/docs', botApi)
+
+  // PPT contract surface (§3 / §4). Mounted as its OWN router so `/api/v1/ppt/**`
+  // uses the C-style `{data}`/`{error}` envelope and error enum, while the legacy
+  // `/api/v1/docs/**` surface below keeps its bare-JSON shape via the global
+  // handler. R1 wires only the envelope + a terminal enveloped NOT_FOUND; the
+  // concrete endpoints (and their auth guards) land inside createPptRouter in R2+.
+  app.use('/api/v1/ppt', createPptRouter())
 
   // central error handler — unexpected errors => 500 (§8.4 error table).
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {

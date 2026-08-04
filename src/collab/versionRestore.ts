@@ -15,6 +15,7 @@ import * as Y from 'yjs'
 import { prosemirrorToYXmlFragment, yDocToProsemirrorJSON } from 'y-prosemirror'
 import { Node as PMNode } from 'prosemirror-model'
 import { buildSchema, COLLAB_FIELD, SCHEMA_VERSION } from '../schema/index.js'
+import { HTML_DOC_TYPE, HTML_PPT_DOC_TYPE, type DocType } from '../db/docType.js'
 import { SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD, SHEET_MERGES_FIELD, SHEET_LIST_FIELD, validateSheetCells, validateSheetCell, validateSheetDims, validateSheetDim, validateSheetDrawing, validateSheetHyperLink, validateSheetHyperLinks, validateSheetMerge, validateSheetMerges, validateSheetListEntry, validateSheetList, type StoredDrawing, type StoredHyperLink, type StoredSheetMeta } from '../agent/sheetConversion.js'
 import { WB_SCHEMA_VERSION } from '../whiteboard/schema/index.js'
 import { getElementsMap, getFilesMap, readEntry, readElements, type YElements } from '../whiteboard/ydoc.js'
@@ -31,15 +32,57 @@ const schema = buildSchema()
  * number — see whiteboard/schema/constants.ts §6). The kind is derived from the
  * doc's immutable `doc_meta.doc_type`, so every decode/gate/restore path selects
  * the correct decoder and schema line for the row it is handling.
+ *
+ * `ppt` is a THIRD, decode-less line: a `html_ppt` version is a BentoDoc /
+ * rendered-HTML blob stored in `ppt_version`, NOT a Yjs `doc_version` row, so it
+ * must never reach the ProseMirror/Excalidraw decoders. The Yjs version routes
+ * reject `ppt` with 422 UNSUPPORTED_DOCUMENT_TYPE rather than decode it (§1.3).
  */
-export type VersionContentKind = 'document' | 'board'
+export type VersionContentKind = 'document' | 'board' | 'ppt'
 
 /** doc_type value the front-end stamps on whiteboards (see routes/docs.ts). */
 export const WHITEBOARD_DOC_TYPE = 'board'
 
-/** Map a doc's `doc_meta.doc_type` to its version-content kind. */
+/**
+ * Map a doc's `doc_meta.doc_type` to its version-content kind.
+ *
+ * EXHAUSTIVE allowlist over `DOC_TYPES` with a compile-time `never` guard: every
+ * wire kind maps to an explicit content line, so a new `DOC_TYPES` member added
+ * without a branch here fails the build (in `assertNeverDocType`) instead of
+ * silently inheriting the `document` (Yjs/ProseMirror) decode path. This is the
+ * guard that keeps `html_ppt` — a BentoDoc blob — from ever falling through to
+ * `decodeTargetSnapshot`/`Y.applyUpdate`/ProseMirror restore.
+ */
 export function contentKindFromDocType(docType: string): VersionContentKind {
-  return docType === WHITEBOARD_DOC_TYPE ? 'board' : 'document'
+  // The DB column is a free string; widen to the DocType union so the `never`
+  // default below is a genuine exhaustiveness check over DOC_TYPES.
+  const kind = docType as DocType
+  switch (kind) {
+    case WHITEBOARD_DOC_TYPE:
+      return 'board'
+    case HTML_PPT_DOC_TYPE:
+      return 'ppt'
+    case 'doc':
+    case 'sheet':
+    case HTML_DOC_TYPE:
+      return 'document'
+    default:
+      return assertNeverDocType(kind)
+  }
+}
+
+/**
+ * Compile-time exhaustiveness backstop for `contentKindFromDocType`. If every
+ * `DOC_TYPES` member is handled above, `kind` narrows to `never` here and this
+ * call type-checks; add a new kind without a branch and `kind` is that literal
+ * (not `never`), breaking the build. At RUNTIME an unknown/legacy `doc_type`
+ * (a value not in DOC_TYPES, e.g. a pre-enum row) is mapped to the historical
+ * `document` line rather than throwing — the guard is a build-time contract, not
+ * a request-time failure.
+ */
+function assertNeverDocType(kind: never): VersionContentKind {
+  void kind
+  return 'document'
 }
 
 /**
