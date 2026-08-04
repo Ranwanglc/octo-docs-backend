@@ -37,6 +37,7 @@ import {
   validateSheetListBatch,
   measureSheetAfterEdit,
   SheetSnapshotInvalidError,
+  ProtectedRangeError,
   type SheetCell,
   type StoredDrawing,
   type StoredHyperLink,
@@ -117,7 +118,7 @@ interface LockedMetaRow {
  * space-share-derived role, so an `anyone_in_space`/edit space member is not
  * 403'd here after passing the route guard.
  */
-async function hasWriterTx(tx: Tx, docId: string, uid: string, meta: LockedMetaRow, isBot: boolean, token: string): Promise<boolean> {
+async function resolveWriterTx(tx: Tx, docId: string, uid: string, meta: LockedMetaRow, isBot: boolean, token: string): Promise<{ canWrite: boolean; isAdmin: boolean }> {
   const direct: ResolvedRole =
     uid === meta.owner_id ? 'admin' : ((await docMemberRepo.getRoleTx(tx, docId, uid)) ?? 'none')
   const role = await resolveEffectiveRole(uid, direct, {
@@ -125,13 +126,19 @@ async function hasWriterTx(tx: Tx, docId: string, uid: string, meta: LockedMetaR
     share_scope: Number(meta.share_scope),
     share_role: Number(meta.share_role),
   }, { isBot, token })
-  return roleAtLeast(role, 'writer')
+  // Return the ADMIN verdict too: range-protection enforcement (commitLiveSheetEdit) must use the
+  // very same effective role this guard computed under the lock. Re-resolving it later could give a
+  // different answer (membership/share change in between) and let a write slip past protection.
+  return { canWrite: roleAtLeast(role, 'writer'), isAdmin: roleAtLeast(role, 'admin') }
 }
 
 /** Map a thrown edit-core / guard error to its HTTP status + code. */
 function mapEditError(err: unknown): { status: number; error: string } | null {
   if (err instanceof BaseVersionStaleError) return { status: 412, error: 'base_version_stale' }
   if (err instanceof SheetSnapshotInvalidError) return { status: 422, error: 'sheet_cell_invalid' }
+  // Pre-mutation refusal (nothing applied / broadcast), so it belongs in this set: the caller's
+  // safety snapshot is an orphan and gets compensated away by the shared handling below.
+  if (err instanceof ProtectedRangeError) return { status: 403, error: 'protected_range' }
   return null
 }
 
@@ -202,7 +209,8 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
     if (!meta || Number(meta.status) === 0) return { ok: false as const, status: 404, error: 'not_found' }
     if (Number(meta.status) === 2) return { ok: false as const, status: 409, error: 'conflict' }
 
-    if (!(await hasWriterTx(tx, input.docId, input.uid, meta, input.isBot ?? false, input.token ?? ''))) {
+    const writer = await resolveWriterTx(tx, input.docId, input.uid, meta, input.isBot ?? false, input.token ?? '')
+    if (!writer.canWrite) {
       return { ok: false as const, status: 403, error: 'forbidden' }
     }
     if (Number(meta.permission_epoch) !== input.authorizedEpoch) {
@@ -221,7 +229,7 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
       createdBy: input.uid,
     })
 
-    return { ok: true as const, safetyVersionId }
+    return { ok: true as const, safetyVersionId, isAdmin: writer.isAdmin }
     // COMMIT here releases both FOR UPDATE locks before the live write.
   })
 
@@ -241,6 +249,7 @@ export async function editDocSheet(input: EditDocSheetInput): Promise<EditDocShe
       input.hyperlinks,
       input.merges,
       input.sheets,
+      txResult.isAdmin,
     )
     bytes = committed.bytes
     newSV = committed.newSV

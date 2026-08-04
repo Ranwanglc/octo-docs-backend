@@ -15,7 +15,7 @@
 import type { Document } from '@hocuspocus/server'
 import * as Y from 'yjs'
 import { getCollabServer } from './server.js'
-import { validateSheetCellBatch, validateSheetDimBatch, validateSheetDrawingBatch, validateSheetHyperLinkBatch, validateSheetMergeBatch, validateSheetListBatch, SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD, SHEET_MERGES_FIELD, SHEET_LIST_FIELD, type SheetCell, type StoredDrawing, type StoredHyperLink, type StoredSheetMeta } from '../agent/sheetConversion.js'
+import { validateSheetCellBatch, validateSheetDimBatch, validateSheetDrawingBatch, validateSheetHyperLinkBatch, validateSheetMergeBatch, validateSheetListBatch, assertSheetWriteAllowed, SHEET_YMAP_FIELD, SHEET_DIMS_FIELD, SHEET_DRAWINGS_FIELD, SHEET_HYPERLINKS_FIELD, SHEET_MERGES_FIELD, SHEET_LIST_FIELD, type SheetCell, type StoredDrawing, type StoredHyperLink, type StoredSheetMeta } from '../agent/sheetConversion.js'
 import { advanceEditVersion } from './liveDocWrite.js'
 import { stateVectorsEqual, BaseVersionStaleError } from './docBodyEdit.js'
 
@@ -87,6 +87,12 @@ export async function commitLiveSheetEdit(
   hyperlinks: Record<string, StoredHyperLink | null> = {},
   merges: Record<string, boolean | null> = {},
   sheets: Record<string, StoredSheetMeta | null> = {},
+  /**
+   * Whether the caller resolved `uid` as a doc admin, under the SAME doc_meta
+   * lock that authorized the write. Defaults to false so an uninformed caller
+   * gets the safe answer (protection enforced) rather than a bypass.
+   */
+  isAdmin = false,
 ): Promise<{ newSV: Uint8Array; bytes: number }> {
   const server = getCollabServer()
   const connection = await server.hocuspocus.openDirectConnection(documentName, { user: { id: uid } })
@@ -100,6 +106,16 @@ export async function commitLiveSheetEdit(
       if (!stateVectorsEqual(clientBaseVersion, currentSV)) {
         throw new BaseVersionStaleError()
       }
+      // (1b) PROTECTION guard — still before any mutation. Reads the protection
+      //      rules + grant lists off the SAME live doc, so a non-admin writing
+      //      into a protected range is rejected with nothing applied and nothing
+      //      broadcast (same fail-closed shape as the stale-version guard above).
+      //      openDirectConnection bypasses onAuthenticate, so this is the only
+      //      place the bot/REST path can be held to the protection contract.
+      //      `sheets` is passed too: the route allows sheets-only PATCHes, and a
+      //      tab delete destroys every protected cell on that tab, so omitting it
+      //      left a strictly-worse bypass than the cell write this guard refuses.
+      assertSheetWriteAllowed(doc, cells, uid, isAdmin, dims, merges, sheets)
       // (2) The single, last content mutation. Validate ALL SIX batches FIRST
       //     (validate* return the split batches without mutating), THEN apply —
       //     so a bad dim/drawing can't leave cells half-applied. Yjs does NOT roll
