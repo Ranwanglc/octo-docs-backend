@@ -18,6 +18,7 @@
 
 export type Role = 'reader' | 'commenter' | 'writer' | 'admin'
 export type ResolvedRole = Role | 'none'
+export type ForwardGrantRole = Exclude<Role, 'admin'>
 
 export const ROLE_READER = 1
 export const ROLE_WRITER = 2
@@ -76,8 +77,8 @@ export function isMemberRole(value: unknown): value is Role {
   return value === 'reader' || value === 'commenter' || value === 'writer' || value === 'admin'
 }
 
-export function isForwardGrantRole(value: unknown): value is 'reader' | 'writer' {
-  return value === 'reader' || value === 'writer'
+export function isForwardGrantRole(value: unknown): value is ForwardGrantRole {
+  return value === 'reader' || value === 'commenter' || value === 'writer'
 }
 
 export function isAccessRequestRole(value: unknown): value is Exclude<Role, 'admin'> {

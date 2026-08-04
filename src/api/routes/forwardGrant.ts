@@ -1,7 +1,7 @@
 /**
  * Forward-grant route (§2 / §9.1, doc_member max-merge).
  *
- *   POST /api/v1/docs/{docId}/forward-grant   { uid, role: "reader"|"writer" }
+ *   POST /api/v1/docs/{docId}/forward-grant   { uid, role: "reader"|"commenter"|"writer" }
  *
  * Single-uid granularity: the frontend calls this once per 1v1 recipient and,
  * for a group, loops over the host-expanded member-snapshot uids, aggregating
@@ -9,7 +9,7 @@
  *
  * Per-uid status contract:
  *   200 ok              — granted, upgraded, or already >= target (idempotent)
- *   400 bad request     — missing uid / role not reader|writer
+ *   400 bad request     — missing uid / invalid role
  *   403 forbidden       — forwarder is NOT admin/owner (via requireDocRole(admin))
  *   404 user_not_found  — target uid is not a real octo user (anti ghost-member)
  *   404 not_found       — doc missing/deleted ; 409 conflict — archived
@@ -21,13 +21,12 @@
 import { Router, type Router as ExpressRouter, type Request, type Response } from 'express'
 import { requireDocRole } from '../guard.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
-import { isForwardGrantRole, roleToNumber } from '../../permission/role.js'
+import { isForwardGrantRole, roleToNumber, type ForwardGrantRole } from '../../permission/role.js'
 import { grantForwardAccess } from '../services/grantForward.js'
 
 export const forwardGrantRouter: ExpressRouter = Router()
 
-/** Preserve the established Web forward contract. */
-function parseGrantRole(v: unknown): 'reader' | 'writer' | null {
+function parseGrantRole(v: unknown): ForwardGrantRole | null {
   return isForwardGrantRole(v) ? v : null
 }
 
@@ -44,7 +43,7 @@ forwardGrantRouter.post('/:docId/forward-grant', async (req: Request, res: Respo
   }
   const parsedRole = parseGrantRole(role)
   if (!parsedRole) {
-    res.status(400).json({ error: 'role must be reader|writer' })
+    res.status(400).json({ error: 'role must be reader|commenter|writer' })
     return
   }
 
