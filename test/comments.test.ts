@@ -153,6 +153,26 @@ describe('POST create (commenter minimum)', () => {
     expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('commenter')
   })
 
+  it('rejects an html_ppt doc on the legacy comment surface with 409 (Spec #1)', async () => {
+    // Adding html_ppt to DOC_TYPES widened the isDocType() gate; a deck must NOT
+    // be able to store opaque anchors on the legacy comment surface (its comments
+    // get dedicated /api/v1/ppt endpoints in R2). Explicit anchors + html_ppt.
+    const pptGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:ppt:d_1', doc_type: 'html_ppt' }, role: 'commenter' } as never
+    vi.mocked(requireDocRole).mockResolvedValue(pptGuard)
+    const res = mockRes()
+    await createCommentHandler(
+      req({
+        uid: 'u_reader',
+        params: { docId: 'd_1' },
+        body: { body: 'a note', anchorStart: Buffer.from('s').toString('base64'), anchorEnd: Buffer.from('e').toString('base64') },
+      }),
+      res as never,
+    )
+    expect(res.statusCode).toBe(409)
+    expect((res.body as { error: string }).error).toBe('unsupported_doc_type')
+    expect(transaction).not.toHaveBeenCalled()
+  })
+
   it('reader is read-only and cannot create a comment', async () => {
     forbidGuard()
     const res = mockRes()

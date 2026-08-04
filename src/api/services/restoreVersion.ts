@@ -31,6 +31,7 @@ import {
   restoreReconcileBoard,
   gateSchemaForKind,
   currentSchemaVersionFor,
+  assertNeverKind,
   SchemaIncompatibleError,
   SheetSnapshotInvalidError,
   BoardSnapshotInvalidError,
@@ -77,6 +78,15 @@ async function isAdminTx(tx: Tx, docId: string, uid: string, ownerId: string): P
 
 export async function restoreVersion(input: RestoreInput): Promise<RestoreResult> {
   const kind: VersionContentKind = input.contentKind ?? 'document'
+  if (kind === 'ppt') {
+    // Defense in depth: the Yjs restore route rejects html_ppt with 422 before
+    // calling this service. A `ppt` kind reaching here is a wrong-kind call —
+    // reject it up front so the BentoDoc blob never touches the ProseMirror /
+    // Excalidraw reconcile or the live-apply path below. (The type advertises
+    // `ppt` as a legal contentKind; this guard keeps that from doing the wrong
+    // thing silently.)
+    return { ok: false, status: 422, error: 'unsupported_document_type' }
+  }
   // Load the target version (immutable) up front so the schema "newer" gate can
   // fail fast without taking any lock. Cross-doc ids are hidden behind 404.
   const target = await docVersionRepo.getStateById(input.versionId)
@@ -134,9 +144,20 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
     //    diverge by clientId and force the union fallback in persistence.store.
     let validated: Uint8Array
     try {
-      validated = kind === 'board'
-        ? restoreReconcileBoard(currentState, target.state)
-        : restoreReconcile(currentState, target.state)
+      // Exhaustive over the reachable kinds (`ppt` is rejected at the top of
+      // this function); a new VersionContentKind added without a branch here
+      // fails the build in assertNeverKind rather than silently taking the
+      // ProseMirror reconcile.
+      switch (kind) {
+        case 'board':
+          validated = restoreReconcileBoard(currentState, target.state)
+          break
+        case 'document':
+          validated = restoreReconcile(currentState, target.state)
+          break
+        default:
+          assertNeverKind(kind)
+      }
     } catch (err) {
       if (err instanceof SchemaIncompatibleError) {
         return { ok: false as const, status: 409, error: 'version_schema_incompatible' }
@@ -198,10 +219,15 @@ export async function restoreVersion(input: RestoreInput): Promise<RestoreResult
   //    persists via the awaited store flush on disconnect. extension-redis
   //    propagates the same update to other nodes that have the doc loaded. Board
   //    docs take the Excalidraw-scene apply, documents/sheets the ProseMirror one.
-  if (kind === 'board') {
-    await applyBoardRestoreToLiveDoc(input.documentName, input.uid, target.state)
-  } else {
-    await applyRestoreToLiveDoc(input.documentName, input.uid, target.state)
+  switch (kind) {
+    case 'board':
+      await applyBoardRestoreToLiveDoc(input.documentName, input.uid, target.state)
+      break
+    case 'document':
+      await applyRestoreToLiveDoc(input.documentName, input.uid, target.state)
+      break
+    default:
+      assertNeverKind(kind)
   }
 
   return { ok: true, restoredFrom: txResult.restoredFrom, newDocVersionSeq: txResult.newDocVersionSeq }

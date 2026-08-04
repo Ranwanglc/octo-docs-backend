@@ -16,6 +16,8 @@
  *   e. {doc} must not contain illegal chars (incl ':') and must not equal 'wb'.
  */
 
+import { HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../db/docType.js'
+
 const SEG = /^[A-Za-z0-9_-]+$/
 
 export interface ParsedDocument {
@@ -161,22 +163,25 @@ export function buildPptDocumentName(space: string, folder: string, doc: string)
  *   - `:html:` name ⇒ doc_type MUST be `html`
  *   - `:wb:` name   ⇒ doc_type MUST be `board` (mirrors the existing whiteboard
  *     guard in issueCollabToken)
+ *   - 4-seg `document` name ⇒ doc_type MUST be `doc` or `sheet`
  *
- * The 4-segment `document` namespace is intentionally NOT constrained here: it is
- * shared by `doc` and `sheet` (both plain 4-seg keys), so callers that need to
- * separate those two do it by doc_type directly. Returns true when the pairing is
- * consistent (or not one of the namespaced kinds), false when it is a forbidden
- * mismatch — the caller maps false to 403/404 per its own contract.
+ * The 4-segment `document` namespace is shared by `doc` and `sheet` (both plain
+ * 4-seg keys), so it stays flexible BETWEEN those two — but it is still a forbidden
+ * mismatch when paired with a namespaced kind's doc_type (`html` / `html_ppt` /
+ * `board`), which is impossible by construction and therefore exactly the
+ * corruption this guard exists to reject. Returns true when the pairing is
+ * consistent, false when it is a forbidden mismatch — the caller maps false to
+ * 403/404 per its own contract.
  */
 export function isDocTypeConsistentWithName(parsed: ParsedName, docType: string): boolean {
   switch (parsed.kind) {
     case 'ppt':
-      return docType === 'html_ppt'
+      return docType === HTML_PPT_DOC_TYPE
     case 'html':
-      return docType === 'html'
+      return docType === HTML_DOC_TYPE
     case 'whiteboard':
       return docType === 'board'
     case 'document':
-      return true
+      return docType === 'doc' || docType === 'sheet'
   }
 }

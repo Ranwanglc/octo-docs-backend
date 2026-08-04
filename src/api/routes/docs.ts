@@ -7,7 +7,7 @@ import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 import { DocOwnershipError } from '../../db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../../db/repos/docMemberRepo.js'
 import { docViewHistoryRepo } from '../../db/repos/docViewHistoryRepo.js'
-import { normalizeTypeFilter, HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../../db/docType.js'
+import { normalizeTypeFilter, isDocType, HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../../db/docType.js'
 import { buildDocumentName, buildHtmlDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { enqueueDocIndex, isSearchIndexedDoc } from '../../search/docIndexQueue.js'
 import { refreshAndPublish, bumpEpoch } from '../../permission/epoch.js'
@@ -153,6 +153,14 @@ export async function createDocHandler(req: Request, res: Response) {
     // PPT row is never minted here with a 4-seg document key (which would route
     // the deck into the Yjs/ProseMirror collab + version path).
     res.status(422).json({ error: 'unsupported_document_type' })
+    return
+  }
+  if (!isDocType(resolvedDocType)) {
+    // Make the wrong-kind gate TOTAL, not exact-match-on-html_ppt: any doc_type
+    // outside DOC_TYPES would otherwise be persisted verbatim into
+    // doc_meta.doc_type (VARCHAR, no CHECK constraint) and fall through to a
+    // 4-seg Yjs document. Reject unknown types up front.
+    res.status(400).json({ error: 'invalid_doc_type' })
     return
   }
   if (resolvedDocType === HTML_DOC_TYPE) {

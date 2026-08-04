@@ -332,4 +332,17 @@ describe('issueCollabToken — html_ppt uses the Bento relay, not Hocuspocus', (
     expect(docMetaRepo.getByDocId).not.toHaveBeenCalled()
     expect(docMemberRepo.getRole).not.toHaveBeenCalled()
   })
+
+  it('a `:ppt:` key that resolves to a non-html_ppt row is 404 (cross-type guard now wired, Spec #2)', async () => {
+    // The shared isDocTypeConsistentWithName guard is now called here: a corrupt
+    // :ppt: key / doc_type='doc' pairing resolves to "no such document" (404)
+    // before role resolution, closing the hole where such a pairing could reach
+    // the token mint. Not producible by any current mint path, but the one site
+    // that could serve it is now closed.
+    asUser('ppt_owner')
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue({ ...pptMeta('ppt_owner'), doc_type: 'doc' } as never)
+    const out = await issueCollabToken('octo_session_ppt_owner', PPT_KEY)
+    expect(out).toEqual({ ok: false, status: 404, error: 'not_found' })
+    expect(docMemberRepo.getRole).not.toHaveBeenCalled()
+  })
 })

@@ -205,6 +205,22 @@ describe('PPT envelope is scoped to /api/v1/ppt (integration)', () => {
     expect((body as { error: unknown }).error).not.toBe('invalid_body')
   })
 
+  it('an oversized JSON body on /api/v1/ppt returns the C-style PAYLOAD_TOO_LARGE envelope, not the global doc_too_large', async () => {
+    // The router-scoped json parser enforces the 1mb limit; entity.too.large is
+    // caught by pptErrorHandler and enveloped, rather than bubbling to the global
+    // handler that emits the legacy bare-JSON `doc_too_large`.
+    const huge = JSON.stringify({ a: 'x'.repeat(1024 * 1024 + 16) })
+    const res = await fetch(`${base}/api/v1/ppt/docs/x`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: huge,
+    })
+    expect(res.status).toBe(413)
+    const body = (await res.json()) as { error: { code: string; message: string } }
+    expect(body.error.code).toBe('PAYLOAD_TOO_LARGE')
+    expect((body as { error: unknown }).error).not.toBe('doc_too_large')
+  })
+
   it('legacy /v1/bot/docs errors stay BARE JSON (not envelope-wrapped)', async () => {
     // A malformed body on a legacy route is rejected by the global bare-JSON
     // handler as { error: 'invalid_body' } — proving the envelope did not leak
@@ -216,5 +232,38 @@ describe('PPT envelope is scoped to /api/v1/ppt (integration)', () => {
     })
     expect(res.status).toBe(400)
     expect(await res.json()).toEqual({ error: 'invalid_body' })
+  })
+})
+
+// The PPT surface sits behind the same per-IP rate limiter as the other API
+// chains (P1-B): a burst past the window limit is throttled with 429, not served
+// unthrottled as a fixed cheap 404.
+describe('PPT surface is rate-limited (integration, P1-B)', () => {
+  let server: Server
+  let base: string
+
+  beforeAll(async () => {
+    const app = createApp({ rateLimit: { max: 3, windowMs: 60_000 } })
+    await new Promise<void>((resolve) => {
+      server = app.listen(0, '127.0.0.1', resolve)
+    })
+    const { port } = server.address() as AddressInfo
+    base = `http://127.0.0.1:${port}`
+  })
+
+  afterAll(async () => {
+    await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())))
+  })
+
+  it('throttles /api/v1/ppt after the per-IP limit', async () => {
+    const statuses: number[] = []
+    for (let i = 0; i < 6; i++) {
+      const res = await fetch(`${base}/api/v1/ppt/anything`, { headers: { 'x-forwarded-for': '203.0.113.7' } })
+      statuses.push(res.status)
+    }
+    // First few resolve to the enveloped 404; once the window limit is hit the
+    // limiter takes over with 429.
+    expect(statuses.filter((s) => s === 429).length).toBeGreaterThan(0)
+    expect(statuses.slice(0, 3).every((s) => s === 404)).toBe(true)
   })
 })

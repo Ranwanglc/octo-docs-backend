@@ -144,4 +144,12 @@ describe('isDocTypeConsistentWithName — cross-type mismatch guard (§5)', () =
     expect(isDocTypeConsistentWithName(docName, 'doc')).toBe(true)
     expect(isDocTypeConsistentWithName(docName, 'sheet')).toBe(true)
   })
+
+  it('FORBIDS a 4-seg document name paired with a namespaced kind doc_type', () => {
+    // A 4-seg key with html / html_ppt / board is impossible by construction and
+    // is exactly the corruption the guard rejects (P2-3).
+    expect(isDocTypeConsistentWithName(docName, 'html')).toBe(false)
+    expect(isDocTypeConsistentWithName(docName, 'html_ppt')).toBe(false)
+    expect(isDocTypeConsistentWithName(docName, 'board')).toBe(false)
+  })
 })

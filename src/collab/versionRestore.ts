@@ -90,9 +90,35 @@ function assertNeverDocType(kind: never): VersionContentKind {
  * `schema_version` is stamped with and gated against. Board and document lines
  * are isolated: never gate a board blob on the ProseMirror SCHEMA_VERSION or a
  * document blob on WB_SCHEMA_VERSION.
+ *
+ * Exhaustive over VersionContentKind with a compile-time `never` backstop, so a
+ * future kind added without a branch breaks the build here rather than silently
+ * inheriting the ProseMirror SCHEMA_VERSION. `ppt` is decode-less — a html_ppt
+ * version is a BentoDoc blob in `ppt_version`, never a Yjs `doc_version` row, and
+ * the Yjs version routes reject it with 422 before reaching here — so a `ppt`
+ * kind arriving is a wrong-kind call that slipped past a route guard: throw
+ * rather than hand back a Yjs schema line.
  */
 export function currentSchemaVersionFor(kind: VersionContentKind): number {
-  return kind === 'board' ? WB_SCHEMA_VERSION : SCHEMA_VERSION
+  switch (kind) {
+    case 'board':
+      return WB_SCHEMA_VERSION
+    case 'document':
+      return SCHEMA_VERSION
+    case 'ppt':
+      throw new Error(`no Yjs schema version for decode-less content kind '${kind}'`)
+    default:
+      return assertNeverKind(kind)
+  }
+}
+
+/**
+ * Compile-time exhaustiveness backstop for the `kind → behavior` switches
+ * (currentSchemaVersionFor + the two restoreVersion selectors). Adding a member
+ * to VersionContentKind without handling it in each switch fails the build here.
+ */
+export function assertNeverKind(kind: never): never {
+  throw new Error(`unhandled VersionContentKind: ${String(kind)}`)
 }
 
 // SHEET_YMAP_FIELD is the single shared constant (defined in agent/sheetConversion.ts,

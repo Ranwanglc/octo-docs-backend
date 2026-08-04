@@ -1530,3 +1530,77 @@ describe('version routes — html_ppt wrong-kind guard (422 unsupported_document
     getStateSpy.mockRestore()
   })
 })
+
+// ── html_ppt wrong-kind rejection extends to list / rename / delete ──────────
+// The three read/mutate handlers that only touch doc_version rows (a deck has
+// none) answer 422 uniformly with the create/state/restore handlers, instead of
+// an empty 200 / 404 that would contradict the wrong-kind contract.
+describe('version routes — html_ppt 422 on list / rename / delete (P2-2)', () => {
+  const pptGuard = {
+    meta: { doc_id: 'd_1', document_name: 'octo:s1:f_default:ppt:d_1', doc_type: 'html_ppt', permission_epoch: 7 },
+    role: 'admin',
+  } as never
+
+  it('listVersionsHandler rejects html_ppt with 422 and never queries doc_version rows', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(pptGuard)
+    const listSpy = vi.spyOn(docVersionRepo, 'listByDoc')
+    const res = mockRes()
+    await listVersionsHandler(req({ docId: 'd_1' }), res as never)
+    expect(res.statusCode).toBe(422)
+    expect(res.body).toEqual({ error: 'unsupported_document_type' })
+    expect(listSpy).not.toHaveBeenCalled()
+    listSpy.mockRestore()
+  })
+
+  it('renameVersionHandler rejects html_ppt with 422 and never loads or renames a row', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(pptGuard)
+    const getByIdSpy = vi.spyOn(docVersionRepo, 'getById')
+    const renameSpy = vi.spyOn(docVersionRepo, 'rename')
+    const res = mockRes()
+    await renameVersionHandler(req({ docId: 'd_1', versionId: '5' }, { body: { label: 'x' } }), res as never)
+    expect(res.statusCode).toBe(422)
+    expect(res.body).toEqual({ error: 'unsupported_document_type' })
+    expect(getByIdSpy).not.toHaveBeenCalled()
+    expect(renameSpy).not.toHaveBeenCalled()
+    getByIdSpy.mockRestore()
+    renameSpy.mockRestore()
+  })
+
+  it('deleteVersionHandler rejects html_ppt with 422 and never loads or deletes a row', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(pptGuard)
+    const getByIdSpy = vi.spyOn(docVersionRepo, 'getById')
+    const deleteSpy = vi.spyOn(docVersionRepo, 'deleteById')
+    const res = mockRes()
+    await deleteVersionHandler(req({ docId: 'd_1', versionId: '5' }), res as never)
+    expect(res.statusCode).toBe(422)
+    expect(res.body).toEqual({ error: 'unsupported_document_type' })
+    expect(getByIdSpy).not.toHaveBeenCalled()
+    expect(deleteSpy).not.toHaveBeenCalled()
+    getByIdSpy.mockRestore()
+    deleteSpy.mockRestore()
+  })
+})
+
+// ── kind → behavior exhaustiveness (P2-1) ────────────────────────────────────
+// The never-guard on contentKindFromDocType made docType→kind exhaustive; these
+// lock kind→behavior so 'ppt' can never silently inherit the ProseMirror path.
+describe('content kind → behavior is exhaustive for ppt (P2-1)', () => {
+  it('currentSchemaVersionFor throws for the decode-less ppt kind', () => {
+    expect(() => currentSchemaVersionFor('ppt' as never)).toThrow()
+  })
+
+  it('restoreVersion service rejects a ppt contentKind with 422 before loading any row', async () => {
+    const getStateSpy = vi.spyOn(docVersionRepo, 'getStateById')
+    const result = await restoreVersion({
+      docId: 'd_1',
+      versionId: 5,
+      uid: 'u_1',
+      documentName: 'octo:s1:f_default:ppt:d_1',
+      authorizedEpoch: 7,
+      contentKind: 'ppt',
+    })
+    expect(result).toEqual({ ok: false, status: 422, error: 'unsupported_document_type' })
+    expect(getStateSpy).not.toHaveBeenCalled()
+    getStateSpy.mockRestore()
+  })
+})

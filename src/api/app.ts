@@ -221,8 +221,20 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   // uses the C-style `{data}`/`{error}` envelope and error enum, while the legacy
   // `/api/v1/docs/**` surface below keeps its bare-JSON shape via the global
   // handler. R1 wires only the envelope + a terminal enveloped NOT_FOUND; the
-  // concrete endpoints (and their auth guards) land inside createPptRouter in R2+.
-  app.use('/api/v1/ppt', createPptRouter())
+  // concrete endpoints land inside createPptRouter in R2+.
+  //
+  // Fronted by the SAME per-IP rate limiter as the human/bot chains above so the
+  // surface is not un-throttled (every other API mount starts its chain with a
+  // limiter — see §8.4). AUTH POSTURE (deliberate, read before adding R2
+  // handlers): this chain does NOT run authMiddleware / spaceContextMiddleware,
+  // so `req.uid` / `req.spaceId` are NOT pre-populated here. R2 PPT endpoints
+  // must apply their own auth guards and must NOT assume `req.uid` is set — a
+  // handler copied from the legacy routers (which read `req.uid!`) would run
+  // unauthenticated. PPT auth lands per-endpoint inside createPptRouter in R2+.
+  const pptApi = Router()
+  pptApi.use(createRateLimiter(opts.rateLimit))
+  pptApi.use(createPptRouter())
+  app.use('/api/v1/ppt', pptApi)
 
   // central error handler — unexpected errors => 500 (§8.4 error table).
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {

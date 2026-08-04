@@ -215,6 +215,17 @@ describe('POST /api/v1/docs — create key codec (XIN-83 hop-2 join 404)', () =>
     expect(vi.mocked(docMetaRepo.create)).not.toHaveBeenCalled()
   })
 
+  it('rejects an unknown docType with 400 invalid_doc_type (no row written) — P2-4', async () => {
+    // Make the wrong-kind gate total: a doc_type outside DOC_TYPES must not be
+    // persisted verbatim and fall through to a 4-seg Yjs document.
+    const res = mockRes()
+    await createDocHandler(postReq({ spaceId: 's1', folderId: 'f_888', docType: 'totally_made_up' }), res as never)
+
+    expect(res.statusCode).toBe(400)
+    expect((res.body as { error: string }).error).toBe('invalid_doc_type')
+    expect(vi.mocked(docMetaRepo.create)).not.toHaveBeenCalled()
+  })
+
   it('returns 400 when spaceId is missing', async () => {
     const res = mockRes()
     // No X-Space-Id header reaches the handler (req.spaceId === '').
