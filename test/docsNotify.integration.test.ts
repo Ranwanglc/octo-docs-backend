@@ -77,6 +77,7 @@ describe('docsNotify integration (real HTTP round-trip)', () => {
       title: 'Q3 计划',
       requesterUid: 'u-req',
       reason: '需要编辑权限',
+      botUids: ['bot-a', 'bot-b'],
     })
 
     expect(delivered).toBe(2)
@@ -95,7 +96,7 @@ describe('docsNotify integration (real HTTP round-trip)', () => {
         title: 'Q3 计划',
         actor_name: '小明',
         actor_uid: 'u-req',
-        excerpt: '需要编辑权限',
+        excerpt: 'Bots (2): bot-a, bot-b\n需要编辑权限',
       })
       expect(c.body.docs_card.updated_at).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/)
     }

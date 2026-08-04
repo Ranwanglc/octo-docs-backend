@@ -49,6 +49,7 @@ function baseParams() {
     title: 'Test Doc',
     requesterUid: 'u-req',
     reason: 'need edit',
+    botUids: [],
   }
 }
 
@@ -112,6 +113,13 @@ describe('notifyDocAccessRequested', () => {
     expect(body.docs_card.actor_name).toBe('申请人小明')
     expect(body.docs_card.excerpt).toBe('need edit')
     expect(typeof body.docs_card.updated_at).toBe('string')
+  })
+
+  it('shows the bot count and every bot uid before approval', async () => {
+    await notifyDocAccessRequested({ ...baseParams(), botUids: ['bot_a', 'bot_b'] })
+    const [, init] = (fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit]
+    const body = JSON.parse(init.body as string)
+    expect(body.docs_card.excerpt).toBe('Bots (2): bot_a, bot_b\nneed edit')
   })
 
   it('counts only delivered[]; a filtered recipient is not counted', async () => {

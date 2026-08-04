@@ -122,6 +122,14 @@ export interface AccessRequestNotifyParams {
   requesterUid: string
   /** Free-text reason (already trimmed/capped at 512 by the caller). */
   reason: string
+  /** Server-validated bot principals that approval will grant. */
+  botUids: string[]
+}
+
+function accessRequestExcerpt(reason: string, botUids: string[]): string {
+  if (botUids.length === 0) return reason
+  const principals = `Bots (${botUids.length}): ${botUids.join(', ')}`
+  return reason ? `${principals}\n${reason}` : principals
 }
 
 /**
@@ -299,7 +307,7 @@ export async function notifyDocAccessRequested(p: AccessRequestNotifyParams): Pr
       title: p.title,
       actor_uid: p.requesterUid,
       actor_name: actorName,
-      excerpt: p.reason,
+      excerpt: accessRequestExcerpt(p.reason, p.botUids),
       updated_at: formatCardTimestamp(new Date()),
     }
 

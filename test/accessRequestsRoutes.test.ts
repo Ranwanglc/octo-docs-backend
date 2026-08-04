@@ -31,6 +31,9 @@ vi.mock('../src/permission/resolveRole.js', () => ({ resolveRole: vi.fn() }))
 vi.mock('../src/api/services/grantForward.js', () => ({
   grantForwardAccess: vi.fn(async () => ({ finalRole: 'reader', changed: true })),
 }))
+vi.mock('../src/api/services/docsNotify.js', () => ({
+  notifyDocAccessRequested: vi.fn(async () => 1),
+}))
 // getOctoIdentity().ownedBotsInSpace gates the submit bot snapshot. Mocked so
 // each test controls exactly which bots the caller "owns" in the doc's Space.
 const mockOwnedBotsInSpace = vi.fn(async () => [] as string[])
@@ -48,6 +51,7 @@ import {
 } from '../src/db/repos/docAccessRequestRepo.js'
 import { resolveRole } from '../src/permission/resolveRole.js'
 import { grantForwardAccess } from '../src/api/services/grantForward.js'
+import { notifyDocAccessRequested } from '../src/api/services/docsNotify.js'
 
 interface MockRes {
   statusCode: number
@@ -95,6 +99,7 @@ beforeEach(() => {
   vi.mocked(docAccessRequestRepo.decide).mockClear()
   vi.mocked(resolveRole).mockReset()
   vi.mocked(grantForwardAccess).mockClear()
+  vi.mocked(notifyDocAccessRequested).mockClear()
   // Default: caller owns no bots in the space unless a test says otherwise.
   mockOwnedBotsInSpace.mockReset()
   mockOwnedBotsInSpace.mockResolvedValue([])
@@ -245,6 +250,9 @@ describe('POST /:docId/access-requests — bot_uids snapshot subset gate', () =>
     expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith(
       expect.objectContaining({ botUids: ['bot_a', 'bot_b'] }),
     )
+    expect(vi.mocked(notifyDocAccessRequested)).toHaveBeenCalledWith(
+      expect.objectContaining({ botUids: ['bot_a', 'bot_b'] }),
+    )
   })
 
   it('rejects (403) a bot the caller does NOT own in the Space \u2014 someone else\u2019s bot', async () => {
@@ -308,12 +316,26 @@ describe('POST /:docId/access-requests — bot_uids snapshot subset gate', () =>
     )
   })
 
-  it('already_granted short-circuits BEFORE the bot-ownership remote check (idempotent no-op preserved)', async () => {
-    // A caller who already holds >= the requested role returns already_granted
-    // without any octo-server round-trip, even when the body carries bots.
+  it.each(['writer', 'admin'] as const)(
+    '%s requester with bots creates a pending request for admin approval',
+    async (currentRole) => {
+      vi.mocked(resolveRole).mockResolvedValue(currentRole)
+      mockOwnedBotsInSpace.mockResolvedValue(['bot_a'])
+      const res = mockRes()
+      await submitHandler()(req({ requestedRole: 'reader', botUids: ['bot_a'] }), res as never)
+      expect(res.statusCode).toBe(201)
+      expect(res.body).toEqual({ requestId: 'req_b', status: 'pending' })
+      expect(mockOwnedBotsInSpace).toHaveBeenCalledWith('u_applicant', 's_1', 'caller-tok')
+      expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith(
+        expect.objectContaining({ requestedRoleNum: 1, botUids: ['bot_a'] }),
+      )
+    },
+  )
+
+  it('writer without bots keeps the legacy already_granted no-op', async () => {
     vi.mocked(resolveRole).mockResolvedValue('writer')
     const res = mockRes()
-    await submitHandler()(req({ requestedRole: 'reader', botUids: ['bot_a'] }), res as never)
+    await submitHandler()(req({ requestedRole: 'reader' }), res as never)
     expect(res.statusCode).toBe(200)
     expect(res.body).toEqual({ status: 'already_granted', role: 'writer' })
     expect(mockOwnedBotsInSpace).not.toHaveBeenCalled()

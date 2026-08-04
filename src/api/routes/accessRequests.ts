@@ -59,8 +59,8 @@ function callerSessionToken(req: Request): string | undefined {
 
 /**
  * POST submit — any authenticated octo user (no doc role required). Idempotent
- * by (doc_id, uid). If the caller already holds >= the requested role, returns
- * 200 already_granted without writing a row.
+ * by (doc_id, uid). If the caller already holds >= the requested role and no
+ * bots are requested, returns 200 already_granted without writing a row.
  */
 accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: Response) => {
   const docId = req.params.docId!
@@ -110,12 +110,10 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
     throw err
   }
 
-  // Already sufficiently privileged => idempotent no-op success (no request row).
-  // This runs BEFORE any bot-ownership remote check so the pre-existing
-  // already_granted behavior is unchanged for a caller who happens to also pass
-  // bots: an admin-level requester short-circuits without an octo-server round-trip.
+  // Preserve the legacy no-op only for human-only requests. A bot-bearing
+  // request must remain pending so an admin explicitly approves the bot grants.
   const current = await resolveRole(req.uid!, docId)
-  if (roleAtLeast(current, requestedRole)) {
+  if (requestedBotUids.length === 0 && roleAtLeast(current, requestedRole)) {
     res.status(200).json({ status: 'already_granted', role: current })
     return
   }
@@ -161,6 +159,7 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
     title: meta.title,
     requesterUid: req.uid!,
     reason,
+    botUids,
   }).catch(() => {})
 
   res.status(201).json({ requestId: out.requestId, status: 'pending' })
