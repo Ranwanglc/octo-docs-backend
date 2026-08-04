@@ -197,16 +197,9 @@ export async function svgUploadHandler(req: Request, res: Response): Promise<voi
   const safeName = sanitizeFileName(decodedName)
   const objectKey = `${docId}/${attachId}/${safeName}`
   const mime = 'image/svg+xml'
-  const ttl = config.attachments.uploadUrlTtlSeconds
-  const upload = getObjectStore().presignPut(objectKey, mime, ttl)
 
   try {
-    const upstream = await fetch(upload.uploadUrl, {
-      method: 'PUT',
-      headers: { ...(upload.headers ?? {}), 'Content-Type': mime },
-      body: new Uint8Array(bytes),
-    })
-    if (!upstream.ok) throw new Error(`storage upload failed (${upstream.status})`)
+    await getObjectStore().upload(objectKey, mime, new Uint8Array(bytes))
     await docAttachmentRepo.register({
       attachId,
       docId,
@@ -554,42 +547,11 @@ export async function copyHandler(req: Request, res: Response): Promise<void> {
 }
 
 /**
- * Read a fetch Response body into a Buffer while enforcing a hard byte cap.
- * Reads the stream chunk by chunk and throws the moment the accumulated size
- * exceeds `cap`, so an object whose real size exceeds the tier cap (e.g. a
- * wrong/understated recorded sizeBytes) is never fully materialized in memory.
- */
-async function readCapped(resp: Awaited<ReturnType<typeof fetch>>, cap: number): Promise<Buffer> {
-  const body = resp.body
-  if (!body) {
-    // No stream (e.g. empty body): fall back to a bounded arrayBuffer read.
-    const buf = Buffer.from(await resp.arrayBuffer())
-    if (buf.length > cap) throw new Error('copied bytes exceed size cap')
-    return buf
-  }
-  const reader = body.getReader()
-  const chunks: Uint8Array[] = []
-  let total = 0
-  try {
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (!value) continue
-      total += value.byteLength
-      if (total > cap) throw new Error('copied bytes exceed size cap')
-      chunks.push(value)
-    }
-  } finally {
-    reader.releaseLock()
-  }
-  return Buffer.concat(chunks.map((c) => Buffer.from(c)), total)
-}
-
-/**
- * Copy a stored attachment's bytes into the target doc and register a fresh row. Store-to-store:
- * sign a GET on the source object key, stream it, sign a PUT on the new key, upload, register.
- * Never touches a client-supplied URL — only object keys the DB already vouches for. Returns the
- * new attachId.
+ * Copy a stored attachment's bytes into the target doc and register a fresh row.
+ * Reads source bytes via the server-side internal endpoint (store.download) then
+ * writes them back with store.upload, so container deployments never hit the
+ * public presigned URL from inside the container network. Never touches a
+ * client-supplied URL — only object keys the DB already vouches for.
  */
 export async function copyStoredObject(
   src: DocAttachment,
@@ -597,21 +559,11 @@ export async function copyStoredObject(
   uid: string,
 ): Promise<string> {
   const store = getObjectStore()
-  const getUrl = store.presignGet(src.objectKey, config.attachments.readUrlTtlSeconds)
   const cap = maxSizeFor(src.mime)
-  const getResp = await fetch(getUrl, { method: 'GET' })
-  if (!getResp.ok) throw new Error(`source read failed: ${getResp.status}`)
-  // Defence in depth: the recorded sizeBytes was already checked by the caller,
-  // but it can be wrong/understated, so bound the ACTUAL transfer instead of
-  // materializing an arbitrarily large object first. Reject early on a
-  // Content-Length that exceeds the tier cap, then read the stream chunk by
-  // chunk and abort the moment the accumulated size crosses the cap — the
-  // oversized body is never fully buffered in memory.
-  const declared = Number(getResp.headers?.get('content-length'))
-  if (Number.isFinite(declared) && declared > cap) {
-    throw new Error('copied bytes exceed size cap')
-  }
-  let bytes = await readCapped(getResp, cap)
+  // Streaming download: aborts mid-stream past cap so a stale/understated
+  // sizeBytes row can never cause the server to fully buffer an oversized object.
+  const downloaded = await store.download(src.objectKey, { maxBytes: cap })
+  let bytes: Buffer = Buffer.from(downloaded)
   // Re-sanitize copied SVG bytes so legacy objects that predate the sanitized upload endpoint
   // cannot bypass the current policy through cross-document copy.
   if (baseMime(src.mime) === 'image/svg+xml') {
@@ -623,13 +575,7 @@ export async function copyStoredObject(
   // src.fileName was sanitized at its own register time; keep it (it is already a safe segment).
   const objectKey = `${targetDocId}/${attachId}/${src.fileName}`
   try {
-    const put = store.presignPut(objectKey, src.mime, config.attachments.uploadUrlTtlSeconds)
-    const putResp = await fetch(put.uploadUrl, {
-      method: 'PUT',
-      body: new Uint8Array(bytes),
-      headers: { 'Content-Type': src.mime, ...(put.headers ?? {}) },
-    })
-    if (!putResp.ok) throw new Error(`target write failed: ${putResp.status}`)
+    await store.upload(objectKey, src.mime, new Uint8Array(bytes))
     await docAttachmentRepo.register({
       attachId,
       docId: targetDocId,
@@ -739,11 +685,9 @@ export async function ingestHandler(req: Request, res: Response): Promise<void> 
         attachId, docId: targetDocId, objectKey, mime, sizeBytes: bytes.length, fileName, createdBy: req.uid!,
       })
       const store = getObjectStore()
-      const put = store.presignPut(objectKey, mime, config.attachments.uploadUrlTtlSeconds)
-      const putResp = await fetch(put.uploadUrl, {
-        method: 'PUT', body: new Uint8Array(bytes), headers: { 'Content-Type': mime, ...(put.headers ?? {}) },
-      })
-      if (!putResp.ok) { notIngested.push({ sourceUrl, reason: 'store_failed' }); continue }
+      try {
+        await store.upload(objectKey, mime, new Uint8Array(bytes))
+      } catch { notIngested.push({ sourceUrl, reason: 'store_failed' }); continue }
       const created = await docAttachmentRepo.getById(attachId)
       if (!created) { notIngested.push({ sourceUrl, reason: 'store_failed' }); continue }
       mappings.push({ sourceUrl, attachId, url: presignAttachmentReadUrl(created, ttl), mime, sizeBytes: bytes.length })

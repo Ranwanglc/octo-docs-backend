@@ -426,6 +426,15 @@ export const config = {
       // endpoint host itself, which is correct for MinIO/S3 and COS accessed
       // directly on its origin endpoint.
       signingHost: str('ATTACHMENT_S3_SIGNING_HOST', ''),
+      // Internal (container-network) endpoint for server-side PUT/DELETE/GET.
+      // In containerised deployments the public browser-reachable endpoint
+      // (e.g. http://127.0.0.1:28090) is not reachable from inside the
+      // backend container; set this to the in-cluster S3/MinIO address
+      // (e.g. http://minio:9000) so server-side media operations stay on
+      // the container network. Browser-facing presignPut/presignGet URLs
+      // always use the public endpoint above. Empty (default) falls back
+      // to the public endpoint for all operations (single-network/dev).
+      internalEndpoint: str('ATTACHMENT_S3_INTERNAL_ENDPOINT', ''),
     },
     // Secret keying the HMAC signature over (objectKey + expiry). Dev fallback;
     // MUST be overridden in production (enforced via requireSafeSigningSecret).

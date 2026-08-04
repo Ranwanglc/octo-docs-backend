@@ -20,6 +20,27 @@ vi.mock('../src/util/fetchExternalImage.js', () => ({
   fetchExternalImage: vi.fn(),
 }))
 
+const storeUpload = vi.fn(async () => undefined)
+const storeDelete = vi.fn(async () => undefined)
+const storeDownload = vi.fn(async () => new Uint8Array([1, 2, 3]))
+const storePresignGet = vi.fn((key: string, _ttl: number, opts?: { contentDisposition?: string; responseContentType?: string }) => {
+  const url = new URL('https://storage.test/read')
+  url.pathname = '/' + key
+  if (opts?.contentDisposition) url.searchParams.set('response-content-disposition', opts.contentDisposition)
+  if (opts?.responseContentType) url.searchParams.set('response-content-type', opts.responseContentType)
+  return url.toString()
+})
+vi.mock('../src/storage/objectStore.js', () => ({
+  getObjectStore: vi.fn(() => ({
+    presignPut: vi.fn(() => ({ uploadUrl: 'https://storage.test/upload', headers: {} })),
+    presignGet: storePresignGet,
+    delete: storeDelete,
+    upload: storeUpload,
+    download: storeDownload,
+  })),
+  verifySignedUrl: vi.fn(() => ({ valid: true })),
+}))
+
 import { presignHandler, readHandler, resolveHandler, copyHandler, ingestHandler } from '../src/api/routes/attachments.js'
 import { requireDocRole } from '../src/api/guard.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
@@ -28,8 +49,8 @@ import { fetchExternalImage } from '../src/util/fetchExternalImage.js'
 import { docAttachmentRepo } from '../src/db/repos/docAttachmentRepo.js'
 import { query } from '../src/db/pool.js'
 import { buildSchema, SCHEMA_VERSION } from '../src/schema/index.js'
-import { verifySignedUrl } from '../src/storage/objectStore.js'
 import { requireSafeSigningSecret } from '../src/config/env.js'
+import { verifySignedUrl } from '../src/storage/objectStore.js'
 
 interface MockRes {
   statusCode: number
@@ -64,6 +85,12 @@ beforeEach(() => {
   vi.mocked(requireDocRole).mockReset()
   vi.mocked(query).mockReset()
   vi.mocked(query).mockResolvedValue([] as never)
+  storeUpload.mockReset()
+  storeUpload.mockResolvedValue(undefined)
+  storeDelete.mockReset()
+  storeDelete.mockResolvedValue(undefined)
+  storeDownload.mockReset()
+  storeDownload.mockResolvedValue(new Uint8Array([1, 2, 3]))
 })
 
 describe('POST presign validation (§3.5 step 1)', () => {
@@ -490,6 +517,12 @@ describe('POST attachments/copy (markdown-import image migration)', () => {
     vi.mocked(requireDocRole).mockResolvedValue(writerGuard) // writer on target d_1
     vi.mocked(docMetaRepo.getByDocId).mockReset()
     vi.mocked(resolveRole).mockReset()
+    storeUpload.mockReset()
+    storeUpload.mockResolvedValue(undefined)
+    storeDelete.mockReset()
+    storeDelete.mockResolvedValue(undefined)
+    storeDownload.mockReset()
+    storeDownload.mockResolvedValue(new Uint8Array([1, 2, 3]))
   })
   afterEach(() => vi.unstubAllGlobals())
 
@@ -516,12 +549,6 @@ describe('POST attachments/copy (markdown-import image migration)', () => {
       .mockResolvedValueOnce([
         { ...srcAttachment, attach_id: 'att_new', doc_id: 'd_1', object_key: 'd_1/att_new/222.png' },
       ] as never) // new-row getById
-    // Store-to-store GET then PUT both succeed; GET returns bytes.
-    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { method?: string }) =>
-      init?.method === 'PUT'
-        ? ({ ok: true, status: 200 })
-        : ({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer }),
-    ))
 
     const res = mockRes()
     await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
@@ -531,7 +558,7 @@ describe('POST attachments/copy (markdown-import image migration)', () => {
     expect(body.mappings).toHaveLength(1)
     expect(body.mappings[0]!.sourceAttachId).toBe('att_src')
     expect(body.mappings[0]!.attachId).toMatch(/^att_/)
-    expect(verifySignedUrl(body.mappings[0]!.url).valid).toBe(true)
+    expect(body.mappings[0]!.url).toContain('storage.test')
   })
 
   it('compensates object and row state when the target PUT fails', async () => {
@@ -540,11 +567,7 @@ describe('POST attachments/copy (markdown-import image migration)', () => {
     vi.mocked(query)
       .mockResolvedValueOnce([srcAttachment] as never)
       .mockResolvedValue([] as never)
-    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { method?: string }) =>
-      init?.method === 'PUT'
-        ? ({ ok: false, status: 503 })
-        : ({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer }),
-    ))
+    storeUpload.mockRejectedValueOnce(new Error('store failed'))
 
     const res = mockRes()
     await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
@@ -561,46 +584,22 @@ describe('POST attachments/copy (markdown-import image migration)', () => {
       .mockResolvedValueOnce([srcAttachment] as never)
       .mockRejectedValueOnce(new Error('register failed'))
       .mockResolvedValue([] as never)
-    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { method?: string }) =>
-      init?.method === 'PUT'
-        ? ({ ok: true, status: 200 })
-        : ({ ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer }),
-    ))
 
     const res = mockRes()
     await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
     expect((res.body as { notCopied: Array<{ reason: string }> }).notCopied[0]!.reason).toBe('copy_failed')
     const sql = vi.mocked(query).mock.calls.map(([statement]) => String(statement))
     expect(sql.some((statement) => statement.startsWith('DELETE FROM doc_attachment'))).toBe(true)
+    expect(storeDelete).toHaveBeenCalled()
   })
 
-  it('degrades to notCopied when the source stream exceeds the size cap (never fully buffered)', async () => {
+  it('degrades to notCopied when the source download exceeds the size cap (in-memory cap check)', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's1', status: 1 } as never)
     vi.mocked(resolveRole).mockResolvedValue('reader' as never)
-    // DB records a small size (passes the pre-check), but the ACTUAL object is
-    // larger than the image tier cap (10MB) — a wrong/understated sizeBytes.
-    vi.mocked(query).mockResolvedValueOnce([srcAttachment] as never) // source getById
+    // Source attachment recorded small but actual bytes larger than image cap.
+    vi.mocked(query).mockResolvedValueOnce([{ ...srcAttachment, size_bytes: 10 }] as never)
     const cap = 10 * 1024 * 1024
-    let delivered = 0
-    // A streamed GET body: yield 1MB chunks; readCapped must abort past the cap
-    // rather than materializing the whole (oversized) object in memory.
-    const stream = {
-      getReader() {
-        return {
-          async read() {
-            if (delivered > cap + 4 * 1024 * 1024) return { done: true, value: undefined }
-            delivered += 1024 * 1024
-            return { done: false, value: new Uint8Array(1024 * 1024) }
-          },
-          releaseLock() {},
-        }
-      },
-    }
-    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { method?: string }) =>
-      init?.method === 'PUT'
-        ? ({ ok: true, status: 200 })
-        : ({ ok: true, status: 200, headers: { get: () => null }, body: stream }),
-    ))
+    storeDownload.mockResolvedValueOnce(new Uint8Array(cap + 1))
 
     const res = mockRes()
     await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
@@ -608,41 +607,11 @@ describe('POST attachments/copy (markdown-import image migration)', () => {
     const body = res.body as { mappings: unknown[]; notCopied: Array<{ reason: string }> }
     expect(body.mappings).toEqual([])
     expect(body.notCopied[0]!.reason).toBe('copy_failed')
-    // Aborted before reading the whole object: stopped once past the cap.
-    expect(delivered).toBeLessThan(cap + 4 * 1024 * 1024)
-  })
-
-  it('rejects early on a Content-Length that already exceeds the cap', async () => {
-    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's1', status: 1 } as never)
-    vi.mocked(resolveRole).mockResolvedValue('reader' as never)
-    vi.mocked(query).mockResolvedValueOnce([srcAttachment] as never)
-    let readCalled = false
-    const stream = {
-      getReader() {
-        readCalled = true
-        return { async read() { return { done: true, value: undefined } }, releaseLock() {} }
-      },
-    }
-    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: { method?: string }) =>
-      init?.method === 'PUT'
-        ? ({ ok: true, status: 200 })
-        : ({ ok: true, status: 200, headers: { get: (h: string) => (h === 'content-length' ? String(999 * 1024 * 1024) : null) }, body: stream }),
-    ))
-
-    const res = mockRes()
-    await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
-    expect(res.statusCode).toBe(200)
-    const body = res.body as { mappings: unknown[]; notCopied: Array<{ reason: string }> }
-    expect(body.mappings).toEqual([])
-    expect(body.notCopied[0]!.reason).toBe('copy_failed')
-    expect(readCalled).toBe(false) // rejected on the header, never read the body
   })
 
   it('degrades to notCopied when the caller lacks read access on the source (no leak, no abort)', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's1', status: 1 } as never)
     vi.mocked(resolveRole).mockResolvedValue('none' as never)
-    const fetchMock = vi.fn()
-    vi.stubGlobal('fetch', fetchMock)
 
     const res = mockRes()
     await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
@@ -650,7 +619,7 @@ describe('POST attachments/copy (markdown-import image migration)', () => {
     const body = res.body as { mappings: unknown[]; notCopied: Array<{ reason: string }> }
     expect(body.mappings).toEqual([])
     expect(body.notCopied[0]!.reason).toBe('source_forbidden')
-    expect(fetchMock).not.toHaveBeenCalled() // never fetched bytes it can't read
+    expect(storeDownload).not.toHaveBeenCalled()
   })
 
   it('degrades to notCopied for a cross-space source (404 semantics, no existence leak)', async () => {
@@ -671,12 +640,11 @@ describe('POST attachments/copy (markdown-import image migration)', () => {
       .mockResolvedValueOnce([storedSvg] as never)
       .mockResolvedValueOnce([] as never)
       .mockResolvedValueOnce([{ ...storedSvg, attach_id: 'att_new', doc_id: 'd_1', object_key: 'd_1/att_new/x.svg' }] as never)
-    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) =>
-      init?.method === 'PUT'
-        ? ({ ok: true, status: 200 })
-        : ({ ok: true, status: 200, headers: { get: () => String(svg.length) }, body: null, arrayBuffer: async () => svg.buffer.slice(svg.byteOffset, svg.byteOffset + svg.byteLength) }),
-    )
-    vi.stubGlobal('fetch', fetchMock)
+    storeDownload.mockResolvedValueOnce(new Uint8Array(svg))
+    let uploaded: Uint8Array | undefined
+    storeUpload.mockImplementationOnce(async (_key: string, _mime: string, body: Uint8Array) => {
+      uploaded = body
+    })
 
     const res = mockRes()
     await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
@@ -685,10 +653,9 @@ describe('POST attachments/copy (markdown-import image migration)', () => {
     const body = res.body as { mappings: Array<{ mime: string }>; notCopied: unknown[] }
     expect(body.notCopied).toEqual([])
     expect(body.mappings[0]!.mime).toBe('image/svg+xml')
-    const put = fetchMock.mock.calls.find((call) => call[1]?.method === 'PUT')!
-    const uploaded = Buffer.from(put[1]!.body as Uint8Array).toString('utf8')
-    expect(uploaded).not.toContain('<script')
-    expect(uploaded).toContain('fill="#ffff00"')
+    const uploadedText = Buffer.from(uploaded!).toString('utf8')
+    expect(uploadedText).not.toContain('<script')
+    expect(uploadedText).toContain('fill="#ffff00"')
   })
 
   it('404-style notCopied when the source attachment does not belong to the claimed source doc', async () => {
@@ -712,6 +679,8 @@ describe('POST attachments/ingest (external-image re-hosting)', () => {
   beforeEach(() => {
     vi.mocked(requireDocRole).mockResolvedValue(writerGuard)
     vi.mocked(fetchExternalImage).mockReset()
+    storeUpload.mockReset()
+    storeUpload.mockResolvedValue(undefined)
   })
 
   it('rejects a non-array / empty body with 400', async () => {
@@ -727,7 +696,6 @@ describe('POST attachments/ingest (external-image re-hosting)', () => {
     vi.mocked(query).mockResolvedValueOnce([
       { attach_id: 'att_x', doc_id: 'd_1', object_key: 'd_1/att_x/pic.png', mime: 'image/png', size_bytes: PNG.length, file_name: 'pic.png', created_by: 'u', created_at: new Date(0) },
     ] as never)
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200 })))
 
     const res = mockRes()
     await ingestHandler(req({ docId: 'd_1' }, { urls: ['https://example.com/pic.png'] }), res as never)
@@ -736,8 +704,7 @@ describe('POST attachments/ingest (external-image re-hosting)', () => {
     expect(body.notIngested).toEqual([])
     expect(body.mappings).toHaveLength(1)
     expect(body.mappings[0]!.sourceUrl).toBe('https://example.com/pic.png')
-    expect(verifySignedUrl(body.mappings[0]!.url).valid).toBe(true)
-    vi.unstubAllGlobals()
+    expect(body.mappings[0]!.url).toContain('storage.test')
   })
 
   it('downloads and sanitizes an external SVG through the SSRF-guarded ingest path', async () => {
@@ -746,8 +713,10 @@ describe('POST attachments/ingest (external-image re-hosting)', () => {
     vi.mocked(query).mockResolvedValueOnce([
       { attach_id: 'att_svg', doc_id: 'd_1', object_key: 'd_1/att_svg/vector.svg+xml', mime: 'image/svg+xml', size_bytes: SVG.length, file_name: 'vector.svg+xml', created_by: 'u', created_at: new Date(0) },
     ] as never)
-    const put = vi.fn(async (_url: string, init?: RequestInit) => ({ ok: true, status: 200, init }))
-    vi.stubGlobal('fetch', put)
+    let uploaded: Uint8Array | undefined
+    storeUpload.mockImplementationOnce(async (_key: string, _mime: string, body: Uint8Array) => {
+      uploaded = body
+    })
 
     const res = mockRes()
     await ingestHandler(req({ docId: 'd_1' }, { urls: ['https://example.com/vector.svg'] }), res as never)
@@ -756,11 +725,9 @@ describe('POST attachments/ingest (external-image re-hosting)', () => {
     const body = res.body as { mappings: Array<{ mime: string }>; notIngested: unknown[] }
     expect(body.notIngested).toEqual([])
     expect(body.mappings[0]!.mime).toBe('image/svg+xml')
-    const uploaded = put.mock.calls[0]![1]!.body as Uint8Array
-    const text = Buffer.from(uploaded).toString('utf8')
+    const text = Buffer.from(uploaded!).toString('utf8')
     expect(text).not.toContain('<script')
     expect(text).toContain('fill="#ffff00"')
-    vi.unstubAllGlobals()
   })
 
   it('rejects active external XML that is not a sanitizable SVG', async () => {

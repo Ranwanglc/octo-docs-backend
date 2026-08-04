@@ -39,6 +39,14 @@ export interface ObjectStore {
    */
   presignGet(objectKey: string, expiresSec: number, opts?: PresignGetOptions): string
   delete(objectKey: string): Promise<void>
+  /** Server-side direct upload (PUT bytes). Uses internal endpoint when configured. */
+  upload(objectKey: string, mime: string, body: Uint8Array, opts?: { signal?: AbortSignal }): Promise<void>
+  /**
+   * Server-side direct download (GET bytes). Uses internal endpoint when configured.
+   * When `maxBytes` is set, reads the response as a stream and aborts past the cap,
+   * preventing oversized objects from being fully buffered in memory (OOM defence).
+   */
+  download(objectKey: string, opts?: { maxBytes?: number }): Promise<Uint8Array>
 }
 
 export interface PresignGetOptions {
@@ -240,6 +248,21 @@ export class LocalHmacObjectStore implements ObjectStore {
     await getLocalBlobStore().delete(applyKeyPrefix(this.keyPrefix, objectKey))
   }
 
+  async upload(objectKey: string, mime: string, body: Uint8Array): Promise<void> {
+    const { getLocalBlobStore } = await import('./localBlobStore.js')
+    await getLocalBlobStore().put(applyKeyPrefix(this.keyPrefix, objectKey), mime, Buffer.from(body))
+  }
+
+  async download(objectKey: string, opts?: { maxBytes?: number }): Promise<Uint8Array> {
+    const { getLocalBlobStore } = await import('./localBlobStore.js')
+    const stored = await getLocalBlobStore().get(applyKeyPrefix(this.keyPrefix, objectKey))
+    if (!stored) throw new Error(`object not found: ${objectKey}`)
+    if (opts?.maxBytes !== undefined && stored.bytes.length > opts.maxBytes) {
+      throw new Error(`downloaded object exceeds maxBytes cap: ${stored.bytes.length} > ${opts.maxBytes}`)
+    }
+    return new Uint8Array(stored.bytes)
+  }
+
   /**
    * Verify a previously minted URL: checks the signature matches and the expiry
    * has not passed. Bound to this driver's secret. Exposed for tests and for a
@@ -357,8 +380,8 @@ function hmac(key: Buffer | string, data: string): Buffer {
   return createHmac('sha256', key).update(data, 'utf8').digest()
 }
 
-function sha256Hex(data: string): string {
-  return createHash('sha256').update(data, 'utf8').digest('hex')
+function sha256Hex(data: string | Buffer | Uint8Array): string {
+  return createHash('sha256').update(data).digest('hex')
 }
 
 /**
@@ -384,6 +407,7 @@ function sha256Hex(data: string): string {
  */
 export class S3ObjectStore implements ObjectStore {
   private readonly endpoint: string
+  private readonly internalEndpoint: string
   private readonly region: string
   private readonly bucket: string
   private readonly accessKeyId: string
@@ -396,6 +420,7 @@ export class S3ObjectStore implements ObjectStore {
 
   constructor(opts: {
     endpoint: string
+    internalEndpoint?: string
     region: string
     bucket: string
     accessKeyId: string
@@ -407,6 +432,9 @@ export class S3ObjectStore implements ObjectStore {
   }) {
     // Strip any trailing slash so path joining stays canonical.
     this.endpoint = opts.endpoint.replace(/\/+$/, '')
+    // Container-network endpoint for server-side PUT/DELETE/GET; falls back to
+    // the public endpoint when unset (single-network/dev deployments).
+    this.internalEndpoint = (opts.internalEndpoint || '').replace(/\/+$/, '') || this.endpoint
     this.region = opts.region
     this.bucket = opts.bucket
     this.accessKeyId = opts.accessKeyId
@@ -531,8 +559,135 @@ export class S3ObjectStore implements ObjectStore {
   }
 
   async delete(objectKey: string): Promise<void> {
-    const response = await fetch(this.presign('DELETE', objectKey, 60), { method: 'DELETE' })
-    if (!response.ok && response.status !== 404) throw new Error(`object delete failed: ${response.status}`)
+    await this.internalRequest('DELETE', objectKey)
+  }
+
+  async upload(objectKey: string, mime: string, body: Uint8Array, opts?: { signal?: AbortSignal }): Promise<void> {
+    await this.internalRequest('PUT', objectKey, { mime, body, signal: opts?.signal })
+  }
+
+  async download(objectKey: string, opts?: { maxBytes?: number }): Promise<Uint8Array> {
+    return this.internalRequest('GET', objectKey, { maxBytes: opts?.maxBytes })
+  }
+
+  /**
+   * Issue a signed SigV4 Authorization-header request against the internal
+   * (container-network) endpoint. PUT takes a mime+body; GET returns the response
+   * bytes as Uint8Array (with streaming cap when maxBytes is set); DELETE returns
+   * void (404 tolerated).
+   */
+  private async internalRequest(
+    method: 'PUT' | 'GET' | 'DELETE',
+    objectKey: string,
+    opts?: { mime?: string; body?: Uint8Array; maxBytes?: number; signal?: AbortSignal },
+  ): Promise<Uint8Array> {
+    const physicalKey = applyKeyPrefix(this.keyPrefix, objectKey)
+    const url = new URL(this.internalEndpoint)
+    const host = url.host
+    // When a distinct internal endpoint is configured the request goes directly
+    // to S3/MinIO (no Host-rewriting proxy), so sign against that host. When no
+    // internal endpoint is set we fall through to the public endpoint, which in
+    // COS-behind-CDN deployments rewrites Host to the origin bucket before SigV4
+    // validation — so keep signing against `signingHost` (same as presign URLs).
+    const signedHost = this.internalEndpoint !== this.endpoint
+      ? host
+      : (this.signingHost || host)
+    const canonicalUri = this.canonicalUri(physicalKey)
+
+    const now = new Date(this.nowSec() * 1000)
+    const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, '')
+    const dateStamp = amzDate.slice(0, 8)
+    const credentialScope = `${dateStamp}/${this.region}/${S3ObjectStore.SERVICE}/aws4_request`
+
+    const payloadHash = method === 'PUT' && opts?.body
+      ? sha256Hex(Buffer.from(opts.body))
+      : 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+
+    const headers: Record<string, string> = {
+      host: signedHost,
+      'x-amz-content-sha256': payloadHash,
+      'x-amz-date': amzDate,
+    }
+    if (method === 'PUT' && opts?.mime) {
+      headers['content-type'] = opts.mime
+    }
+
+    const signedHeaderKeys = Object.keys(headers).sort()
+    const signedHeaders = signedHeaderKeys.join(';')
+    const canonicalHeaders = signedHeaderKeys.map(k => `${k}:${headers[k]}`).join('\n') + '\n'
+
+    const canonicalRequest = [
+      method,
+      canonicalUri,
+      '', // canonicalQuery — empty for Authorization-header mode
+      canonicalHeaders,
+      signedHeaders,
+      payloadHash,
+    ].join('\n')
+
+    const stringToSign = [
+      'AWS4-HMAC-SHA256',
+      amzDate,
+      credentialScope,
+      sha256Hex(canonicalRequest),
+    ].join('\n')
+
+    const kDate = hmac(`AWS4${this.secretAccessKey}`, dateStamp)
+    const kRegion = hmac(kDate, this.region)
+    const kService = hmac(kRegion, S3ObjectStore.SERVICE)
+    const kSigning = hmac(kService, 'aws4_request')
+    const signature = createHmac('sha256', kSigning).update(stringToSign, 'utf8').digest('hex')
+
+    const authorization = `AWS4-HMAC-SHA256 Credential=${this.accessKeyId}/${credentialScope}, SignedHeaders=${signedHeaders}, Signature=${signature}`
+
+    const requestUrl = `${url.protocol}//${host}${canonicalUri}`
+    const fetchHeaders: Record<string, string> = {
+      ...headers,
+      Authorization: authorization,
+    }
+
+    const response = await fetch(requestUrl, {
+      method,
+      headers: fetchHeaders,
+      body: method === 'PUT' && opts?.body ? Buffer.from(opts.body) : undefined,
+      signal: opts?.signal,
+    })
+
+    if (!response.ok) {
+      if (method === 'DELETE' && response.status === 404) return new Uint8Array()
+      const text = await response.text().catch(() => '')
+      throw new Error(`internal ${method} ${objectKey} failed: ${response.status} ${text.slice(0, 200)}`)
+    }
+
+    if (method === 'GET') {
+      // Streaming read with optional byte cap: abort the reader past maxBytes so
+      // an oversized object (e.g. stale/understated sizeBytes row) never fully
+      // buffers in memory — mirrors the old readCapped() defence.
+      if (!response.body) return new Uint8Array()
+      const maxBytes = opts?.maxBytes
+      const reader = response.body.getReader()
+      const chunks: Uint8Array[] = []
+      let total = 0
+      try {
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          if (value) {
+            total += value.byteLength
+            if (maxBytes !== undefined && total > maxBytes) {
+              await reader.cancel().catch(() => {})
+              throw new Error(`internal GET ${objectKey} exceeds maxBytes cap: ${total} > ${maxBytes}`)
+            }
+            chunks.push(value)
+          }
+        }
+      } catch (err) {
+        await reader.cancel().catch(() => {})
+        throw err
+      }
+      return Buffer.concat(chunks.map(c => Buffer.from(c)))
+    }
+    return new Uint8Array()
   }
 }
 
@@ -553,6 +708,7 @@ export function getObjectStore(): ObjectStore {
       if (!s3Store) {
         s3Store = new S3ObjectStore({
           endpoint: config.attachments.s3.endpoint,
+          internalEndpoint: config.attachments.s3.internalEndpoint,
           region: config.attachments.s3.region,
           bucket: config.attachments.bucket,
           accessKeyId: config.attachments.s3.accessKeyId,

@@ -5,10 +5,12 @@ vi.mock('../src/api/guard.js', () => ({ requireDocRole: vi.fn() }))
 vi.mock('../src/db/repos/docAttachmentRepo.js', () => ({
   docAttachmentRepo: { register: vi.fn(), getById: vi.fn() },
 }))
+const objectUpload = vi.fn(async () => undefined)
 vi.mock('../src/storage/objectStore.js', () => ({
   getObjectStore: () => ({
     presignPut: () => ({ uploadUrl: 'https://storage.test/upload', headers: {} }),
     presignGet: () => 'https://storage.test/read',
+    upload: objectUpload,
   }),
 }))
 
@@ -43,6 +45,8 @@ function request(svg: string, headers: Record<string, string> = {}) {
 
 beforeEach(() => {
   vi.restoreAllMocks()
+  objectUpload.mockReset()
+  objectUpload.mockResolvedValue(undefined)
   vi.mocked(requireDocRole).mockResolvedValue({ meta: { doc_id: 'd_1' }, role: 'writer' } as never)
   vi.mocked(docAttachmentRepo.register).mockResolvedValue(undefined as never)
   vi.mocked(docAttachmentRepo.getById).mockImplementation(async (attachId: string) => ({
@@ -59,11 +63,10 @@ beforeEach(() => {
 
 describe('POST sanitized SVG attachment', () => {
   it('uploads only sanitized bytes and registers the sanitized size', async () => {
-    let uploaded = ''
-    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
-      uploaded = Buffer.from(init?.body as Uint8Array).toString('utf8')
-      return new Response(null, { status: 200 })
-    }))
+    let uploaded: Uint8Array | undefined
+    objectUpload.mockImplementation(async (_key: string, _mime: string, body: Uint8Array) => {
+      uploaded = body
+    })
     const res = response()
     await svgUploadHandler(request(
       '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><script>alert(1)</script><path d="M0 0h1v1z"/></svg>',
@@ -71,16 +74,15 @@ describe('POST sanitized SVG attachment', () => {
     ), res as never)
 
     expect(res.statusCode).toBe(201)
-    expect(uploaded).toContain('<path')
-    expect(uploaded).not.toMatch(/script|onload/i)
+    const uploadedText = Buffer.from(uploaded!).toString('utf8')
+    expect(uploadedText).toContain('<path')
+    expect(uploadedText).not.toMatch(/script|onload/i)
     expect(docAttachmentRepo.register).toHaveBeenCalledWith(expect.objectContaining({
-      docId: 'd_1', mime: 'image/svg+xml', fileName: 'logo.svg', sizeBytes: Buffer.byteLength(uploaded),
+      docId: 'd_1', mime: 'image/svg+xml', fileName: 'logo.svg', sizeBytes: Buffer.byteLength(uploadedText),
     }))
   })
 
   it('rejects active XML without touching storage', async () => {
-    const fetchMock = vi.fn()
-    vi.stubGlobal('fetch', fetchMock)
     const res = response()
     await svgUploadHandler(request(
       '<!DOCTYPE svg [<!ENTITY x SYSTEM "file:///etc/passwd">]><svg xmlns="http://www.w3.org/2000/svg">&x;</svg>',
@@ -88,7 +90,7 @@ describe('POST sanitized SVG attachment', () => {
 
     expect(res.statusCode).toBe(400)
     expect(res.body).toEqual({ error: 'invalid_svg' })
-    expect(fetchMock).not.toHaveBeenCalled()
+    expect(objectUpload).not.toHaveBeenCalled()
     expect(docAttachmentRepo.register).not.toHaveBeenCalled()
   })
 })

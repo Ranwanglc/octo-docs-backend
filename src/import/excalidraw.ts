@@ -106,12 +106,12 @@ export async function uploadExcalidrawAttachment(docId: string, uid: string, byt
   const attachId = newAttachId()
   const safeName = fileName.replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 96) || 'image'
   const objectKey = `${docId}/${attachId}/${safeName}`
-  const put = getObjectStore().presignPut(objectKey, mime, config.attachments.uploadUrlTtlSeconds)
-  const response = await fetch(put.uploadUrl, {
-    method: 'PUT', body: new Uint8Array(bytes), headers: { 'Content-Type': mime, ...(put.headers ?? {}) },
-    signal: AbortSignal.timeout(config.docxImport.timeoutMs),
-  })
-  if (!response.ok) throw new ExcalidrawImportError('upload_failed', 502)
+  try {
+    const signal = AbortSignal.timeout(config.docxImport.timeoutMs)
+    await getObjectStore().upload(objectKey, mime, new Uint8Array(bytes), { signal })
+  } catch {
+    throw new ExcalidrawImportError('upload_failed', 502)
+  }
   try {
     await docAttachmentRepo.register({ attachId, docId, objectKey, mime, sizeBytes: bytes.length, fileName: safeName, createdBy: uid })
   } catch (err) {

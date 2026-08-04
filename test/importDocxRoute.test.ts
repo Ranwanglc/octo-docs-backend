@@ -20,10 +20,12 @@ vi.mock('../src/db/repos/docAttachmentRepo.js', () => ({
   },
 }))
 const objectDelete = vi.fn(async () => undefined)
+const objectUpload = vi.fn(async () => undefined)
 vi.mock('../src/storage/objectStore.js', () => ({
   getObjectStore: vi.fn(() => ({
     presignPut: () => ({ uploadUrl: 'http://x', headers: {} }),
     delete: objectDelete,
+    upload: objectUpload,
   })),
 }))
 vi.mock('../src/import/docx/importQueue.js', () => ({
@@ -224,7 +226,7 @@ describe('importDocxHandler — status mapping', () => {
 
   it('cleans DOCX-created attachments when atomic apply is rejected', async () => {
     guard.mockResolvedValue(guardOk)
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200 })))
+    objectUpload.mockResolvedValue(undefined)
     parse.mockImplementation(async (_buffer, uploadCtx) => {
       const attachId = await uploadCtx!.upload({
         bytes: Buffer.from('png'), mime: 'image/png', fileName: 'image.png',

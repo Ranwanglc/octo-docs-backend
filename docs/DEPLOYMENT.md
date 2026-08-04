@@ -180,7 +180,8 @@ S3/MinIO/COS-only vars (used when `ATTACHMENT_DRIVER=s3|minio`):
 | `ATTACHMENT_S3_ACCESS_KEY` | _(empty)_ | supply at runtime; never commit |
 | `ATTACHMENT_S3_SECRET_KEY` | _(empty)_ | supply at runtime; never commit |
 | `ATTACHMENT_S3_FORCE_PATH_STYLE` | `true` | addressing mode — see §3.3 |
-| `ATTACHMENT_S3_SIGNING_HOST` | _(empty)_ | SigV4 `host` override — see §3.3 |
+| `ATTACHMENT_S3_SIGNING_HOST` | _(empty)_ | SigV4 `host` override for the public/browser path — see §3.3 |
+| `ATTACHMENT_S3_INTERNAL_ENDPOINT` | _(empty)_ | container-network origin for **server-side** PUT/GET/DELETE (DOCX import, Excalidraw import, SVG upload, copy, markdown ingest, delete). See §3.4 |
 
 ### 3.3 Tencent Cloud COS via a custom CDN domain — the three switches
 
@@ -227,6 +228,45 @@ canonicalUri and the signature mismatches.
 
 Treat the 403→404 transition as the signal that COS signing is configured
 correctly.
+
+### 3.4 Container deployments — setting `ATTACHMENT_S3_INTERNAL_ENDPOINT`
+
+When the backend runs inside a container (docker, k8s) and
+`ATTACHMENT_S3_ENDPOINT` points at a host-only reverse proxy (e.g.
+`http://127.0.0.1:28090` — an nginx bound to the docker-host loopback that
+forwards to MinIO), that address is **unreachable from inside the backend
+container** (127.0.0.1 inside the container is the container itself). All
+server-side attachment operations (DOCX embedded images, Excalidraw import,
+SVG inline upload, copy/relocate, markdown image ingest, delete) would
+otherwise fail with `ECONNREFUSED` at TCP connect time. Browser uploads are
+unaffected because the browser runs on the host.
+
+Set `ATTACHMENT_S3_INTERNAL_ENDPOINT` to the **in-cluster / container-network
+address** of your object store so server-side operations stay on the
+container network:
+
+```bash
+# Public endpoint (browser-facing, signed into presign URLs):
+ATTACHMENT_S3_ENDPOINT=http://127.0.0.1:28090
+# Internal endpoint (server-side direct SigV4 PUT/GET/DELETE, container DNS):
+ATTACHMENT_S3_INTERNAL_ENDPOINT=http://minio:9000
+```
+
+For the **COS-behind-CDN** configuration described in §3.3, leave
+`ATTACHMENT_S3_INTERNAL_ENDPOINT` **unset only if** the CDN is reachable from
+the server; otherwise set it to the COS bucket origin directly so that
+server-side requests bypass the CDN and its Host rewrite:
+
+```bash
+ATTACHMENT_S3_ENDPOINT=https://<cdn-custom-domain>
+ATTACHMENT_S3_SIGNING_HOST=<bucket>.cos.<region>.myqcloud.com
+# Server-side requests go straight to COS, avoiding the CDN Host-rewrite path:
+ATTACHMENT_S3_INTERNAL_ENDPOINT=https://<bucket>.cos.<region>.myqcloud.com
+```
+
+When `ATTACHMENT_S3_INTERNAL_ENDPOINT` is empty (default) all operations fall
+back to `ATTACHMENT_S3_ENDPOINT`, which is correct for single-network/dev
+deployments where both browser and server share the same network.
 
 ---
 
