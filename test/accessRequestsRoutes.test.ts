@@ -31,6 +31,12 @@ vi.mock('../src/permission/resolveRole.js', () => ({ resolveRole: vi.fn() }))
 vi.mock('../src/api/services/grantForward.js', () => ({
   grantForwardAccess: vi.fn(async () => ({ finalRole: 'reader', changed: true })),
 }))
+// getOctoIdentity().ownedBotsInSpace gates the submit bot snapshot. Mocked so
+// each test controls exactly which bots the caller "owns" in the doc's Space.
+const mockOwnedBotsInSpace = vi.fn(async () => [] as string[])
+vi.mock('../src/auth/octoIdentity.js', () => ({
+  getOctoIdentity: () => ({ ownedBotsInSpace: mockOwnedBotsInSpace }),
+}))
 
 import { accessRequestsRouter } from '../src/api/routes/accessRequests.js'
 import { requireDocRole } from '../src/api/guard.js'
@@ -89,6 +95,11 @@ beforeEach(() => {
   vi.mocked(docAccessRequestRepo.decide).mockClear()
   vi.mocked(resolveRole).mockReset()
   vi.mocked(grantForwardAccess).mockClear()
+  // Default: caller owns no bots in the space unless a test says otherwise.
+  mockOwnedBotsInSpace.mockReset()
+  mockOwnedBotsInSpace.mockResolvedValue([])
+  // grantForward default success unless a test overrides per-uid.
+  vi.mocked(grantForwardAccess).mockResolvedValue({ finalRole: 'reader', changed: true })
 })
 
 // ── submit ────────────────────────────────────────────────────────────────
@@ -151,6 +162,7 @@ describe('POST /:docId/access-requests — submit', () => {
       uid: 'u_applicant',
       requestedRoleNum: 2,
       reason: 'need edit',
+      botUids: [],
     })
   })
 
@@ -169,6 +181,7 @@ describe('POST /:docId/access-requests — submit', () => {
       uid: 'u_applicant',
       requestedRoleNum: 1,
       reason: '',
+      botUids: [],
     })
   })
 
@@ -208,6 +221,118 @@ describe('POST /:docId/access-requests — submit', () => {
   })
 })
 
+// ── submit: Space-bot snapshot gate ─────────────────────────────────────────
+describe('POST /:docId/access-requests — bot_uids snapshot subset gate', () => {
+  const submitHandler = () => handlerFor('/:docId/access-requests', 'post')
+  const req = (body: Record<string, unknown>) =>
+    ({ uid: 'u_applicant', spaceId: 's_1', octoToken: 'caller-tok', params: { docId: 'd_1' }, body }) as never
+
+  beforeEach(() => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1' } as never)
+    vi.mocked(resolveRole).mockResolvedValue('none')
+    vi.mocked(docAccessRequestRepo.submit).mockResolvedValue({ requestId: 'req_b', status: 1 })
+  })
+
+  it('admits the caller\u2019s OWN bots in this Space (subset) and stores the snapshot', async () => {
+    // Caller owns bot_a, bot_b, bot_c in s_1; requests a subset.
+    mockOwnedBotsInSpace.mockResolvedValue(['bot_a', 'bot_b', 'bot_c'])
+    const res = mockRes()
+    await submitHandler()(req({ requestedRole: 'writer', botUids: ['bot_b', 'bot_a'] }), res as never)
+    expect(res.statusCode).toBe(201)
+    // ownedBotsInSpace is resolved with the caller\u2019s own token + the doc\u2019s space.
+    expect(mockOwnedBotsInSpace).toHaveBeenCalledWith('u_applicant', 's_1', 'caller-tok')
+    // Stored snapshot is normalized (sorted, deduped).
+    expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith(
+      expect.objectContaining({ botUids: ['bot_a', 'bot_b'] }),
+    )
+  })
+
+  it('rejects (403) a bot the caller does NOT own in the Space \u2014 someone else\u2019s bot', async () => {
+    // Caller owns only bot_a; bot_other belongs to a different user.
+    mockOwnedBotsInSpace.mockResolvedValue(['bot_a'])
+    const res = mockRes()
+    await submitHandler()(req({ botUids: ['bot_a', 'bot_other'] }), res as never)
+    expect(res.statusCode).toBe(403)
+    expect(res.body).toEqual({ error: 'bot_not_owned_in_space', botUids: ['bot_other'] })
+    // Nothing written when any bot is inadmissible (fail closed, no partial row).
+    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+  })
+
+  it('rejects (403) a cross-Space bot (owned map is scoped to THIS doc\u2019s space)', async () => {
+    // The caller owns bot_x in some OTHER space, so ownedBotsInSpace(s_1) omits it.
+    mockOwnedBotsInSpace.mockResolvedValue([])
+    const res = mockRes()
+    await submitHandler()(req({ botUids: ['bot_x'] }), res as never)
+    expect(res.statusCode).toBe(403)
+    expect(res.body).toEqual({ error: 'bot_not_owned_in_space', botUids: ['bot_x'] })
+    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+  })
+
+  it('fail-closed: an unresolvable owned set (transport failure => []) rejects any submitted bot', async () => {
+    mockOwnedBotsInSpace.mockResolvedValue([]) // fail-closed empty from identity layer
+    const res = mockRes()
+    await submitHandler()(req({ botUids: ['bot_a'] }), res as never)
+    expect(res.statusCode).toBe(403)
+    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+  })
+
+  it('enforces the count cap: > MAX_BOT_UIDS submitted bots -> 400, no ownership check, no row', async () => {
+    const many = Array.from({ length: 51 }, (_, i) => `bot_${String(i).padStart(2, '0')}`)
+    const res = mockRes()
+    await submitHandler()(req({ botUids: many }), res as never)
+    expect(res.statusCode).toBe(400)
+    expect(mockOwnedBotsInSpace).not.toHaveBeenCalled()
+    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+  })
+
+  it('rejects (400) junk entries strictly (non-strings, blanks, over-long, duplicates) — no silent drop', async () => {
+    mockOwnedBotsInSpace.mockResolvedValue(['bot_a'])
+    const overlong = 'b'.repeat(65)
+    for (const bad of [['bot_a', ''], ['bot_a', 123], ['bot_a', overlong], ['bot_a', 'bot_a'], ['bot_a', ' bot_b']]) {
+      const res = mockRes()
+      await submitHandler()(req({ botUids: bad }), res as never)
+      expect(res.statusCode).toBe(400)
+    }
+    // A strict 400 never reaches the ownership check or writes a row.
+    expect(mockOwnedBotsInSpace).not.toHaveBeenCalled()
+    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+  })
+
+  it('zero bots (omitted botUids) never calls the ownership resolver \u2014 legacy path unchanged', async () => {
+    const res = mockRes()
+    await submitHandler()(req({ requestedRole: 'reader' }), res as never)
+    expect(res.statusCode).toBe(201)
+    expect(mockOwnedBotsInSpace).not.toHaveBeenCalled()
+    expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith(
+      expect.objectContaining({ botUids: [] }),
+    )
+  })
+
+  it('already_granted short-circuits BEFORE the bot-ownership remote check (idempotent no-op preserved)', async () => {
+    // A caller who already holds >= the requested role returns already_granted
+    // without any octo-server round-trip, even when the body carries bots.
+    vi.mocked(resolveRole).mockResolvedValue('writer')
+    const res = mockRes()
+    await submitHandler()(req({ requestedRole: 'reader', botUids: ['bot_a'] }), res as never)
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toEqual({ status: 'already_granted', role: 'writer' })
+    expect(mockOwnedBotsInSpace).not.toHaveBeenCalled()
+    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+  })
+
+  it('a bot-mount submit (no session token) cannot carry bots \u2014 owned set empty => 403', async () => {
+    // Bot mount: req.octoToken is undefined. ownedBotsInSpace gets '' and returns
+    // [] (fail-closed), so any submitted bot is rejected.
+    mockOwnedBotsInSpace.mockResolvedValue([])
+    const botReq = ({ uid: 'bot_self', spaceId: 's_1', params: { docId: 'd_1' }, body: { botUids: ['bot_a'] } }) as never
+    const res = mockRes()
+    await submitHandler()(botReq, res as never)
+    expect(res.statusCode).toBe(403)
+    expect(mockOwnedBotsInSpace).toHaveBeenCalledWith('bot_self', 's_1', '')
+    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+  })
+})
+
 // ── list ──────────────────────────────────────────────────────────────────
 describe('GET /:docId/access-requests — list pending (admin)', () => {
   const listHandler = () => handlerFor('/:docId/access-requests', 'get')
@@ -223,6 +348,7 @@ describe('GET /:docId/access-requests — list pending (admin)', () => {
         status: 1,
         request_id: 'req_x',
         decided_by: '',
+        bot_uids: ['bot_a', 'bot_b'],
         created_at: new Date(0),
         updated_at: new Date(0),
       },
@@ -232,7 +358,7 @@ describe('GET /:docId/access-requests — list pending (admin)', () => {
     expect(res.statusCode).toBe(200)
     expect(res.body).toEqual({
       items: [
-        { requestId: 'req_x', uid: 'u_applicant', requestedRole: 'writer', reason: 'edit pls', createdAt: new Date(0) },
+        { requestId: 'req_x', uid: 'u_applicant', requestedRole: 'writer', reason: 'edit pls', botUids: ['bot_a', 'bot_b'], createdAt: new Date(0) },
       ],
     })
   })
@@ -369,6 +495,115 @@ describe('POST /:docId/access-requests/:requestId/approve', () => {
 })
 
 // ── deny ────────────────────────────────────────────────────────────────────
+describe('POST /:docId/access-requests/:requestId/approve — carried Space-bot snapshot', () => {
+  const approveHandler = () => handlerFor('/:docId/access-requests/:requestId/approve', 'post')
+  const req = (body: Record<string, unknown>) =>
+    ({ uid: 'u_admin', params: { docId: 'd_1', requestId: 'req_x' }, body }) as never
+  const rowWithBots = (bots: string[], status = 1) => ({
+    doc_id: 'd_1',
+    uid: 'u_applicant',
+    requested_role: 2,
+    reason: '',
+    status,
+    request_id: 'req_x',
+    decided_by: '',
+    bot_uids: bots,
+    created_at: new Date(0),
+    updated_at: new Date(0),
+  })
+
+  it('grants the requester AND each carried bot the same role; returns succeeded/failed', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue(rowWithBots(['bot_a', 'bot_b']))
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValue(true)
+    vi.mocked(grantForwardAccess).mockResolvedValue({ finalRole: 'writer', changed: true })
+    const res = mockRes()
+    await approveHandler()(req({ role: 'writer' }), res as never)
+
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toEqual({
+      ok: true,
+      role: 'writer',
+      botGrantResult: { succeeded: ['bot_a', 'bot_b'], failed: [] },
+    })
+    // requester + 2 bots, each at roleNum 2 (writer), via the shared grant core.
+    expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledTimes(3)
+    for (const uid of ['u_applicant', 'bot_a', 'bot_b']) {
+      expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith(
+        expect.objectContaining({ uid, roleNum: 2, docId: 'd_1', grantedBy: 'u_admin' }),
+      )
+    }
+  })
+
+  it('partial failure: one bot grant throws, request stays approved, failed bot reported', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue(rowWithBots(['bot_a', 'bot_bad', 'bot_c']))
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValue(true)
+    vi.mocked(grantForwardAccess).mockImplementation(async (p: { uid: string }) => {
+      if (p.uid === 'bot_bad') throw new Error('transient grant failure')
+      return { finalRole: 'writer', changed: true }
+    })
+    const res = mockRes()
+    await approveHandler()(req({ role: 'writer' }), res as never)
+
+    // Approval stands (200) even though one bot failed.
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toEqual({
+      ok: true,
+      role: 'writer',
+      botGrantResult: {
+        succeeded: ['bot_a', 'bot_c'],
+        failed: [{ uid: 'bot_bad', reason: 'grant_failed' }],
+      },
+    })
+    expect(vi.mocked(docAccessRequestRepo.decide)).toHaveBeenCalledTimes(1)
+  })
+
+  it('already-high-role bot is not downgraded (grantForward skip) and counts as succeeded', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue(rowWithBots(['bot_admin']))
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValue(true)
+    // grantForwardAccess is the only-up/no-downgrade seam; a bot already admin
+    // returns finalRole:'admin', changed:false (idempotent success, no write).
+    vi.mocked(grantForwardAccess).mockImplementation(async (p: { uid: string }) =>
+      p.uid === 'bot_admin'
+        ? { finalRole: 'admin', changed: false }
+        : { finalRole: 'writer', changed: true },
+    )
+    const res = mockRes()
+    await approveHandler()(req({ role: 'writer' }), res as never)
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toEqual({
+      ok: true,
+      role: 'writer',
+      botGrantResult: { succeeded: ['bot_admin'], failed: [] },
+    })
+  })
+
+  it('duplicate approval (already-decided) grants NO bot and returns 409 not_pending', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue(rowWithBots(['bot_a'], REQUEST_STATUS_APPROVED))
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValue(false) // CAS: already decided
+    const res = mockRes()
+    await approveHandler()(req({ role: 'writer' }), res as never)
+    expect(res.statusCode).toBe(409)
+    expect(res.body).toEqual({ error: 'not_pending' })
+    expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
+  })
+
+  it('zero-bot approve returns the legacy role plus empty bots arrays', async () => {
+    vi.mocked(requireDocRole).mockResolvedValue(okGuard)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValue(rowWithBots([]))
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValue(true)
+    vi.mocked(grantForwardAccess).mockResolvedValue({ finalRole: 'writer', changed: true })
+    const res = mockRes()
+    await approveHandler()(req({ role: 'writer' }), res as never)
+    expect(res.statusCode).toBe(200)
+    expect(res.body).toEqual({ ok: true, role: 'writer' })
+    expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledTimes(1) // requester only
+  })
+})
+
 describe('POST /:docId/access-requests/:requestId/deny', () => {
   const denyHandler = () => handlerFor('/:docId/access-requests/:requestId/deny', 'post')
   const req = () => ({ uid: 'u_admin', params: { docId: 'd_1', requestId: 'req_x' }, body: {} }) as never

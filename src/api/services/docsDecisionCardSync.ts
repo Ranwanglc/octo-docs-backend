@@ -59,6 +59,12 @@ export interface DecisionCardSyncParams {
   /** Reviewer deny reason surfaced on the terminal card; empty on approve. */
   denyReason?: string
   /**
+   * Human-visible one-line bot-grant outcome ("Bot 授权:成功 N,失败 M…"), surfaced
+   * on the terminal card so a partial bot-grant failure is SEEN. Set only when
+   * the approval carried bots; omitted otherwise (zero-bot card unchanged).
+   */
+  botSummary?: string
+  /**
    * The decider's already-resolved display name, when the caller has it (the
    * decision routes resolve it for the decider's own card). Passing it here keeps
    * sibling cards naming the same approver WITHOUT a second identity lookup for
@@ -133,6 +139,8 @@ async function mutateOneCard(
     doc_id: p.docId,
     title: p.title,
     deny_reason: p.denied ? (p.denyReason ?? '') : '',
+    // Additive visible line for the bot-grant outcome on an approval.
+    bot_summary: p.botSummary ?? '',
     operator_name: decider.operatorName,
     decided_at_display: decider.decidedAtDisplay,
   })
@@ -162,7 +170,8 @@ async function reNotifyTerminal(
       kind,
       title: p.title,
       actor_name: decider.operatorName,
-      excerpt: p.denied ? (p.denyReason ?? '') : '',
+      // Denied cards carry the reviewer reason; approvals carry the bot summary.
+      excerpt: p.denied ? (p.denyReason ?? '') : (p.botSummary ?? ''),
       updated_at: decider.decidedAtDisplay,
     },
   })

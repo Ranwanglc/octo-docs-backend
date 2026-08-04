@@ -544,3 +544,135 @@ describe('cardActionDecideHandler (duplicate same-terminal callback → real dec
     expect(mockGetUser.mock.calls.map((c) => c[0])).toContain('admin-B')
   })
 })
+
+// User-bot grants: an approve callback grants the requester AND each bot in the
+// request's stored snapshot the same role, via the shared grant core. Per-bot
+// failures are isolated (the approval still stands); a replay/duplicate that
+// loses the decide() CAS grants nothing. Zero-bot requests keep the legacy path.
+describe('cardActionDecideHandler (carried Space-bot snapshot grants)', () => {
+  const ts = String(Math.floor(Date.now() / 1000))
+  const bodyFor = (eventId: string) =>
+    JSON.stringify({
+      event_id: eventId,
+      action_id: 'approval-approve',
+      decision: 'approve',
+      operator_uid: 'op-1',
+      inputs: {},
+      data: { owner: 'docs', action_type: 'access_request.decision', doc_id: 'doc-1', request_id: 'req-1' },
+      doc_id: 'doc-1',
+      request_id: 'req-1',
+      message_id: 'm-1',
+      channel_id: 'notification',
+      channel_type: 1,
+      space_id: 'space-1',
+      acted_at: Number(ts),
+    })
+
+  async function drive(eventId: string) {
+    const body = bodyFor(eventId)
+    const sig = sign(CARD_ACTION_DECIDE_PATH, body, ts, eventId, HANDLER_SECRET)
+    const { req, res } = makeReqRes(
+      { 'X-Octo-Timestamp': ts, 'X-Octo-Event-ID': eventId, 'X-Octo-Signature': sig },
+      body,
+    )
+    await cardActionDecideHandler(req, res as unknown as Parameters<typeof cardActionDecideHandler>[1])
+    return res
+  }
+
+  it('grants the requester and every snapshotted bot the requested role', async () => {
+    const { docAccessRequestRepo } = await import('../src/db/repos/docAccessRequestRepo.js')
+    const { grantForwardAccess } = await import('../src/api/services/grantForward.js')
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValueOnce({
+      uid: 'req-u', requested_role: 2, status: 1, bot_uids: ['bot_a', 'bot_b'],
+    } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(true)
+    vi.mocked(grantForwardAccess).mockClear()
+    vi.mocked(grantForwardAccess).mockResolvedValue({ finalRole: 'writer', changed: true })
+
+    const res = await drive('4100')
+    expect(res.statusCode).toBe(200)
+    const payload = res.payload as {
+      disposition: string
+      botGrantResult?: { succeeded: string[]; failed: Array<{ uid: string; reason: string }> }
+      display?: Record<string, string>
+    }
+    expect(payload.disposition).toBe('applied')
+    expect(payload.botGrantResult).toEqual({ succeeded: ['bot_a', 'bot_b'], failed: [] })
+    // The bot outcome is also surfaced as a visible display line on the card.
+    expect(payload.display?.bot_summary).toContain('成功 2')
+    // requester (req-u) + 2 bots, all at roleNum 2.
+    expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledTimes(3)
+    for (const uid of ['req-u', 'bot_a', 'bot_b']) {
+      expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledWith(expect.objectContaining({ uid, roleNum: 2 }))
+    }
+  })
+
+  it('partial failure: a failing bot grant does not fail the callback (still applied)', async () => {
+    const { docAccessRequestRepo } = await import('../src/db/repos/docAccessRequestRepo.js')
+    const { grantForwardAccess } = await import('../src/api/services/grantForward.js')
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValueOnce({
+      uid: 'req-u', requested_role: 2, status: 1, bot_uids: ['bot_ok', 'bot_bad'],
+    } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(true)
+    vi.mocked(grantForwardAccess).mockReset()
+    vi.mocked(grantForwardAccess).mockImplementation(async (p: { uid: string }) => {
+      if (p.uid === 'bot_bad') throw new Error('transient')
+      return { finalRole: 'writer', changed: true }
+    })
+
+    const res = await drive('4101')
+    expect(res.statusCode).toBe(200)
+    const payload = res.payload as {
+      disposition: string
+      botGrantResult?: { succeeded: string[]; failed: Array<{ uid: string; reason: string }> }
+      display?: Record<string, string>
+    }
+    expect(payload.disposition).toBe('applied')
+    expect(payload.botGrantResult).toEqual({
+      succeeded: ['bot_ok'],
+      failed: [{ uid: 'bot_bad', reason: 'grant_failed' }],
+    })
+    // Partial failure is SEEN on the card (visible summary), not silently returned.
+    expect(payload.display?.bot_summary).toContain('失败 1')
+    expect(payload.display?.bot_summary).toContain('bot_bad')
+  })
+
+  it('a lost decide() CAS (replay/duplicate) grants NO bot', async () => {
+    const { docAccessRequestRepo } = await import('../src/db/repos/docAccessRequestRepo.js')
+    const { docCardActionReceiptRepo } = await import('../src/db/repos/docCardActionReceiptRepo.js')
+    const { grantForwardAccess } = await import('../src/api/services/grantForward.js')
+    // Fresh claim so we execute computeDecision, but the row is already approved
+    // and decide() reports no transition => report-only, no grant.
+    vi.mocked(docCardActionReceiptRepo.claim).mockResolvedValueOnce(true)
+    vi.mocked(docCardActionReceiptRepo.getResponse).mockResolvedValueOnce(null)
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValueOnce({
+      uid: 'req-u', requested_role: 2, status: 2, bot_uids: ['bot_a'], decided_by: 'op-2',
+    } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(false) // CAS loses
+    vi.mocked(grantForwardAccess).mockReset()
+    vi.mocked(grantForwardAccess).mockResolvedValue({ finalRole: 'writer', changed: true })
+
+    const res = await drive('4102')
+    expect(res.statusCode).toBe(200)
+    expect(vi.mocked(grantForwardAccess)).not.toHaveBeenCalled()
+  })
+
+  it('zero-bot approve omits the bots field (legacy response shape)', async () => {
+    const { docAccessRequestRepo } = await import('../src/db/repos/docAccessRequestRepo.js')
+    const { grantForwardAccess } = await import('../src/api/services/grantForward.js')
+    vi.mocked(docAccessRequestRepo.getByRequestId).mockResolvedValueOnce({
+      uid: 'req-u', requested_role: 1, status: 1, bot_uids: [],
+    } as unknown as Awaited<ReturnType<typeof docAccessRequestRepo.getByRequestId>>)
+    vi.mocked(docAccessRequestRepo.decide).mockResolvedValueOnce(true)
+    vi.mocked(grantForwardAccess).mockReset()
+    vi.mocked(grantForwardAccess).mockResolvedValue({ finalRole: 'reader', changed: true })
+
+    const res = await drive('4103')
+    expect(res.statusCode).toBe(200)
+    const payload = res.payload as { disposition: string; botGrantResult?: unknown; display?: Record<string, string> }
+    expect(payload.disposition).toBe('applied')
+    expect(payload.botGrantResult).toBeUndefined() // no botGrantResult on the zero-bot path
+    expect(payload.display?.bot_summary).toBeUndefined() // no visible bot line either
+    expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledTimes(1) // requester only
+  })
+})

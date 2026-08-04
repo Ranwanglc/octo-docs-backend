@@ -27,7 +27,9 @@ import {
 } from '../../db/repos/docAccessRequestRepo.js'
 import { requireDocRole, requireSameSpace } from '../guard.js'
 import { resolveRole } from '../../permission/resolveRole.js'
-import { grantForwardAccess } from '../services/grantForward.js'
+import { grantRequestWithBots, botGrantSummary } from '../services/grantRequestWithBots.js'
+import { getOctoIdentity } from '../../auth/octoIdentity.js'
+import { parseRequestBotUids, BotUidsValidationError } from '../../util/botUids.js'
 import { notifyDocAccessRequested } from '../services/docsNotify.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
 import { isAccessRequestRole, roleAtLeast, roleToNumber, roleFromNumber } from '../../permission/role.js'
@@ -93,11 +95,50 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
   const reasonRaw = (req.body ?? {}).reason
   const reason = typeof reasonRaw === 'string' ? reasonRaw.slice(0, 512) : ''
 
-  // Already sufficiently privileged => no-op idempotent success (no request row).
+  // Strict-parse the optional Space-bot snapshot: omitted => []; otherwise it
+  // MUST be an array of trimmed, non-empty, ≤64-char, non-duplicate uids, total
+  // ≤50 — any violation is a 400 (never a silent drop/truncate). The owned-set
+  // subset gate runs later, only if the caller is not already privileged.
+  let requestedBotUids: string[]
+  try {
+    requestedBotUids = parseRequestBotUids((req.body ?? {}).botUids)
+  } catch (err) {
+    if (err instanceof BotUidsValidationError) {
+      res.status(400).json({ error: err.message })
+      return
+    }
+    throw err
+  }
+
+  // Already sufficiently privileged => idempotent no-op success (no request row).
+  // This runs BEFORE any bot-ownership remote check so the pre-existing
+  // already_granted behavior is unchanged for a caller who happens to also pass
+  // bots: an admin-level requester short-circuits without an octo-server round-trip.
   const current = await resolveRole(req.uid!, docId)
   if (roleAtLeast(current, requestedRole)) {
     res.status(200).json({ status: 'already_granted', role: current })
     return
+  }
+
+  // Admit ONLY bots the caller actually owns in THIS doc's Space —
+  // octo-server's owned_bots_by_space[doc.space_id], resolved from the caller's
+  // own session token (never client-supplied, never a third party's bots).
+  // FAIL-CLOSED: a bot mount (no session token) or unresolvable context yields
+  // an empty owned set, so any submitted bot is rejected (403).
+  let botUids: string[] = []
+  if (requestedBotUids.length > 0) {
+    const owned = new Set(
+      await getOctoIdentity().ownedBotsInSpace(req.uid!, meta.space_id, req.octoToken ?? ''),
+    )
+    const rejected = requestedBotUids.filter((b) => !owned.has(b))
+    if (rejected.length > 0) {
+      // Any bot the caller does not own here is a hard 403, not a silent narrow:
+      // failing loudly keeps the boundary auditable. A transport failure
+      // (owned=[]) also lands here rather than authorizing anything.
+      res.status(403).json({ error: 'bot_not_owned_in_space', botUids: rejected })
+      return
+    }
+    botUids = requestedBotUids
   }
 
   const out = await docAccessRequestRepo.submit({
@@ -105,6 +146,7 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
     uid: req.uid!,
     requestedRoleNum: roleToNumber(requestedRole),
     reason,
+    botUids,
   })
 
   // Best-effort second-phase push: notify owner+admins with a docs-notify card
@@ -142,6 +184,7 @@ accessRequestsRouter.get('/:docId/access-requests', async (req: Request, res: Re
       uid: r.uid,
       requestedRole: roleName(Number(r.requested_role)),
       reason: r.reason,
+      botUids: r.bot_uids,
       createdAt: r.created_at,
     })),
   })
@@ -196,18 +239,21 @@ accessRequestsRouter.post(
       return
     }
 
-    const result = await grantForwardAccess({
+    const result = await grantRequestWithBots({
       docId: guard.meta.doc_id,
       documentName: guard.meta.document_name,
       uid: request.uid,
       roleNum: roleToNumber(grantRole),
       grantedBy: req.uid!,
+      // Stored, already-admissible snapshot from submit time; re-normalized
+      // fail-closed by the repo read path so a corrupt DB value grants no bot.
+      botUids: request.bot_uids,
     })
-    // Drive every approver's sibling card to terminal (task
-    // docs-access-decision-card-sync). Best-effort, fired after the decision
-    // commits. This is the REST path (no card-callback finalizer), so the decider
-    // (req.uid) is an approver holding a live card and must be terminalized too —
-    // deciderCardHandledExternally omitted (false).
+    const hadBots = (request.bot_uids?.length ?? 0) > 0
+    // Best-effort sibling-card sync. REST path has no card-callback finalizer, so
+    // the decider (req.uid) holds a live card and is terminalized here too
+    // (deciderCardHandledExternally omitted). Surface the bot outcome as visible
+    // card text so a partial failure is seen, not just returned.
     void syncDecisionCards({
       requestId: req.params.requestId!,
       spaceId: guard.meta.space_id,
@@ -215,12 +261,25 @@ accessRequestsRouter.post(
       title: guard.meta.title,
       deciderUid: req.uid!,
       denied: false,
-      // This request IS authenticated, so the approver name can resolve with the
-      // decider's own session token instead of depending on OCTO_SERVER_TOKEN.
+      botSummary: hadBots ? botGrantSummary(result.botsSucceeded, result.botsFailed) : undefined,
       callerToken: callerSessionToken(req),
       decidedAtSeconds: Math.floor(Date.now() / 1000),
     }).catch(() => {})
-    res.status(200).json({ ok: true, role: result.finalRole })
+    // Response shape (per scheme): zero-bot requests keep the legacy { ok, role }
+    // byte-for-byte (no empty field). Only when the request carried bots do we add
+    // botGrantResult, with failures itemized as { uid, reason:'grant_failed' }.
+    res.status(200).json({
+      ok: true,
+      role: result.requesterRole,
+      ...(hadBots
+        ? {
+            botGrantResult: {
+              succeeded: result.botsSucceeded,
+              failed: result.botsFailed.map((uid) => ({ uid, reason: 'grant_failed' as const })),
+            },
+          }
+        : {}),
+    })
   },
 )
 

@@ -27,7 +27,7 @@ import {
 } from '../../db/repos/docAccessRequestRepo.js'
 import { docCardActionReceiptRepo } from '../../db/repos/docCardActionReceiptRepo.js'
 import { resolveRole } from '../../permission/resolveRole.js'
-import { grantForwardAccess } from '../services/grantForward.js'
+import { grantRequestWithBots, botGrantSummary } from '../services/grantRequestWithBots.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
 import { buildDecisionDisplay, buildDecisionDisplayAt } from '../services/decisionDisplay.js'
 import { isAccessRequestRole, roleFromNumber } from '../../permission/role.js'
@@ -70,6 +70,12 @@ interface DecisionResult {
   state: DecisionState
   requester_uid?: string
   display?: Record<string, string>
+  // Additive, docs-backend-owned field: the outcome of granting the requester's
+  // carried Space-bot snapshot on an approval. Present only on the sole deciding
+  // execution of an approve that carried bots; absent on deny, replays,
+  // conflicts, and zero-bot requests so the response stays byte-compatible.
+  // Failures are itemized { uid, reason } (scheme parity with the REST route).
+  botGrantResult?: { succeeded: string[]; failed: Array<{ uid: string; reason: string }> }
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -265,16 +271,39 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
   // pending (un-superseded). This makes the grant exactly-once and immune to the
   // stale-requested_role escalation: a foreign/concurrent event that did not win
   // the CAS falls into the report-only branch above and grants nothing.
+  let botOutcome: { succeeded: string[]; failed: Array<{ uid: string; reason: string }> } | undefined
+  let botSummary: string | undefined
   if (req.decision === 'approve') {
-    // Grant the requested role via the shared only-up max-merge path. Idempotent
-    // (resolveRole skip / GREATEST upsert).
-    await grantForwardAccess({
+    // The stored, already-admissible snapshot. The repo read path normalizes it
+    // to an array (fail-closed); `?? []` is defense-in-depth for any caller that
+    // bypasses that path.
+    const botUids = request.bot_uids ?? []
+    // Grant the requested role to the requester AND their carried Space-bot
+    // snapshot via the shared only-up max-merge path. Idempotent (resolveRole
+    // skip / GREATEST upsert). Per-bot failures are isolated and never fail the
+    // callback — the request is already approved (the CAS won above), and the
+    // grant is gated on transitioned===true so bots are granted exactly once
+    // (a redelivery/replay of the same event falls into the report-only branch
+    // above and grants nothing, so no bot is ever double-granted).
+    const granted = await grantRequestWithBots({
       docId,
       documentName: meta.document_name,
       uid: request.uid,
       roleNum: Number(request.requested_role),
       grantedBy: req.operator_uid,
+      botUids,
     })
+    // Only surface the bot outcome when the request actually carried bots, so
+    // the zero-bot response stays identical to the legacy shape.
+    if (botUids.length > 0) {
+      botOutcome = {
+        succeeded: granted.botsSucceeded,
+        failed: granted.botsFailed.map((uid) => ({ uid, reason: 'grant_failed' })),
+      }
+      // One-line visible summary threaded into the card display + sibling sync so
+      // a partial failure is SEEN on the card, not just returned to octo-server.
+      botSummary = botGrantSummary(granted.botsSucceeded, granted.botsFailed)
+    }
   }
 
   // Sibling-card sync (task docs-access-decision-card-sync): drive every OTHER
@@ -294,6 +323,9 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     req.operator_uid,
     req.acted_at,
   )
+  // Surface the bot-grant summary as a visible display line (octo-server renders
+  // the display map on the outcome card) so a partial failure is seen.
+  if (botSummary) display.bot_summary = botSummary
 
   void syncDecisionCards({
     requestId,
@@ -304,6 +336,7 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     deciderCardHandledExternally: true,
     denied: req.decision === 'deny',
     denyReason: decisionNote(req),
+    botSummary,
     deciderName: operatorName,
     decidedAtSeconds: req.acted_at,
   }).catch(() => {})
@@ -313,6 +346,7 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     state: req.decision === 'approve' ? 'approved' : 'denied',
     requester_uid: request.uid,
     display,
+    ...(botOutcome ? { botGrantResult: botOutcome } : {}),
   }
 }
 

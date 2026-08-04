@@ -233,6 +233,39 @@ describe('syncDecisionCards', () => {
     expect(bodyOf(fetchMock, 0).deny_reason).toBe('权限不足')
   })
 
+  it('carries the bot-grant summary onto the approval terminal card (visible text)', async () => {
+    repo.listByRequest.mockResolvedValue([row('u-admin1')])
+    await syncDecisionCards({
+      ...baseParams(),
+      denied: false,
+      botSummary: 'Bot 授权:成功 1,失败 1(bot_bad)',
+      deciderCardHandledExternally: true,
+    })
+    // The mutate body carries the visible bot summary line.
+    expect(bodyOf(fetchMock, 0).bot_summary).toBe('Bot 授权:成功 1,失败 1(bot_bad)')
+  })
+
+  it('carries the bot-grant summary onto the re-notify fallback excerpt too', async () => {
+    repo.listByRequest.mockResolvedValue([row('u-admin1')])
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.includes('/v1/internal/cards/mutate')) return { ok: false, status: 500 }
+      return { ok: true, status: 200 }
+    })
+    await syncDecisionCards({
+      ...baseParams(),
+      denied: false,
+      botSummary: 'Bot 授权:成功 2,失败 0',
+      deciderCardHandledExternally: true,
+    })
+    const notifyIdx = fetchMock.mock.calls.findIndex((c) =>
+      (c[0] as string).includes('/v1/internal/notify'),
+    )
+    expect(notifyIdx).toBeGreaterThanOrEqual(0)
+    const card = (bodyOf(fetchMock, notifyIdx) as unknown as { docs_card: Record<string, string> })
+      .docs_card
+    expect(card.excerpt).toBe('Bot 授权:成功 2,失败 0')
+  })
+
   it('never throws even when the ledger lookup fails (best-effort)', async () => {
     repo.listByRequest.mockRejectedValue(new Error('db down'))
     await expect(syncDecisionCards(baseParams())).resolves.toBeUndefined()

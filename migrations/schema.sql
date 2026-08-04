@@ -125,6 +125,7 @@ CREATE TABLE doc_access_request (
   request_id     VARCHAR(64)  NOT NULL,            -- 高熵 id，供 approve/deny 路由寻址
   decided_by     VARCHAR(64)  NOT NULL DEFAULT '', -- 处理人 uid
   decision_note  VARCHAR(512) NOT NULL DEFAULT '', -- 处理人拒绝理由（卡片 inputs["deny_reason"] 原样传入，存前截断）
+  bot_uids       JSON         NULL,                -- 申请人携带的本人 Space Bot 快照（JSON 字符串数组）；空/NULL=零 Bot，兼容旧行为。批准时逐个复用 forward-grant 授同一角色
   created_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (doc_id, uid),                       -- 一个 uid 对一个 doc 至多一条申请（重复申请 UPDATE 复用）
