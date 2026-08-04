@@ -95,6 +95,14 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   if (localBlobGatewayEnabled()) {
     const blobLimiter = createRateLimiter(opts.rateLimit)
     app.use((req: Request, res: Response, next: NextFunction) => {
+      // Never let the query-param HMAC gateway claim a PPT path: it terminates
+      // the response itself with a bare `{ error: 'invalid_signature' }`, which
+      // would leak the legacy shape into the PPT contract. PPT keeps its own
+      // enveloped surface for every request, signed-looking or not.
+      if (/^\/api\/v1\/ppt(\/|$)/i.test(req.path)) {
+        next()
+        return
+      }
       if (!isSignedBlobRequest(req)) {
         next()
         return
@@ -238,7 +246,11 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   // handler copied from the legacy routers (which read `req.uid!`) would run
   // unauthenticated. PPT auth lands per-endpoint inside createPptRouter in R2+.
   const pptApi = Router()
-  pptApi.use(createRateLimiter(opts.rateLimit))
+  // The 429 body MUST be the C-style envelope, not the legacy bare
+  // `{ error: 'rate_limited' }` — a throttle is ordinary production behavior and
+  // the canonical path, so a PPT client reading `body.error.code` must not break
+  // on it. RATE_LIMITED (429) exists in the enum for exactly this.
+  pptApi.use(createRateLimiter({ ...opts.rateLimit, message: { error: { code: 'RATE_LIMITED', message: 'rate limited' } } }))
   pptApi.use(createPptRouter())
   app.use('/api/v1/ppt', pptApi)
   // Belt-and-braces: register the envelope error handler at app level too, scoped

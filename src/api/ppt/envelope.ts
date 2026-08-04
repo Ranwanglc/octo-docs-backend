@@ -144,6 +144,7 @@ export function sendPptError(res: Response, code: PptErrorCode, message: string,
  *  - PptApiError                     -> its own code + status
  *  - express.json `entity.parse.failed` -> 400 VALIDATION_ERROR
  *  - express.json `entity.too.large`    -> 413 PAYLOAD_TOO_LARGE
+ *  - express.json `charset.unsupported` / `encoding.unsupported` -> 415 UNSUPPORTED_MEDIA_TYPE
  *  - anything else                   -> 500 INTERNAL_ERROR (logged, message not leaked)
  */
 export function pptErrorHandler(err: unknown, _req: Request, res: Response, next: NextFunction): void {
@@ -162,6 +163,12 @@ export function pptErrorHandler(err: unknown, _req: Request, res: Response, next
   }
   if (type === 'entity.too.large') {
     sendPptError(res, 'PAYLOAD_TOO_LARGE', 'request body too large')
+    return
+  }
+  if (type === 'charset.unsupported' || type === 'encoding.unsupported') {
+    // express.json rejects an unsupported charset/encoding before parsing — that
+    // is a media-type problem, not an internal error. Map it to the enum's 415.
+    sendPptError(res, 'UNSUPPORTED_MEDIA_TYPE', 'unsupported content encoding')
     return
   }
   // eslint-disable-next-line no-console

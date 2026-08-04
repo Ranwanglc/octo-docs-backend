@@ -272,15 +272,79 @@ describe('PPT surface is rate-limited (integration, P1-B)', () => {
     await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())))
   })
 
-  it('throttles /api/v1/ppt after the per-IP limit', async () => {
-    const statuses: number[] = []
+  it('throttles /api/v1/ppt after the per-IP limit with the C-style RATE_LIMITED envelope', async () => {
+    const results: Array<{ status: number; body: unknown }> = []
     for (let i = 0; i < 6; i++) {
       const res = await fetch(`${base}/api/v1/ppt/anything`, { headers: { 'x-forwarded-for': '203.0.113.7' } })
-      statuses.push(res.status)
+      results.push({ status: res.status, body: await res.json() })
     }
+    const statuses = results.map((r) => r.status)
     // First few resolve to the enveloped 404; once the window limit is hit the
     // limiter takes over with 429.
     expect(statuses.filter((s) => s === 429).length).toBeGreaterThan(0)
     expect(statuses.slice(0, 3).every((s) => s === 404)).toBe(true)
+    // The 429 body MUST be the envelope, not the legacy bare `rate_limited`.
+    const throttled = results.find((r) => r.status === 429)!
+    expect((throttled.body as { error: { code: string } }).error.code).toBe('RATE_LIMITED')
+    expect((throttled.body as { error: unknown }).error).not.toBe('rate_limited')
+  })
+})
+
+// Class-level guarantee (reviewer's ask): every way a request to /api/v1/ppt/x
+// can fail must be enveloped with a string `error.code`, so this stops being a
+// bug review keeps rediscovering. Rate-limiting is covered by its own describe
+// above (it needs a small limit budget); this table covers the rest.
+describe('every /api/v1/ppt failure is enveloped with an error.code (integration)', () => {
+  let server: Server
+  let base: string
+
+  beforeAll(async () => {
+    const app = createApp()
+    await new Promise<void>((resolve) => {
+      server = app.listen(0, '127.0.0.1', resolve)
+    })
+    const { port } = server.address() as AddressInfo
+    base = `http://127.0.0.1:${port}`
+  })
+
+  afterAll(async () => {
+    await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())))
+  })
+
+  const cases: Array<{ label: string; path: string; init?: RequestInit; expectCode: string }> = [
+    { label: 'unknown path (404)', path: '/api/v1/ppt/nope', expectCode: 'NOT_FOUND' },
+    { label: 'unknown path, case-variant mount (404)', path: '/api/v1/PPT/nope', expectCode: 'NOT_FOUND' },
+    {
+      label: 'malformed JSON body (400)',
+      path: '/api/v1/ppt/docs/x',
+      init: { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{bad-json' },
+      expectCode: 'VALIDATION_ERROR',
+    },
+    {
+      label: 'malformed JSON on case-variant path (400)',
+      path: '/api/v1/PPT/docs/x',
+      init: { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{bad-json' },
+      expectCode: 'VALIDATION_ERROR',
+    },
+    {
+      label: 'oversized JSON body (413)',
+      path: '/api/v1/ppt/docs/x',
+      init: { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ a: 'x'.repeat(1024 * 1024 + 16) }) },
+      expectCode: 'PAYLOAD_TOO_LARGE',
+    },
+    {
+      label: 'unsupported charset (415)',
+      path: '/api/v1/ppt/docs/x',
+      init: { method: 'POST', headers: { 'content-type': 'application/json; charset=utf-32' }, body: '{}' },
+      expectCode: 'UNSUPPORTED_MEDIA_TYPE',
+    },
+  ]
+
+  it.each(cases)('$label is enveloped as $expectCode', async ({ path, init, expectCode }) => {
+    const res = await fetch(`${base}${path}`, init)
+    const body = (await res.json()) as { error?: { code?: string } }
+    // Every failure carries a string error.code — never the legacy bare shape.
+    expect(typeof body.error?.code).toBe('string')
+    expect(body.error!.code).toBe(expectCode)
   })
 })

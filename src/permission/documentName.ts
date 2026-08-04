@@ -163,15 +163,20 @@ export function buildPptDocumentName(space: string, folder: string, doc: string)
  *   - `:html:` name ⇒ doc_type MUST be `html`
  *   - `:wb:` name   ⇒ doc_type MUST be `board` (mirrors the existing whiteboard
  *     guard in issueCollabToken)
- *   - 4-seg `document` name ⇒ doc_type MUST be `doc` or `sheet`
+ *   - 4-seg `document` name ⇒ doc_type MUST NOT be a namespaced kind
+ *     (`board` / `html` / `html_ppt`)
  *
- * The 4-segment `document` namespace is shared by `doc` and `sheet` (both plain
- * 4-seg keys), so it stays flexible BETWEEN those two — but it is still a forbidden
- * mismatch when paired with a namespaced kind's doc_type (`html` / `html_ppt` /
- * `board`), which is impossible by construction and therefore exactly the
- * corruption this guard exists to reject. Returns true when the pairing is
- * consistent, false when it is a forbidden mismatch — the caller maps false to
- * 403/404 per its own contract.
+ * The 4-segment `document` namespace is shared by `doc` and `sheet`, and it also
+ * tolerates any legacy free-string `doc_type` (rows created before the legacy
+ * create path validated doc_type — `doc_meta.doc_type` is a VARCHAR with no CHECK
+ * constraint). A namespaced kind's doc_type paired with a 4-seg key IS a forbidden
+ * mismatch (impossible by construction — this is the corruption the guard exists
+ * to reject); everything else is treated as the shared document namespace. This
+ * DENY-LIST posture matches contentKindFromDocType, which maps an unknown
+ * `doc_type` to `document` rather than failing closed, so the two guards agree on
+ * legacy rows instead of one 404-ing what the other serves. Returns true when the
+ * pairing is consistent, false when it is a forbidden mismatch — the caller maps
+ * false to 403/404 per its own contract.
  */
 export function isDocTypeConsistentWithName(parsed: ParsedName, docType: string): boolean {
   switch (parsed.kind) {
@@ -182,6 +187,6 @@ export function isDocTypeConsistentWithName(parsed: ParsedName, docType: string)
     case 'whiteboard':
       return docType === 'board'
     case 'document':
-      return docType === 'doc' || docType === 'sheet'
+      return docType !== 'board' && docType !== HTML_DOC_TYPE && docType !== HTML_PPT_DOC_TYPE
   }
 }

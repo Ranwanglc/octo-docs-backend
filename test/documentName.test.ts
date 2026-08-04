@@ -145,6 +145,15 @@ describe('isDocTypeConsistentWithName — cross-type mismatch guard (§5)', () =
     expect(isDocTypeConsistentWithName(docName, 'sheet')).toBe(true)
   })
 
+  it('tolerates a legacy free-string doc_type on a 4-seg key (deny-list, not allow-list)', () => {
+    // A 4-seg key with a legacy/unknown doc_type is treated as the shared
+    // document namespace (matches contentKindFromDocType's unknown→document
+    // posture), so opening a pre-existing row is not broken (P2-D).
+    expect(isDocTypeConsistentWithName(docName, 'template')).toBe(true)
+    expect(isDocTypeConsistentWithName(docName, 'wiki')).toBe(true)
+    expect(isDocTypeConsistentWithName(docName, '')).toBe(true)
+  })
+
   it('FORBIDS a 4-seg document name paired with a namespaced kind doc_type', () => {
     // A 4-seg key with html / html_ppt / board is impossible by construction and
     // is exactly the corruption the guard rejects (P2-3).
