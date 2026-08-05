@@ -27,7 +27,8 @@ vi.mock('../src/util/ids.js', () => ({
 }))
 
 // Stateful in-memory idempotency store mirroring the real table's
-// reserve/get/complete contract, keyed by space|scope|key.
+// reserve/get/complete contract, keyed by space|scope|uid|key (uid included so
+// the cross-user isolation the fix relies on is faithfully modeled).
 interface Rec {
   requestHash: string
   responseStatus: number
@@ -36,18 +37,18 @@ interface Rec {
   completed: boolean
 }
 const store = new Map<string, Rec>()
-const k = (s: string, sc: string, key: string) => `${s}|${sc}|${key}`
+const k = (s: string, sc: string, uid: string, key: string) => `${s}|${sc}|${uid}|${key}`
 vi.mock('../src/db/repos/pptIdempotencyRepo.js', () => ({
   PPT_IDEMPOTENCY_SCOPE_CREATE: 'create',
   pptIdempotencyRepo: {
-    get: vi.fn(async (s: string, sc: string, key: string) => store.get(k(s, sc, key)) ?? null),
-    reserve: vi.fn(async (s: string, sc: string, key: string, hash: string) => {
-      if (store.has(k(s, sc, key))) return { reserved: false }
-      store.set(k(s, sc, key), { requestHash: hash, responseStatus: 0, responseData: null, docId: null, completed: false })
+    get: vi.fn(async (s: string, sc: string, uid: string, key: string) => store.get(k(s, sc, uid, key)) ?? null),
+    reserve: vi.fn(async (s: string, sc: string, uid: string, key: string, hash: string) => {
+      if (store.has(k(s, sc, uid, key))) return { reserved: false }
+      store.set(k(s, sc, uid, key), { requestHash: hash, responseStatus: 0, responseData: null, docId: null, completed: false })
       return { reserved: true }
     }),
-    complete: vi.fn(async (s: string, sc: string, key: string, status: number, data: unknown, docId: string | null) => {
-      store.set(k(s, sc, key), { requestHash: store.get(k(s, sc, key))!.requestHash, responseStatus: status, responseData: data, docId, completed: true })
+    complete: vi.fn(async (s: string, sc: string, uid: string, key: string, status: number, data: unknown, docId: string | null) => {
+      store.set(k(s, sc, uid, key), { requestHash: store.get(k(s, sc, uid, key))!.requestHash, responseStatus: status, responseData: data, docId, completed: true })
     }),
   },
 }))
@@ -224,6 +225,40 @@ describe('PPT-IDEMP-002 — same key + different payload conflicts', () => {
     expect(j.error.details?.idempotencyKey).toBe('idem-c')
     // No duplicate side effect.
     expect(create).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('cross-user idempotency isolation — same key, different user (XIN-1515)', () => {
+  it('a second user reusing the same key + payload gets their OWN deck, never the first user\'s response', async () => {
+    // User A creates with key K.
+    setOctoIdentity(stub({ verifyToken: async () => ({ uid: 'u_A' }) }))
+    const a = await post({ title: 'Shared', templateId: 'pitch' }, { key: 'shared-key' })
+    expect(a.status).toBe(201)
+    const aBody = (await a.json()) as { data: { ownerId: string; role: string } }
+    expect(aBody.data.ownerId).toBe('u_A')
+    expect(aBody.data.role).toBe('admin')
+    expect(create).toHaveBeenCalledTimes(1)
+
+    // User B (same space) reuses the SAME key + SAME payload. The idempotency row
+    // is scoped by uid, so B has no prior record and mints their OWN deck — B must
+    // never receive A's response (the cross-user leak this test guards).
+    setOctoIdentity(stub({ verifyToken: async () => ({ uid: 'u_B' }) }))
+    const b = await post({ title: 'Shared', templateId: 'pitch' }, { key: 'shared-key' })
+    expect(b.status).toBe(201)
+    const bBody = (await b.json()) as { data: { ownerId: string; role: string } }
+    expect(bBody.data.ownerId).toBe('u_B')
+    expect(bBody.data.ownerId).not.toBe('u_A')
+    // A real second create ran for B (not a replay of A's doc); B is admin of B's deck.
+    expect(create).toHaveBeenCalledTimes(2)
+    expect(create.mock.calls[1]![0]).toMatchObject({ ownerId: 'u_B' })
+    expect(upsertDirect).toHaveBeenLastCalledWith({ docId: 'd_ppt1', uid: 'u_B', roleNum: ROLE_ADMIN, grantedBy: 'u_B' })
+
+    // A's replay still returns A's original response byte-identically, with no new create.
+    setOctoIdentity(stub({ verifyToken: async () => ({ uid: 'u_A' }) }))
+    const aReplay = await post({ title: 'Shared', templateId: 'pitch' }, { key: 'shared-key' })
+    expect(aReplay.status).toBe(201)
+    expect(await aReplay.json()).toEqual(aBody)
+    expect(create).toHaveBeenCalledTimes(2)
   })
 })
 

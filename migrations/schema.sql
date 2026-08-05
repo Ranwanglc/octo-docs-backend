@@ -315,13 +315,18 @@ CREATE TABLE ppt_doc_state (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- Scoped idempotency replay/conflict store for the PPT write endpoints. Keyed by
--- (space_id, scope, idempotency_key): the same Idempotency-Key is independent
--- across spaces and across operation kinds ('create' in R2-B1; register/publish
--- reuse this table via distinct scopes later). A placeholder row (response_status
--- = 0) reserves the key before the side effect; complete fills the real response.
+-- (space_id, scope, uid, idempotency_key): the same Idempotency-Key is independent
+-- across spaces, across operation kinds ('create' in R2-B1; register/publish reuse
+-- this table via distinct scopes later), AND across users. `uid` is part of the
+-- key on purpose — the created deck is owned by / grants admin to the caller and
+-- the stored response carries that identity, so scoping without uid would let a
+-- different user in the same space replay the first user's doc response (a
+-- cross-user identity leak). A placeholder row (response_status = 0) reserves the
+-- key before the side effect; complete fills the real response.
 CREATE TABLE ppt_idempotency (
   space_id        VARCHAR(64)  NOT NULL,                   -- enforced X-Space-Id (server-derived), tenant scope
   scope           VARCHAR(32)  NOT NULL,                   -- operation namespace: 'create' | 'register' | 'publish'
+  uid             VARCHAR(64)  NOT NULL,                   -- authenticated caller (owner of the created deck)
   idempotency_key VARCHAR(255) NOT NULL,                   -- client Idempotency-Key header
   request_hash    CHAR(64)     NOT NULL,                   -- sha256(hex) of the canonical request payload
   response_status INT          NOT NULL DEFAULT 0,         -- stored HTTP status; 0 while the row is a placeholder
@@ -329,5 +334,5 @@ CREATE TABLE ppt_idempotency (
   doc_id          VARCHAR(64)  NULL DEFAULT NULL,          -- created doc id, when the op created one
   created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-  PRIMARY KEY (space_id, scope, idempotency_key)
+  PRIMARY KEY (space_id, scope, uid, idempotency_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

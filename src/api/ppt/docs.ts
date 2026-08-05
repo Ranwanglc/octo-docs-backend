@@ -110,8 +110,13 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
   // payload replays; same key + different payload conflicts.
   const requestHash = hashCanonicalPayload({ title, folderId: folder, templateId })
 
-  // Replay/conflict against a prior record for this (space, create, key).
-  const prior = await pptIdempotencyRepo.get(spaceId, PPT_IDEMPOTENCY_SCOPE_CREATE, idempotencyKey)
+  // Replay/conflict against a prior record for this (space, create, uid, key).
+  // The idempotency row is scoped by the authenticated `uid`: the created deck is
+  // owned by / grants admin to this caller and the stored response carries that
+  // identity, so a DIFFERENT user reusing the same key must NOT replay this
+  // caller's response (cross-user leak). Per-user scoping means another user
+  // reusing the key mints their own deck instead.
+  const prior = await pptIdempotencyRepo.get(spaceId, PPT_IDEMPOTENCY_SCOPE_CREATE, uid, idempotencyKey)
   if (prior) {
     if (prior.requestHash !== requestHash) {
       throw new PptApiError('CONFLICT', 'Idempotency-Key was reused with a different payload', {
@@ -135,11 +140,12 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
   const { reserved } = await pptIdempotencyRepo.reserve(
     spaceId,
     PPT_IDEMPOTENCY_SCOPE_CREATE,
+    uid,
     idempotencyKey,
     requestHash,
   )
   if (!reserved) {
-    const winner = await pptIdempotencyRepo.get(spaceId, PPT_IDEMPOTENCY_SCOPE_CREATE, idempotencyKey)
+    const winner = await pptIdempotencyRepo.get(spaceId, PPT_IDEMPOTENCY_SCOPE_CREATE, uid, idempotencyKey)
     if (winner && winner.requestHash !== requestHash) {
       throw new PptApiError('CONFLICT', 'Idempotency-Key was reused with a different payload', {
         details: { idempotencyKey },
@@ -192,8 +198,8 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
     ...(meta?.created_at ? { createdAt: meta.created_at } : {}),
   }
 
-  // Record the response so a header replay returns it byte-for-byte.
-  await pptIdempotencyRepo.complete(spaceId, PPT_IDEMPOTENCY_SCOPE_CREATE, idempotencyKey, 201, data, docId)
+  // Record the response so a header replay returns it byte-for-byte (per-user).
+  await pptIdempotencyRepo.complete(spaceId, PPT_IDEMPOTENCY_SCOPE_CREATE, uid, idempotencyKey, 201, data, docId)
 
   sendPptData(res, data, 201)
 }

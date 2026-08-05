@@ -3,11 +3,15 @@
  * write endpoints (create in R2-B1; register/publish reuse the same table in
  * later rounds via distinct `scope` values).
  *
- * A record is keyed by `(space_id, scope, idempotency_key)` so the same
- * `Idempotency-Key` is independent across spaces and across operation kinds. It
- * captures the CANONICAL request hash and the full original response (status +
- * enveloped `data` payload) so a replay returns byte-identical output with no new
- * side effect, and a same-key/different-payload retry is detected as a conflict.
+ * A record is keyed by `(space_id, scope, uid, idempotency_key)`. The `uid` is
+ * part of the key on purpose: the created resource is owned by / grants admin to
+ * the authenticated caller, and the stored response carries that caller's
+ * `ownerId`/`role`. Scoping only by `(space_id, scope, idempotency_key)` would
+ * let a DIFFERENT user in the same space, reusing the same `Idempotency-Key`,
+ * replay the FIRST user's doc response — a cross-user identity leak. Per-user
+ * scoping makes replay/conflict strictly per-caller: a second user reusing the
+ * same key simply mints their OWN deck, and the first user's replay still returns
+ * their original response byte-for-byte.
  *
  * Two-phase write to avoid ever creating an orphaned document on a concurrent
  * same-key race:
@@ -26,6 +30,7 @@ export const PPT_IDEMPOTENCY_SCOPE_CREATE = 'create'
 export interface PptIdempotencyRecord {
   spaceId: string
   scope: string
+  uid: string
   idempotencyKey: string
   /** SHA-256 (hex) of the canonical request payload (see hashCanonicalPayload). */
   requestHash: string
@@ -57,13 +62,13 @@ interface IdempotencyRow {
 }
 
 export const pptIdempotencyRepo = {
-  /** Look up a prior record for this (space, scope, key), or null if none. */
-  async get(spaceId: string, scope: string, idempotencyKey: string): Promise<PptIdempotencyRecord | null> {
+  /** Look up a prior record for this (space, scope, uid, key), or null if none. */
+  async get(spaceId: string, scope: string, uid: string, idempotencyKey: string): Promise<PptIdempotencyRecord | null> {
     const rows = await query<IdempotencyRow>(
       `SELECT request_hash, response_status, response_body, doc_id
          FROM ppt_idempotency
-        WHERE space_id = ? AND scope = ? AND idempotency_key = ?`,
-      [spaceId, scope, idempotencyKey],
+        WHERE space_id = ? AND scope = ? AND uid = ? AND idempotency_key = ?`,
+      [spaceId, scope, uid, idempotencyKey],
     )
     const row = rows[0]
     if (!row) return null
@@ -71,6 +76,7 @@ export const pptIdempotencyRepo = {
     return {
       spaceId,
       scope,
+      uid,
       idempotencyKey,
       requestHash: row.request_hash,
       responseStatus: row.response_status,
@@ -90,15 +96,16 @@ export const pptIdempotencyRepo = {
   async reserve(
     spaceId: string,
     scope: string,
+    uid: string,
     idempotencyKey: string,
     requestHash: string,
   ): Promise<{ reserved: boolean }> {
     try {
       await query(
         `INSERT INTO ppt_idempotency
-           (space_id, scope, idempotency_key, request_hash, response_status, response_body, doc_id)
-         VALUES (?, ?, ?, ?, 0, NULL, NULL)`,
-        [spaceId, scope, idempotencyKey, requestHash],
+           (space_id, scope, uid, idempotency_key, request_hash, response_status, response_body, doc_id)
+         VALUES (?, ?, ?, ?, ?, 0, NULL, NULL)`,
+        [spaceId, scope, uid, idempotencyKey, requestHash],
       )
       return { reserved: true }
     } catch (err) {
@@ -111,6 +118,7 @@ export const pptIdempotencyRepo = {
   async complete(
     spaceId: string,
     scope: string,
+    uid: string,
     idempotencyKey: string,
     responseStatus: number,
     responseData: unknown,
@@ -119,8 +127,8 @@ export const pptIdempotencyRepo = {
     await query(
       `UPDATE ppt_idempotency
           SET response_status = ?, response_body = ?, doc_id = ?
-        WHERE space_id = ? AND scope = ? AND idempotency_key = ?`,
-      [responseStatus, JSON.stringify(responseData), docId, spaceId, scope, idempotencyKey],
+        WHERE space_id = ? AND scope = ? AND uid = ? AND idempotency_key = ?`,
+      [responseStatus, JSON.stringify(responseData), docId, spaceId, scope, uid, idempotencyKey],
     )
   },
 }

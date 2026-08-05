@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS ppt_doc_state (
 CREATE TABLE IF NOT EXISTS ppt_idempotency (
   space_id        VARCHAR(64)  NOT NULL,
   scope           VARCHAR(32)  NOT NULL,
+  uid             VARCHAR(64)  NOT NULL,
   idempotency_key VARCHAR(255) NOT NULL,
   request_hash    CHAR(64)     NOT NULL,
   response_status INT          NOT NULL DEFAULT 0,
@@ -38,5 +39,5 @@ CREATE TABLE IF NOT EXISTS ppt_idempotency (
   doc_id          VARCHAR(64)  NULL DEFAULT NULL,
   created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-  PRIMARY KEY (space_id, scope, idempotency_key)
+  PRIMARY KEY (space_id, scope, uid, idempotency_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
