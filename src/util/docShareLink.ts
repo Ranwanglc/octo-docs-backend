@@ -27,3 +27,17 @@ export function buildDocShareUrl(webOrigin: string, docId: string, spaceId?: str
   const path = `${origin}/d/${encodeURIComponent(docId)}`
   return spaceId ? `${path}?sp=${encodeURIComponent(spaceId)}` : path
 }
+
+/**
+ * Editor-facing URL for a PPT (`html_ppt`) deck — the route a freshly created
+ * deck should open in for editing. Mirrors {@link buildDocShareUrl}'s origin
+ * handling and `?sp=<spaceId>` scoping, but carries an explicit `/edit` intent so
+ * the frontend routes the deck into the PPT editor (not the read-only preview).
+ * Degrades to an origin-relative path when `webOrigin` is empty, exactly like the
+ * share link.
+ */
+export function buildPptEditorUrl(webOrigin: string, docId: string, spaceId?: string): string {
+  const origin = webOrigin.trim().replace(/\/+$/, '')
+  const path = `${origin}/d/${encodeURIComponent(docId)}/edit`
+  return spaceId ? `${path}?sp=${encodeURIComponent(spaceId)}` : path
+}

@@ -289,3 +289,45 @@ CREATE TABLE doc_access_notify_card (
   updated_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (request_id, recipient_uid)            -- leftmost prefix serves the decision-time lookup by request_id
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---------------------------------------------------------------------------
+-- Bento PPT (`html_ppt`) — R2-B1 (XIN-1514): human create + templates +
+-- idempotency. These tables are PPT-owned and never touch the legacy doc/Yjs
+-- paths. Kept in lockstep with migrations/upgrades/2026-08-05-add-ppt-create-tables.sql
+-- so a fresh build from this schema.sql and an upgraded DB are identical.
+-- ---------------------------------------------------------------------------
+
+-- Per-document PPT state that does not belong on the shared doc_meta row: the
+-- originating template, the Bento format/sync versions, the draft/live/published
+-- counters, and the initial materialized BentoDoc the create endpoint mints.
+CREATE TABLE ppt_doc_state (
+  doc_id                VARCHAR(64)  NOT NULL,             -- FK-by-convention to doc_meta.doc_id (html_ppt row)
+  template_id           VARCHAR(64)  NOT NULL,             -- one of the four fixed bundled templates
+  draft_revision        BIGINT       NOT NULL DEFAULT 0,   -- monotonic draft save counter (R2-B2 advances)
+  snapshot_version      BIGINT       NOT NULL DEFAULT 0,   -- authoritative live snapshot version (R4 advances)
+  published_version_seq BIGINT       NULL DEFAULT NULL,    -- latest published version seq (R5), NULL until first publish
+  ppt_format_version    INT          NOT NULL DEFAULT 1,   -- BentoDoc FORMAT_VERSION at create
+  bento_sync_pv         INT          NOT NULL DEFAULT 2,   -- Bento SYNC_V (relay protocol version)
+  draft_doc             MEDIUMTEXT   NOT NULL,             -- materialized starter BentoDoc JSON (template stripped)
+  created_at            DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at            DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (doc_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Scoped idempotency replay/conflict store for the PPT write endpoints. Keyed by
+-- (space_id, scope, idempotency_key): the same Idempotency-Key is independent
+-- across spaces and across operation kinds ('create' in R2-B1; register/publish
+-- reuse this table via distinct scopes later). A placeholder row (response_status
+-- = 0) reserves the key before the side effect; complete fills the real response.
+CREATE TABLE ppt_idempotency (
+  space_id        VARCHAR(64)  NOT NULL,                   -- enforced X-Space-Id (server-derived), tenant scope
+  scope           VARCHAR(32)  NOT NULL,                   -- operation namespace: 'create' | 'register' | 'publish'
+  idempotency_key VARCHAR(255) NOT NULL,                   -- client Idempotency-Key header
+  request_hash    CHAR(64)     NOT NULL,                   -- sha256(hex) of the canonical request payload
+  response_status INT          NOT NULL DEFAULT 0,         -- stored HTTP status; 0 while the row is a placeholder
+  response_body   MEDIUMTEXT   NULL DEFAULT NULL,          -- stored enveloped `data` payload (JSON); NULL until complete
+  doc_id          VARCHAR(64)  NULL DEFAULT NULL,          -- created doc id, when the op created one
+  created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (space_id, scope, idempotency_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
