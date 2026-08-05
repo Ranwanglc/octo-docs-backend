@@ -127,9 +127,20 @@ export interface AccessRequestNotifyParams {
 }
 
 function accessRequestExcerpt(reason: string, botUids: string[]): string {
-  if (botUids.length === 0) return reason
-  const principals = `Bots (${botUids.length}): ${botUids.join(', ')}`
-  return reason ? `${principals}\n${reason}` : principals
+  const takeRunes = (value: string, limit: number): string => [...value].slice(0, Math.max(0, limit)).join('')
+  if (botUids.length === 0) return takeRunes(reason, 300)
+
+  const count = `Bots (${botUids.length})`
+  let excerpt = count
+  for (const uid of botUids) {
+    const next = `${excerpt === count ? ': ' : ', '}${uid}`
+    if ([...(excerpt + next)].length > 300) break
+    excerpt += next
+  }
+  if (reason && [...excerpt].length < 300) {
+    excerpt += `\n${takeRunes(reason, 300 - [...excerpt].length - 1)}`
+  }
+  return excerpt
 }
 
 /**

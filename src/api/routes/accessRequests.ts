@@ -27,7 +27,7 @@ import {
 } from '../../db/repos/docAccessRequestRepo.js'
 import { requireDocRole, requireSameSpace } from '../guard.js'
 import { resolveRole } from '../../permission/resolveRole.js'
-import { grantRequestWithBots, botGrantSummary } from '../services/grantRequestWithBots.js'
+import { grantRequestWithBots } from '../services/grantRequestWithBots.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { parseRequestBotUids, BotUidsValidationError } from '../../util/botUids.js'
 import { notifyDocAccessRequested } from '../services/docsNotify.js'
@@ -251,8 +251,7 @@ accessRequestsRouter.post(
     const hadBots = (request.bot_uids?.length ?? 0) > 0
     // Best-effort sibling-card sync. REST path has no card-callback finalizer, so
     // the decider (req.uid) holds a live card and is terminalized here too
-    // (deciderCardHandledExternally omitted). Surface the bot outcome as visible
-    // card text so a partial failure is seen, not just returned.
+    // (deciderCardHandledExternally omitted).
     void syncDecisionCards({
       requestId: req.params.requestId!,
       spaceId: guard.meta.space_id,
@@ -260,7 +259,6 @@ accessRequestsRouter.post(
       title: guard.meta.title,
       deciderUid: req.uid!,
       denied: false,
-      botSummary: hadBots ? botGrantSummary(result.botsSucceeded, result.botsFailed) : undefined,
       callerToken: callerSessionToken(req),
       decidedAtSeconds: Math.floor(Date.now() / 1000),
     }).catch(() => {})

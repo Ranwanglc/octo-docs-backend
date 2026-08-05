@@ -73,6 +73,14 @@ describe('buildDecisionDisplay (seconds source)', () => {
     expect(getUser).not.toHaveBeenCalled()
     expect(display).toEqual({ title: '季度目标', decided_at: AT_DISPLAY })
   })
+
+  it('caps every free-text display value at 500 runes without splitting unicode', async () => {
+    getUser.mockResolvedValueOnce({ uid: 'op-1', name: '😀'.repeat(600) })
+    const { display } = await buildDecisionDisplay('文'.repeat(600), 'op-1', AT_SECONDS)
+    for (const value of Object.values(display)) expect([...value].length).toBeLessThanOrEqual(500)
+    expect([...display.title!]).toHaveLength(500)
+    expect([...display.operator_name!]).toHaveLength(500)
+  })
 })
 
 describe('buildDecisionDisplayAt (persisted Date source)', () => {

@@ -27,7 +27,7 @@ import {
 } from '../../db/repos/docAccessRequestRepo.js'
 import { docCardActionReceiptRepo } from '../../db/repos/docCardActionReceiptRepo.js'
 import { resolveRole } from '../../permission/resolveRole.js'
-import { grantRequestWithBots, botGrantSummary } from '../services/grantRequestWithBots.js'
+import { grantRequestWithBots } from '../services/grantRequestWithBots.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
 import { buildDecisionDisplay, buildDecisionDisplayAt } from '../services/decisionDisplay.js'
 import { isAccessRequestRole, roleFromNumber } from '../../permission/role.js'
@@ -70,12 +70,24 @@ interface DecisionResult {
   state: DecisionState
   requester_uid?: string
   display?: Record<string, string>
-  // Additive, docs-backend-owned field: the outcome of granting the requester's
-  // carried Space-bot snapshot on an approval. Present only on the sole deciding
-  // execution of an approve that carried bots; absent on deny, replays,
-  // conflicts, and zero-bot requests so the response stays byte-compatible.
-  // Failures are itemized { uid, reason } (scheme parity with the REST route).
-  botGrantResult?: { succeeded: string[]; failed: Array<{ uid: string; reason: string }> }
+}
+
+const DECISION_RESULT_KEYS = new Set(['disposition', 'state', 'requester_uid', 'display'])
+const MAX_DISPLAY_RUNES = 500
+
+/** Keep the callback response aligned with octo-server's strict decoder. */
+export function assertDecisionResultContract(value: unknown): asserts value is DecisionResult {
+  if (!isRecord(value) || Object.keys(value).some((key) => !DECISION_RESULT_KEYS.has(key))) {
+    throw new Error('invalid decision result shape')
+  }
+  if (value.display !== undefined) {
+    if (!isRecord(value.display)) throw new Error('invalid decision display')
+    for (const displayValue of Object.values(value.display)) {
+      if (typeof displayValue !== 'string' || [...displayValue].length > MAX_DISPLAY_RUNES) {
+        throw new Error('invalid decision display value')
+      }
+    }
+  }
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -271,8 +283,6 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
   // pending (un-superseded). This makes the grant exactly-once and immune to the
   // stale-requested_role escalation: a foreign/concurrent event that did not win
   // the CAS falls into the report-only branch above and grants nothing.
-  let botOutcome: { succeeded: string[]; failed: Array<{ uid: string; reason: string }> } | undefined
-  let botSummary: string | undefined
   if (req.decision === 'approve') {
     // The stored, already-admissible snapshot. The repo read path normalizes it
     // to an array (fail-closed); `?? []` is defense-in-depth for any caller that
@@ -285,7 +295,7 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     // grant is gated on transitioned===true so bots are granted exactly once
     // (a redelivery/replay of the same event falls into the report-only branch
     // above and grants nothing, so no bot is ever double-granted).
-    const granted = await grantRequestWithBots({
+    await grantRequestWithBots({
       docId,
       documentName: meta.document_name,
       uid: request.uid,
@@ -293,17 +303,6 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
       grantedBy: req.operator_uid,
       botUids,
     })
-    // Only surface the bot outcome when the request actually carried bots, so
-    // the zero-bot response stays identical to the legacy shape.
-    if (botUids.length > 0) {
-      botOutcome = {
-        succeeded: granted.botsSucceeded,
-        failed: granted.botsFailed.map((uid) => ({ uid, reason: 'grant_failed' })),
-      }
-      // One-line visible summary threaded into the card display + sibling sync so
-      // a partial failure is SEEN on the card, not just returned to octo-server.
-      botSummary = botGrantSummary(granted.botsSucceeded, granted.botsFailed)
-    }
   }
 
   // Sibling-card sync (task docs-access-decision-card-sync): drive every OTHER
@@ -323,10 +322,6 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     req.operator_uid,
     req.acted_at,
   )
-  // Surface the bot-grant summary as a visible display line (octo-server renders
-  // the display map on the outcome card) so a partial failure is seen.
-  if (botSummary) display.bot_summary = botSummary
-
   void syncDecisionCards({
     requestId,
     spaceId: meta.space_id,
@@ -336,7 +331,6 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     deciderCardHandledExternally: true,
     denied: req.decision === 'deny',
     denyReason: decisionNote(req),
-    botSummary,
     deciderName: operatorName,
     decidedAtSeconds: req.acted_at,
   }).catch(() => {})
@@ -346,7 +340,6 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     state: req.decision === 'approve' ? 'approved' : 'denied',
     requester_uid: request.uid,
     display,
-    ...(botOutcome ? { botGrantResult: botOutcome } : {}),
   }
 }
 
@@ -365,20 +358,28 @@ async function decideIdempotently(req: DecisionRequest): Promise<DecisionResult>
   const claimed = await docCardActionReceiptRepo.claim(req.event_id)
   if (!claimed) {
     const stored = await docCardActionReceiptRepo.getResponse(req.event_id)
-    if (stored != null) return JSON.parse(stored) as DecisionResult
+    if (stored != null) {
+      const replay: unknown = JSON.parse(stored)
+      assertDecisionResultContract(replay)
+      return replay
+    }
     // Claimed but not finalized (prior crash or in-flight peer) → re-execute.
     // Safe: computeDecision applies the grant ONLY when its decide() CAS wins, so
     // a concurrent sibling that re-executes here cannot double- or stale-grant —
     // the CAS admits exactly one grantor per request regardless of claim outcome.
   }
   const result = await computeDecision(req)
+  assertDecisionResultContract(result)
   const won = await docCardActionReceiptRepo.finalize(req.event_id, JSON.stringify(result))
   if (won) return result
   // A concurrent execution finalized first — return its stored response so all
   // deliveries converge on one identical result. Fall back to our own result
   // only if the row is somehow unreadable (never expected post-finalize).
   const stored = await docCardActionReceiptRepo.getResponse(req.event_id)
-  return stored != null ? (JSON.parse(stored) as DecisionResult) : result
+  if (stored == null) return result
+  const replay: unknown = JSON.parse(stored)
+  assertDecisionResultContract(replay)
+  return replay
 }
 
 /** Express handler for POST CARD_ACTION_DECIDE_PATH. Requires an express.raw body. */

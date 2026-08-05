@@ -52,9 +52,23 @@ vi.mock('../src/auth/octoIdentity.js', () => ({ getOctoIdentity: () => ({ getUse
 
 import {
   verifyOctoSignature,
+  assertDecisionResultContract,
   cardActionDecideHandler,
   CARD_ACTION_DECIDE_PATH,
 } from '../src/api/routes/cardActionDecide.js'
+
+describe('callback response contract guard', () => {
+  it('rejects unknown top-level keys and display values over 500 runes', () => {
+    expect(() => assertDecisionResultContract({ disposition: 'applied', state: 'approved', extra: true }))
+      .toThrow('invalid decision result shape')
+    expect(() => assertDecisionResultContract({
+      disposition: 'applied', state: 'approved', display: { title: '😀'.repeat(501) },
+    })).toThrow('invalid decision display value')
+    expect(() => assertDecisionResultContract({
+      disposition: 'applied', state: 'approved', display: { title: '😀'.repeat(500) },
+    })).not.toThrow()
+  })
+})
 
 // The language-neutral test vector from octo-server
 // docs/card-action-callback-consumer.md. Validates our HMAC canonical
@@ -591,15 +605,9 @@ describe('cardActionDecideHandler (carried Space-bot snapshot grants)', () => {
 
     const res = await drive('4100')
     expect(res.statusCode).toBe(200)
-    const payload = res.payload as {
-      disposition: string
-      botGrantResult?: { succeeded: string[]; failed: Array<{ uid: string; reason: string }> }
-      display?: Record<string, string>
-    }
+    const payload = res.payload as Record<string, unknown>
     expect(payload.disposition).toBe('applied')
-    expect(payload.botGrantResult).toEqual({ succeeded: ['bot_a', 'bot_b'], failed: [] })
-    // The bot outcome is also surfaced as a visible display line on the card.
-    expect(payload.display?.bot_summary).toContain('成功 2')
+    expect(Object.keys(payload).sort()).toEqual(['display', 'disposition', 'requester_uid', 'state'])
     // requester (req-u) + 2 bots, all at roleNum 2.
     expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledTimes(3)
     for (const uid of ['req-u', 'bot_a', 'bot_b']) {
@@ -622,19 +630,9 @@ describe('cardActionDecideHandler (carried Space-bot snapshot grants)', () => {
 
     const res = await drive('4101')
     expect(res.statusCode).toBe(200)
-    const payload = res.payload as {
-      disposition: string
-      botGrantResult?: { succeeded: string[]; failed: Array<{ uid: string; reason: string }> }
-      display?: Record<string, string>
-    }
+    const payload = res.payload as Record<string, unknown>
     expect(payload.disposition).toBe('applied')
-    expect(payload.botGrantResult).toEqual({
-      succeeded: ['bot_ok'],
-      failed: [{ uid: 'bot_bad', reason: 'grant_failed' }],
-    })
-    // Partial failure is SEEN on the card (visible summary), not silently returned.
-    expect(payload.display?.bot_summary).toContain('失败 1')
-    expect(payload.display?.bot_summary).toContain('bot_bad')
+    expect(Object.keys(payload).sort()).toEqual(['display', 'disposition', 'requester_uid', 'state'])
   })
 
   it('a lost decide() CAS (replay/duplicate) grants NO bot', async () => {
@@ -669,10 +667,9 @@ describe('cardActionDecideHandler (carried Space-bot snapshot grants)', () => {
 
     const res = await drive('4103')
     expect(res.statusCode).toBe(200)
-    const payload = res.payload as { disposition: string; botGrantResult?: unknown; display?: Record<string, string> }
+    const payload = res.payload as Record<string, unknown>
     expect(payload.disposition).toBe('applied')
-    expect(payload.botGrantResult).toBeUndefined() // no botGrantResult on the zero-bot path
-    expect(payload.display?.bot_summary).toBeUndefined() // no visible bot line either
+    expect(Object.keys(payload).sort()).toEqual(['display', 'disposition', 'requester_uid', 'state'])
     expect(vi.mocked(grantForwardAccess)).toHaveBeenCalledTimes(1) // requester only
   })
 })
