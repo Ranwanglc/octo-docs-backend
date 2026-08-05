@@ -19,6 +19,13 @@ import { config } from '../../config/env.js'
 export interface RateLimiterOptions {
   windowMs?: number
   max?: number
+  /**
+   * Body sent on a 429. Defaults to the legacy bare `{ error: 'rate_limited' }`
+   * shape used by the /api/v1/docs and /v1/bot/docs chains. The PPT chain passes
+   * its C-style envelope here so a throttled PPT request stays on-contract
+   * (`{ error: { code: 'RATE_LIMITED', … } }`) instead of leaking the bare shape.
+   */
+  message?: unknown
 }
 
 /** Build a per-IP rate limiter; unspecified options fall back to config.rateLimit. */
@@ -28,6 +35,6 @@ export function createRateLimiter(opts: RateLimiterOptions = {}): RateLimitReque
     limit: opts.max ?? config.rateLimit.max,
     standardHeaders: 'draft-7', // RateLimit-* response headers
     legacyHeaders: false, // drop the deprecated X-RateLimit-* headers
-    message: { error: 'rate_limited' },
+    message: opts.message ?? { error: 'rate_limited' },
   })
 }

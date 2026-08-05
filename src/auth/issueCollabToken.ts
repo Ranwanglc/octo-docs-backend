@@ -18,12 +18,12 @@
  */
 import { signCollabToken, type CollabTokenResult } from './collabToken.js'
 import { getOctoIdentity } from './octoIdentity.js'
-import { parseDocumentName } from '../permission/documentName.js'
+import { parseDocumentName, isDocTypeConsistentWithName } from '../permission/documentName.js'
 import { resolveRole, resolveDocMetaByName } from '../permission/resolveRole.js'
 import { docViewHistoryRepo } from '../db/repos/docViewHistoryRepo.js'
 import { config } from '../config/env.js'
 import { effectiveRole, SHARE_SCOPE_ANYONE } from '../permission/shareScope.js'
-import { HTML_DOC_TYPE } from '../db/docType.js'
+import { HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../db/docType.js'
 
 export type IssueResult =
   | { ok: true; result: CollabTokenResult }
@@ -84,18 +84,27 @@ export async function issueCollabToken(
   // anymore. A null here means the well-formed key addresses no live row.
   const meta = await resolveDocMetaByName(documentName)
   if (!meta) return { ok: false, status: 404, error: 'not_found' }
-  // The `:wb:` namespace addresses boards only — a resolved row that is not a
-  // board (corrupt key/row pairing) is "no such whiteboard".
-  if (parsed.kind === 'whiteboard' && meta.doc_type !== 'board') {
+  // A namespaced key must address a row of the matching kind. This is the shared
+  // cross-type guard (§5): a `:wb:` key on a non-board row, a `:ppt:` key on a
+  // non-`html_ppt` row, or a `:html:` key on a non-`html` row is a corrupt
+  // key/row pairing and resolves to "no such document". Previously only the
+  // whiteboard arm was hand-rolled here; the `:ppt:`/`:html:` arms had the hole
+  // the helper was written to close. Not reachable by any current mint path, but
+  // the one site that could serve a corrupt pairing is now closed.
+  if (!isDocTypeConsistentWithName(parsed, meta.doc_type)) {
     return { ok: false, status: 404, error: 'not_found' }
   }
 
   // HTML has its own body/comment backend and no Yjs collaboration design.
-  // Reject before role resolution so no HTML role can mint a Hocuspocus token.
-  if (meta.doc_type === HTML_DOC_TYPE) {
+  // html_ppt (Bento slide-deck) is an EXPLICIT sibling here: it uses the Bento
+  // frame protocol over its OWN relay + `POST /api/v1/ppt/docs/collab-token`
+  // endpoint, never the Hocuspocus/Yjs token. Reject BOTH before role resolution
+  // so no html / html_ppt role can mint a Hocuspocus token (§1.2 / §6).
+  if (meta.doc_type === HTML_DOC_TYPE || meta.doc_type === HTML_PPT_DOC_TYPE) {
     // eslint-disable-next-line no-console
-    console.warn('[octo-docs] collab-token rejected: HTML does not support collaboration', {
+    console.warn('[octo-docs] collab-token rejected: doc type does not support Hocuspocus collaboration', {
       docId: meta.doc_id,
+      docType: meta.doc_type,
     })
     return { ok: false, status: 422, error: 'unsupported_document_type' }
   }

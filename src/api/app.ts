@@ -40,6 +40,7 @@ import { docSceneRouter } from './routes/docScene.js'
 import { exportRouter } from './routes/export.js'
 import { boardExportRouter } from './routes/boardExport.js'
 import { importRouter } from './routes/import.js'
+import { createPptRouter, pptErrorHandler } from './ppt/envelope.js'
 import { sanitizeUrlForLog } from './accessLog.js'
 
 export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: boolean | number | string } = {}): Express {
@@ -94,6 +95,14 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   if (localBlobGatewayEnabled()) {
     const blobLimiter = createRateLimiter(opts.rateLimit)
     app.use((req: Request, res: Response, next: NextFunction) => {
+      // Never let the query-param HMAC gateway claim a PPT path: it terminates
+      // the response itself with a bare `{ error: 'invalid_signature' }`, which
+      // would leak the legacy shape into the PPT contract. PPT keeps its own
+      // enveloped surface for every request, signed-looking or not.
+      if (/^\/api\/v1\/ppt(\/|$)/i.test(req.path)) {
+        next()
+        return
+      }
       if (!isSignedBlobRequest(req)) {
         next()
         return
@@ -130,6 +139,19 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
     // reject malformed UTF-8/JSON and enforce its own byte boundary before
     // walking the untrusted scene. Leave only that route for express.raw.
     if (req.path.endsWith('/import/excalidraw')) return next()
+    // The PPT surface parses its own body INSIDE createPptRouter so that a
+    // malformed-JSON body error is caught by the router-scoped pptErrorHandler
+    // and rendered as the C-style VALIDATION_ERROR envelope. If the global
+    // parser ran here it would throw before the PPT mount and the central
+    // bare-JSON handler would emit `{ error: 'invalid_body' }`, leaking the
+    // legacy shape into the PPT contract.
+    //
+    // Match Express's OWN mount semantics: `app.use('/api/v1/ppt', …)` is
+    // case-insensitive by default, so the skip MUST be too — otherwise a
+    // case-variant path (`/api/v1/PPT/…`) is served by the PPT router but its
+    // body is parsed by the global parser here, and the leak persists on exactly
+    // the routes the router serves.
+    if (/^\/api\/v1\/ppt(\/|$)/i.test(req.path)) return next()
     return jsonBodyParser(req, res, next)
   })
 
@@ -208,6 +230,37 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   botApi.use(boardExportRouter) // /v1/bot/docs/:docId/export (whiteboard PNG/SVG, W3)
   botApi.use(importRouter) // /v1/bot/docs/:docId/import/{docx|markdown|xlsx}
   app.use('/v1/bot/docs', botApi)
+
+  // PPT contract surface (§3 / §4). Mounted as its OWN router so `/api/v1/ppt/**`
+  // uses the C-style `{data}`/`{error}` envelope and error enum, while the legacy
+  // `/api/v1/docs/**` surface below keeps its bare-JSON shape via the global
+  // handler. R1 wires only the envelope + a terminal enveloped NOT_FOUND; the
+  // concrete endpoints land inside createPptRouter in R2+.
+  //
+  // Fronted by the SAME per-IP rate limiter as the human/bot chains above so the
+  // surface is not un-throttled (every other API mount starts its chain with a
+  // limiter — see §8.4). AUTH POSTURE (deliberate, read before adding R2
+  // handlers): this chain does NOT run authMiddleware / spaceContextMiddleware,
+  // so `req.uid` / `req.spaceId` are NOT pre-populated here. R2 PPT endpoints
+  // must apply their own auth guards and must NOT assume `req.uid` is set — a
+  // handler copied from the legacy routers (which read `req.uid!`) would run
+  // unauthenticated. PPT auth lands per-endpoint inside createPptRouter in R2+.
+  const pptApi = Router()
+  // The 429 body MUST be the C-style envelope, not the legacy bare
+  // `{ error: 'rate_limited' }` — a throttle is ordinary production behavior and
+  // the canonical path, so a PPT client reading `body.error.code` must not break
+  // on it. RATE_LIMITED (429) exists in the enum for exactly this.
+  pptApi.use(createRateLimiter({ ...opts.rateLimit, message: { error: { code: 'RATE_LIMITED', message: 'rate limited' } } }))
+  pptApi.use(createPptRouter())
+  app.use('/api/v1/ppt', pptApi)
+  // Belt-and-braces: register the envelope error handler at app level too, scoped
+  // to the same prefix. A mounted Router has arity 3, so an error raised by any
+  // app-level middleware BEFORE the mount would otherwise skip the router-scoped
+  // handler and fall through to the global bare-JSON handler. This app-level
+  // registration uses Express's own case-insensitive mount matching (no path
+  // string of our own to keep in sync) and renders ANY pre-mount error for a PPT
+  // path as the C-style envelope, not just the body-parser types.
+  app.use('/api/v1/ppt', pptErrorHandler)
 
   // central error handler — unexpected errors => 500 (§8.4 error table).
   app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {

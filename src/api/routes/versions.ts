@@ -101,6 +101,12 @@ versionsRouter.get('/:docId/versions', listVersionsHandler)
 export async function listVersionsHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
+  if (contentKindFromDocType(guard.meta.doc_type) === 'ppt') {
+    // html_ppt has no Yjs `doc_version` rows (§1.3); answer wrong-kind uniformly
+    // with the other Yjs version handlers rather than an empty 200 list.
+    res.status(422).json({ error: 'unsupported_document_type' })
+    return
+  }
 
   const cursorRaw = req.query.cursor
   const cursor = typeof cursorRaw === 'string' && cursorRaw !== '' ? Number(cursorRaw) : undefined
@@ -141,6 +147,13 @@ export async function createVersionHandler(req: Request, res: Response): Promise
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   const kind = contentKindFromDocType(guard.meta.doc_type)
+  if (kind === 'ppt') {
+    // html_ppt versions are BentoDoc / rendered-HTML blobs in `ppt_version`, not
+    // Yjs `doc_version` rows. The legacy Yjs version endpoints must reject them
+    // rather than snapshot the (non-existent) live Yjs state (§1.3).
+    res.status(422).json({ error: 'unsupported_document_type' })
+    return
+  }
 
   // Wire contract: the frontend sends the label as `label`. Accept the legacy
   // `name` as a fallback so older clients keep working.
@@ -183,6 +196,12 @@ export async function getVersionStateHandler(req: Request, res: Response): Promi
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
   const kind = contentKindFromDocType(guard.meta.doc_type)
+  if (kind === 'ppt') {
+    // html_ppt has no Yjs version state to decode here (§1.3) — reject rather
+    // than feed a BentoDoc blob to the ProseMirror/Excalidraw decoders.
+    res.status(422).json({ error: 'unsupported_document_type' })
+    return
+  }
 
   const versionId = parseVersionId(req.params.versionId)
   if (versionId === null) {
@@ -271,6 +290,10 @@ versionsRouter.patch('/:docId/versions/:versionId', renameVersionHandler)
 export async function renameVersionHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
   if (!guard) return
+  if (contentKindFromDocType(guard.meta.doc_type) === 'ppt') {
+    res.status(422).json({ error: 'unsupported_document_type' })
+    return
+  }
 
   const versionId = parseVersionId(req.params.versionId)
   if (versionId === null) {
@@ -301,6 +324,10 @@ versionsRouter.delete('/:docId/versions/:versionId', deleteVersionHandler)
 export async function deleteVersionHandler(req: Request, res: Response): Promise<void> {
   const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
   if (!guard) return
+  if (contentKindFromDocType(guard.meta.doc_type) === 'ppt') {
+    res.status(422).json({ error: 'unsupported_document_type' })
+    return
+  }
 
   const versionId = parseVersionId(req.params.versionId)
   if (versionId === null) {
@@ -326,6 +353,12 @@ export async function restoreVersionHandler(req: Request, res: Response): Promis
   const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
   if (!guard) return
   const kind = contentKindFromDocType(guard.meta.doc_type)
+  if (kind === 'ppt') {
+    // html_ppt restore goes through the PPT `ppt_version` path (§8), never the
+    // Yjs forward-reconcile here — reject before touching the live Yjs doc.
+    res.status(422).json({ error: 'unsupported_document_type' })
+    return
+  }
 
   const versionId = parseVersionId(req.params.versionId)
   if (versionId === null) {

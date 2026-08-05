@@ -40,6 +40,9 @@ describe('isSearchIndexedDoc — which docs get enqueued', () => {
   it('accepts html (5-seg) keys — body resolved from octo-docs-html S3 by the indexer', () => {
     expect(isSearchIndexedDoc('octo:sp1:fol1:html:doc2')).toBe(true)
   })
+  it('accepts ppt (5-seg) keys — published deck HTML resolved from S3 like html', () => {
+    expect(isSearchIndexedDoc('octo:sp1:fol1:ppt:deck1')).toBe(true)
+  })
   it('accepts whiteboards (board, :wb: key — has an extractable Yjs body)', () => {
     expect(isSearchIndexedDoc('octo:sp1:fol1:wb:board1')).toBe(true)
   })

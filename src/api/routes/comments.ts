@@ -31,7 +31,7 @@ import {
 } from '../../collab/anchorResolve.js'
 import { notifyDocMentioned } from '../services/docsNotify.js'
 import type { BlockPath } from '../../collab/docBodyEdit.js'
-import { isDocType } from '../../db/docType.js'
+import { isDocType, HTML_PPT_DOC_TYPE } from '../../db/docType.js'
 import { validateExplicitCommentAnchors } from '../services/commentAnchors.js'
 import { publishCommentMutation } from '../services/commentEvents.js'
 
@@ -282,6 +282,15 @@ export async function createCommentHandler(req: Request, res: Response): Promise
     // other document types retain their existing opaque formats and reject the
     // board namespace.
     if (!isDocType(guard.meta.doc_type)) {
+      res.status(409).json({ error: 'unsupported_doc_type' })
+      return
+    }
+    // html_ppt (Bento slide-deck) is NOT served by this legacy comment surface —
+    // deck comments get their own /api/v1/ppt endpoints in R2. Adding html_ppt to
+    // DOC_TYPES widened the isDocType() gate above (it used to reject an html_ppt
+    // row as unsupported); reject it explicitly so a deck cannot store opaque
+    // anchors here and end up with two comment surfaces.
+    if (guard.meta.doc_type === HTML_PPT_DOC_TYPE) {
       res.status(409).json({ error: 'unsupported_doc_type' })
       return
     }

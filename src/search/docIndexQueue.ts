@@ -50,15 +50,16 @@ export type DocIndexKind = 'body'
 /**
  * Whether a documentName has a searchable body worth enqueuing. Indexed this期:
  * 'document' (doc / sheet), 'whiteboard' (board, `:wb:` key / doc_type='board'),
- * and 'html' — doc/sheet/board carry a Yjs body the consumer extracts;
- * html has no Yjs body but the consumer reads the published `v<N>/index.html`
- * from S3 (via octo-docs-html) and extracts plain text.
+ * 'html', and 'ppt' (html_ppt, `:ppt:` key) — doc/sheet/board carry a Yjs body
+ * the consumer extracts; html and ppt have no Yjs body but the consumer reads the
+ * published `v<N>/index.html` from S3 and extracts plain text (a PPT publishes
+ * rendered HTML the same way an html doc does).
  * Parse failures => not indexed (best-effort gate, never throws).
  */
 export function isSearchIndexedDoc(documentName: string): boolean {
   try {
     const kind = parseDocumentName(documentName).kind
-    return kind === 'document' || kind === 'whiteboard' || kind === 'html'
+    return kind === 'document' || kind === 'whiteboard' || kind === 'html' || kind === 'ppt'
   } catch {
     return false
   }

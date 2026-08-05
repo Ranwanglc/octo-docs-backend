@@ -23,6 +23,8 @@ const DOC_ID = 'd_abc123'
 const DOC_KEY = `octo:${SPACE}:${FOLDER}:${DOC_ID}`
 const HTML_DOC_ID = 'd_html789'
 const HTML_KEY = `octo:${SPACE}:${FOLDER}:html:${HTML_DOC_ID}`
+const PPT_DOC_ID = 'd_ppt789'
+const PPT_KEY = `octo:${SPACE}:${FOLDER}:ppt:${PPT_DOC_ID}`
 
 const boardMeta = (ownerId: string) =>
   ({
@@ -60,6 +62,18 @@ const htmlMeta = (ownerId: string) =>
     doc_type: 'html',
     status: 1,
     permission_epoch: 7,
+  }) as never
+
+const pptMeta = (ownerId: string) =>
+  ({
+    doc_id: PPT_DOC_ID,
+    document_name: PPT_KEY,
+    owner_id: ownerId,
+    space_id: SPACE,
+    folder_id: FOLDER,
+    doc_type: 'html_ppt',
+    status: 1,
+    permission_epoch: 9,
   }) as never
 
 /** Inject a stub identity that maps any non-empty token to a fixed uid. */
@@ -288,5 +302,47 @@ describe('issueCollabToken — HTML has no collaboration channel', () => {
     if (!out.ok) return
     expect(out.result.role).toBe('admin')
     expect(verifyCollabToken(out.result.token).role).toBe('admin')
+  })
+})
+
+describe('issueCollabToken — html_ppt uses the Bento relay, not Hocuspocus', () => {
+  beforeEach(() => {
+    vi.mocked(docMetaRepo.getByDocId).mockReset()
+    vi.mocked(docMetaRepo.getByDocumentName).mockReset()
+    vi.mocked(docMemberRepo.getRole).mockReset()
+  })
+
+  it.each([
+    ['owner', 'ppt_owner', undefined],
+    ['admin', 'ppt_admin', 'admin'],
+    ['writer', 'ppt_writer', 'writer'],
+    ['commenter', 'ppt_commenter', 'commenter'],
+    ['reader', 'ppt_reader', 'reader'],
+    ['non-member', 'ppt_stranger', undefined],
+  ] as const)('rejects an html_ppt %s with 422 before role resolution', async (_label, uid, memberRole) => {
+    asUser(uid)
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(
+      pptMeta(uid === 'ppt_owner' ? uid : 'someone_else'),
+    )
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue(memberRole)
+
+    const out = await issueCollabToken(`octo_session_${uid}`, PPT_KEY)
+
+    expect(out).toEqual({ ok: false, status: 422, error: 'unsupported_document_type' })
+    expect(docMetaRepo.getByDocId).not.toHaveBeenCalled()
+    expect(docMemberRepo.getRole).not.toHaveBeenCalled()
+  })
+
+  it('a `:ppt:` key that resolves to a non-html_ppt row is 404 (cross-type guard now wired, Spec #2)', async () => {
+    // The shared isDocTypeConsistentWithName guard is now called here: a corrupt
+    // :ppt: key / doc_type='doc' pairing resolves to "no such document" (404)
+    // before role resolution, closing the hole where such a pairing could reach
+    // the token mint. Not producible by any current mint path, but the one site
+    // that could serve it is now closed.
+    asUser('ppt_owner')
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue({ ...pptMeta('ppt_owner'), doc_type: 'doc' } as never)
+    const out = await issueCollabToken('octo_session_ppt_owner', PPT_KEY)
+    expect(out).toEqual({ ok: false, status: 404, error: 'not_found' })
+    expect(docMemberRepo.getRole).not.toHaveBeenCalled()
   })
 })
