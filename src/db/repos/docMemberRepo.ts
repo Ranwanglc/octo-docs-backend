@@ -139,4 +139,22 @@ export const docMemberRepo = {
       [params.docId, params.uid, params.roleNum, params.grantedBy, params.inviteToken],
     )
   },
+
+  /**
+   * Transaction-scoped twin of {@link upsertDirect}: direct-grant a member role
+   * on the tx connection so it participates in the caller's atomic create (PPT
+   * human create grants the owner admin in the same transaction as the doc_meta
+   * insert, so a partial failure rolls both back — no orphan membership).
+   */
+  async upsertDirectTx(
+    tx: Tx,
+    params: { docId: string; uid: string; roleNum: number; grantedBy: string },
+  ): Promise<void> {
+    await tx.query(
+      `INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
+       VALUES (?, ?, ?, ?, ${SOURCE_DIRECT}, '')
+       ON DUPLICATE KEY UPDATE role = VALUES(role), granted_by = VALUES(granted_by)`,
+      [params.docId, params.uid, params.roleNum, params.grantedBy],
+    )
+  },
 }

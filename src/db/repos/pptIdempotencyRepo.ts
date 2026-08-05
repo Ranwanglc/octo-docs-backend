@@ -13,16 +13,19 @@
  * same key simply mints their OWN deck, and the first user's replay still returns
  * their original response byte-for-byte.
  *
- * Two-phase write to avoid ever creating an orphaned document on a concurrent
- * same-key race:
- *   1. {@link reserve} claims the key with a placeholder row BEFORE the caller
+ * Two-phase write, executed INSIDE the create transaction so the whole thing is
+ * atomic (reserve + doc writes + complete all commit together, or all roll back):
+ *   1. {@link reserveTx} claims the key with a placeholder row BEFORE the caller
  *      creates anything. The unique key makes exactly one concurrent request the
- *      winner; the losers get `{ reserved: false }` and never create a doc.
- *   2. {@link complete} fills the placeholder with the real response once the
- *      side effect has succeeded.
- * A completed record (response_status > 0) is what a later replay reads.
+ *      winner; the losers get `{ reserved: false }` and never create a doc. A
+ *      request that dies mid-transaction rolls the placeholder back, so the key
+ *      is never permanently stranded (no stale "in progress" wedge).
+ *   2. {@link completeTx} fills the placeholder with the real response as the
+ *      last write in the same transaction.
+ * A completed record (response_status > 0) is what a later replay reads via the
+ * non-transactional {@link get} (committed data only).
  */
-import { query } from '../pool.js'
+import { query, type Tx } from '../pool.js'
 
 /** Operation namespaces that share the one idempotency table. */
 export const PPT_IDEMPOTENCY_SCOPE_CREATE = 'create'
@@ -87,13 +90,15 @@ export const pptIdempotencyRepo = {
   },
 
   /**
-   * Claim the key with a placeholder row (status 0) recording the request hash.
-   * Returns `{ reserved: true }` when this caller won the key and may proceed to
-   * create the resource, or `{ reserved: false }` when a concurrent request
-   * already claimed it (the caller then re-reads via {@link get} to replay or
-   * conflict — WITHOUT creating a duplicate resource).
+   * Claim the key with a placeholder row (status 0) recording the request hash,
+   * on the tx connection. Returns `{ reserved: true }` when this caller won the
+   * key and may proceed to create the resource, or `{ reserved: false }` when a
+   * concurrent/prior request already claimed it (the caller then aborts the
+   * transaction and re-reads via {@link get} to replay or conflict — WITHOUT
+   * creating a duplicate resource).
    */
-  async reserve(
+  async reserveTx(
+    tx: Tx,
     spaceId: string,
     scope: string,
     uid: string,
@@ -101,7 +106,7 @@ export const pptIdempotencyRepo = {
     requestHash: string,
   ): Promise<{ reserved: boolean }> {
     try {
-      await query(
+      await tx.query(
         `INSERT INTO ppt_idempotency
            (space_id, scope, uid, idempotency_key, request_hash, response_status, response_body, doc_id)
          VALUES (?, ?, ?, ?, ?, 0, NULL, NULL)`,
@@ -114,8 +119,12 @@ export const pptIdempotencyRepo = {
     }
   },
 
-  /** Fill a reserved placeholder with the final response once the side effect committed. */
-  async complete(
+  /**
+   * Fill a reserved placeholder with the final response, on the tx connection, as
+   * the last write in the create transaction (commits atomically with the doc).
+   */
+  async completeTx(
+    tx: Tx,
     spaceId: string,
     scope: string,
     uid: string,
@@ -124,7 +133,7 @@ export const pptIdempotencyRepo = {
     responseData: unknown,
     docId: string | null,
   ): Promise<void> {
-    await query(
+    await tx.query(
       `UPDATE ppt_idempotency
           SET response_status = ?, response_body = ?, doc_id = ?
         WHERE space_id = ? AND scope = ? AND uid = ? AND idempotency_key = ?`,

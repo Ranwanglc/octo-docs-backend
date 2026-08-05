@@ -24,6 +24,7 @@ import {
   pptIdempotencyRepo,
   PPT_IDEMPOTENCY_SCOPE_CREATE,
 } from '../../db/repos/pptIdempotencyRepo.js'
+import { transaction } from '../../db/pool.js'
 import { hashCanonicalPayload } from '../../ppt/idempotency.js'
 import { buildPptDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { HTML_PPT_DOC_TYPE } from '../../db/docType.js'
@@ -51,6 +52,36 @@ const FORBIDDEN_BODY_FIELDS = ['ownerId', 'spaceId', 'mountType', 'octoDocSlug',
 
 function vErr(message: string, details?: unknown): PptApiError {
   return new PptApiError('VALIDATION_ERROR', message, details === undefined ? {} : { details })
+}
+
+/** Enveloped `data` payload of a successful create (also the replayed body). */
+interface PptCreateResponse {
+  docId: string
+  documentName: string
+  title: string
+  spaceId: string
+  folderId: string
+  ownerId: string
+  docType: string
+  role: 'admin'
+  templateId: string
+  draftRevision: number
+  snapshotVersion: number
+  editorUrl: string
+  shareUrl: string
+  createdAt?: Date
+}
+
+/**
+ * Internal sentinel: a concurrent request already reserved this idempotency key,
+ * so the current transaction must abort (rolling back its own placeholder attempt)
+ * and fall through to a committed re-read. Never leaves the module.
+ */
+class KeyReservedElsewhereError extends Error {
+  constructor() {
+    super('idempotency key reserved by a concurrent request')
+    this.name = 'KeyReservedElsewhereError'
+  }
 }
 
 /** POST /docs — human create from `{ title, folderId?, templateId }`. */
@@ -92,8 +123,11 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
   }
   const templateId = templateIdRaw as string
 
-  // 5. Folder: optional; default reserved folder. Validate the segment early by
-  //    building the documentName (buildPptDocumentName rejects illegal segments).
+  // 5. Folder: optional; default reserved folder. Building the documentName here
+  //    validates the space + folder segments. Attribute a rejected segment to the
+  //    correct field: the space comes from the X-Space-Id header, the folder from
+  //    the body (the docId segment is server-minted and always valid), so a
+  //    client is never misled about which input was bad.
   const folderRaw = body.folderId
   const folder = typeof folderRaw === 'string' && folderRaw !== '' ? folderRaw : DEFAULT_FOLDER
   const docId = newDocId()
@@ -101,7 +135,11 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
   try {
     documentName = buildPptDocumentName(spaceId, folder, docId)
   } catch (err) {
-    if (err instanceof DocumentNameError) throw vErr('invalid folderId segment', { field: 'folderId' })
+    if (err instanceof DocumentNameError) {
+      // buildPptDocumentName's message names the offending segment (space|folder|doc).
+      if (/\bspace\b/.test(err.message)) throw vErr('invalid X-Space-Id segment', { field: 'X-Space-Id' })
+      throw vErr('invalid folderId segment', { field: 'folderId' })
+    }
     throw err
   }
 
@@ -110,12 +148,12 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
   // payload replays; same key + different payload conflicts.
   const requestHash = hashCanonicalPayload({ title, folderId: folder, templateId })
 
-  // Replay/conflict against a prior record for this (space, create, uid, key).
-  // The idempotency row is scoped by the authenticated `uid`: the created deck is
-  // owned by / grants admin to this caller and the stored response carries that
-  // identity, so a DIFFERENT user reusing the same key must NOT replay this
-  // caller's response (cross-user leak). Per-user scoping means another user
-  // reusing the key mints their own deck instead.
+  // Replay/conflict against a prior COMMITTED record for this (space, create, uid,
+  // key). The idempotency row is scoped by the authenticated `uid`: the created
+  // deck is owned by / grants admin to this caller and the stored response carries
+  // that identity, so a DIFFERENT user reusing the same key must NOT replay this
+  // caller's response (cross-user leak). Read outside the transaction — only
+  // committed rows are visible here.
   const prior = await pptIdempotencyRepo.get(spaceId, PPT_IDEMPOTENCY_SCOPE_CREATE, uid, idempotencyKey)
   if (prior) {
     if (prior.requestHash !== requestHash) {
@@ -123,83 +161,105 @@ export async function createPptDocHandler(req: Request, res: Response): Promise<
         details: { idempotencyKey },
       })
     }
-    if (prior.completed) {
-      sendPptData(res, prior.responseData, prior.responseStatus)
-      return
-    }
-    // A concurrent request holds the key but has not finished. Do not create a
-    // duplicate; ask the client to retry the (in-flight, same-payload) create.
-    throw new PptApiError('CONFLICT', 'an identical create is in progress; retry', {
-      details: { idempotencyKey },
-      hint: 'retry',
-    })
+    // A committed row is always complete (reserve+complete commit together), so
+    // this replays the original response.
+    sendPptData(res, prior.responseData, prior.responseStatus)
+    return
   }
 
-  // Claim the key BEFORE creating anything, so a same-key race never yields two
-  // decks (the loser gets reserved:false and re-reads to replay/conflict).
-  const { reserved } = await pptIdempotencyRepo.reserve(
-    spaceId,
-    PPT_IDEMPOTENCY_SCOPE_CREATE,
-    uid,
-    idempotencyKey,
-    requestHash,
-  )
-  if (!reserved) {
-    const winner = await pptIdempotencyRepo.get(spaceId, PPT_IDEMPOTENCY_SCOPE_CREATE, uid, idempotencyKey)
-    if (winner && winner.requestHash !== requestHash) {
-      throw new PptApiError('CONFLICT', 'Idempotency-Key was reused with a different payload', {
-        details: { idempotencyKey },
-      })
-    }
-    if (winner && winner.completed) {
-      sendPptData(res, winner.responseData, winner.responseStatus)
-      return
-    }
-    throw new PptApiError('CONFLICT', 'an identical create is in progress; retry', {
-      details: { idempotencyKey },
-      hint: 'retry',
-    })
-  }
-
-  // Materialize the deck: strip `template`, mint a fresh Bento docId, drop collab.
+  // Materialize the deck (pure, no I/O): strip `template`, mint a fresh Bento
+  // docId, drop collab. Done before the transaction so no work is wasted holding
+  // a DB connection.
   const deck = instantiateTemplate(template, new Date().toISOString())
 
-  // Persist the doc_meta row (html_ppt, slug NULL, PPT documentName), the
-  // creator's admin membership, and the create-time PPT state + starter deck.
-  await docMetaRepo.create({
-    docId,
-    documentName,
-    title,
-    ownerId: uid,
-    spaceId,
-    folderId: folder,
-    docType: HTML_PPT_DOC_TYPE,
-    createdBy: uid,
-  })
-  await docMemberRepo.upsertDirect({ docId, uid, roleNum: ROLE_ADMIN, grantedBy: uid })
-  await pptDocStateRepo.create({ docId, templateId, draftDoc: deck })
+  // ATOMIC create. Reserve the idempotency key, write doc_meta + owner membership
+  // + PPT state, and complete the idempotency record in ONE transaction. If any
+  // step throws, the whole transaction rolls back: no orphan doc_meta/member/state
+  // row is left behind, and the reserve placeholder is rolled back too — so the
+  // key is NEVER permanently stranded and a later retry with the same key can
+  // still succeed (no duplicate deck).
+  let data: PptCreateResponse
+  try {
+    data = await transaction(async (tx) => {
+      const { reserved } = await pptIdempotencyRepo.reserveTx(
+        tx,
+        spaceId,
+        PPT_IDEMPOTENCY_SCOPE_CREATE,
+        uid,
+        idempotencyKey,
+        requestHash,
+      )
+      // A concurrent request already claimed this key. Abort (rolling back this
+      // transaction's placeholder attempt) and fall through to a committed re-read.
+      if (!reserved) throw new KeyReservedElsewhereError()
 
-  const meta = await docMetaRepo.getByDocId(docId)
+      await docMetaRepo.createTx(tx, {
+        docId,
+        documentName,
+        title,
+        ownerId: uid,
+        spaceId,
+        folderId: folder,
+        docType: HTML_PPT_DOC_TYPE,
+        createdBy: uid,
+      })
+      await docMemberRepo.upsertDirectTx(tx, { docId, uid, roleNum: ROLE_ADMIN, grantedBy: uid })
+      await pptDocStateRepo.createTx(tx, { docId, templateId, draftDoc: deck })
 
-  const data = {
-    docId,
-    documentName,
-    title,
-    spaceId,
-    folderId: folder,
-    ownerId: uid,
-    docType: HTML_PPT_DOC_TYPE,
-    role: 'admin' as const,
-    templateId,
-    draftRevision: 0,
-    snapshotVersion: 0,
-    editorUrl: buildPptEditorUrl(config.webOrigin, docId, spaceId),
-    shareUrl: buildDocShareUrl(config.webOrigin, docId, spaceId),
-    ...(meta?.created_at ? { createdAt: meta.created_at } : {}),
+      const meta = await docMetaRepo.getByDocIdTx(tx, docId)
+      const payload: PptCreateResponse = {
+        docId,
+        documentName,
+        title,
+        spaceId,
+        folderId: folder,
+        ownerId: uid,
+        docType: HTML_PPT_DOC_TYPE,
+        role: 'admin',
+        templateId,
+        draftRevision: 0,
+        snapshotVersion: 0,
+        editorUrl: buildPptEditorUrl(config.webOrigin, docId, spaceId),
+        shareUrl: buildDocShareUrl(config.webOrigin, docId, spaceId),
+        ...(meta?.created_at ? { createdAt: meta.created_at } : {}),
+      }
+      // Record the response as the LAST write so a header replay returns it
+      // byte-for-byte. It commits atomically with the doc writes above.
+      await pptIdempotencyRepo.completeTx(
+        tx,
+        spaceId,
+        PPT_IDEMPOTENCY_SCOPE_CREATE,
+        uid,
+        idempotencyKey,
+        201,
+        payload,
+        docId,
+      )
+      return payload
+    })
+  } catch (err) {
+    if (err instanceof KeyReservedElsewhereError) {
+      // The winner has committed (or is a prior create). Re-read committed data
+      // and replay/conflict — WITHOUT creating a duplicate deck.
+      const winner = await pptIdempotencyRepo.get(spaceId, PPT_IDEMPOTENCY_SCOPE_CREATE, uid, idempotencyKey)
+      if (winner && winner.requestHash !== requestHash) {
+        throw new PptApiError('CONFLICT', 'Idempotency-Key was reused with a different payload', {
+          details: { idempotencyKey },
+        })
+      }
+      if (winner && winner.completed) {
+        sendPptData(res, winner.responseData, winner.responseStatus)
+        return
+      }
+      // The winner's transaction has not committed yet (rare, transient). Ask the
+      // client to retry; nothing was created here.
+      throw new PptApiError('CONFLICT', 'an identical create is in progress; retry', {
+        details: { idempotencyKey },
+        hint: 'retry',
+      })
+    }
+    throw err
   }
-
-  // Record the response so a header replay returns it byte-for-byte (per-user).
-  await pptIdempotencyRepo.complete(spaceId, PPT_IDEMPOTENCY_SCOPE_CREATE, uid, idempotencyKey, 201, data, docId)
 
   sendPptData(res, data, 201)
 }

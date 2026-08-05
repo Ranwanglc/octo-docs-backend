@@ -10,7 +10,7 @@
  * baseline to read and advance. Those rounds add their own tables/columns; this
  * table is the create-time home for the deck and its scalar state.
  */
-import { query } from '../pool.js'
+import { query, type Tx } from '../pool.js'
 import { BENTO_FORMAT_VERSION, BENTO_SYNC_V, type BentoDoc } from '../../ppt/bentoDoc.js'
 
 export interface PptDocState {
@@ -60,6 +60,27 @@ export const pptDocStateRepo = {
    */
   async create(input: CreatePptDocStateInput): Promise<void> {
     await query(
+      `INSERT INTO ppt_doc_state
+         (doc_id, template_id, draft_revision, snapshot_version, published_version_seq,
+          ppt_format_version, bento_sync_pv, draft_doc)
+       VALUES (?, ?, 0, 0, NULL, ?, ?, ?)`,
+      [
+        input.docId,
+        input.templateId,
+        BENTO_FORMAT_VERSION,
+        BENTO_SYNC_V,
+        JSON.stringify(input.draftDoc),
+      ],
+    )
+  },
+
+  /**
+   * Transaction-scoped twin of {@link create}: insert the PPT state row + starter
+   * deck on the tx connection so it participates in the caller's atomic create
+   * (rolls back with doc_meta/membership on a partial failure).
+   */
+  async createTx(tx: Tx, input: CreatePptDocStateInput): Promise<void> {
+    await tx.query(
       `INSERT INTO ppt_doc_state
          (doc_id, template_id, draft_revision, snapshot_version, published_version_seq,
           ppt_format_version, bento_sync_pv, draft_doc)
