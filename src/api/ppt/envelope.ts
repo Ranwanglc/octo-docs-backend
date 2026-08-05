@@ -25,6 +25,7 @@
  * bare-JSON error handler.
  */
 import { Router, json, type Request, type Response, type NextFunction } from 'express'
+import { createPptDocsRouter } from './docs.js'
 
 /**
  * Fixed HTTP-status-to-code map. The first ten codes are C's enum verbatim; the
@@ -196,7 +197,11 @@ export function createPptRouter(): Router {
   // VALIDATION_ERROR envelope instead of the global bare-JSON `invalid_body`.
   router.use(json({ limit: '1mb' }))
 
-  // R2+ endpoint routers mount here.
+  // R2+ endpoint routers mount here (before the terminal 404). Body is already
+  // parsed by the router-scoped `json()` above, so these handlers read req.body
+  // directly and a malformed body is enveloped by pptErrorHandler.
+  // R2-B1: human create — POST /api/v1/ppt/docs.
+  router.use(createPptDocsRouter())
 
   // Terminal 404: any PPT path without a matching route returns the enveloped
   // NOT_FOUND rather than falling through to the app's bare-JSON handler.

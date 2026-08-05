@@ -104,6 +104,37 @@ export const docMetaRepo = {
     )
   },
 
+  /**
+   * Transaction-scoped twin of {@link create}: insert the doc_meta row on the tx
+   * connection so it participates in the caller's atomic create (PPT human create
+   * inserts doc_meta, membership, and PPT state in ONE transaction, so a partial
+   * failure rolls all of them back — no orphan doc_meta row).
+   */
+  async createTx(tx: Tx, input: CreateDocInput): Promise<void> {
+    await tx.query(
+      `INSERT INTO doc_meta
+         (doc_id, document_name, title, owner_id, space_id, folder_id, doc_type, octo_doc_slug, status, permission_epoch, created_by, updated_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
+      [
+        input.docId,
+        input.documentName,
+        input.title,
+        input.ownerId,
+        input.spaceId,
+        input.folderId,
+        input.docType,
+        docTypeUsesOctoDocSlug(input.docType) ? (input.octoDocSlug ?? null) : null,
+        input.createdBy,
+      ],
+    )
+  },
+
+  /** Transaction-scoped twin of {@link getByDocId} (reads own uncommitted write). */
+  async getByDocIdTx(tx: Tx, docId: string): Promise<DocMeta | null> {
+    const rows = await tx.query<DocMeta>('SELECT * FROM doc_meta WHERE doc_id = ? LIMIT 1', [docId])
+    return rows[0] ?? null
+  },
+
   async upsertHtmlByOctoDocSlug(input: CreateDocInput & { octoDocSlug: string }): Promise<{ meta: DocMeta; created: boolean }> {
     // NOTE (R1 scope): the `doc_type = 'html'` predicates in this method and in
     // getByOctoDocSlug are INTENTIONALLY html-only. PPT bot register (R2-B2)
