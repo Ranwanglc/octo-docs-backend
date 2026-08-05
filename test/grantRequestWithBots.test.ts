@@ -7,12 +7,17 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 vi.mock('../src/api/services/grantForward.js', () => ({
   grantForwardAccess: vi.fn(async () => ({ finalRole: 'writer', changed: true })),
 }))
+vi.mock('../src/api/services/botGrantAudit.js', () => ({
+  logBotGrantFailure: vi.fn(),
+}))
 
 import { grantRequestWithBots } from '../src/api/services/grantRequestWithBots.js'
 import { grantForwardAccess } from '../src/api/services/grantForward.js'
+import { logBotGrantFailure } from '../src/api/services/botGrantAudit.js'
 
 const base = {
   docId: 'd_1',
+  requestId: 'req_1',
   documentName: 'dn-1',
   uid: 'u_req',
   roleNum: 2,
@@ -42,6 +47,12 @@ describe('grantRequestWithBots', () => {
     const out = await grantRequestWithBots({ ...base, botUids: ['bot_a', 'bot_bad', 'bot_c'] })
     expect(out.botsSucceeded).toEqual(['bot_a', 'bot_c'])
     expect(out.botsFailed).toEqual(['bot_bad'])
+    expect(vi.mocked(logBotGrantFailure)).toHaveBeenCalledWith({
+      docId: 'd_1',
+      requestId: 'req_1',
+      botUid: 'bot_bad',
+      error: expect.objectContaining({ message: 'boom' }),
+    })
   })
 
   it('a failing REQUESTER grant propagates (primary op, not swallowed)', async () => {

@@ -28,6 +28,7 @@ import {
 import { docCardActionReceiptRepo } from '../../db/repos/docCardActionReceiptRepo.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { grantRequestWithBots } from '../services/grantRequestWithBots.js'
+import { logBotGrantSummary } from '../services/botGrantAudit.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
 import { buildDecisionDisplay, buildDecisionDisplayAt } from '../services/decisionDisplay.js'
 import { isAccessRequestRole, roleFromNumber } from '../../permission/role.js'
@@ -295,14 +296,18 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     // grant is gated on transitioned===true so bots are granted exactly once
     // (a redelivery/replay of the same event falls into the report-only branch
     // above and grants nothing, so no bot is ever double-granted).
-    await grantRequestWithBots({
+    const result = await grantRequestWithBots({
       docId,
+      requestId,
       documentName: meta.document_name,
       uid: request.uid,
       roleNum: Number(request.requested_role),
       grantedBy: req.operator_uid,
       botUids,
     })
+    if (botUids.length > 0) {
+      logBotGrantSummary({ source: 'card_callback', docId, requestId, result })
+    }
   }
 
   // Sibling-card sync (task docs-access-decision-card-sync): drive every OTHER

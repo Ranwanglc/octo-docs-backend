@@ -11,9 +11,11 @@
  * is empty and only the human is granted (legacy single-grant behavior).
  */
 import { grantForwardAccess } from './grantForward.js'
+import { logBotGrantFailure } from './botGrantAudit.js'
 
 export interface GrantWithBotsParams {
   docId: string
+  requestId: string
   documentName: string
   /** The human requester's uid. */
   uid: string
@@ -60,20 +62,16 @@ export async function grantRequestWithBots(
         grantedBy: params.grantedBy,
       })
       botsSucceeded.push(botUid)
-    } catch {
+    } catch (error) {
       botsFailed.push(botUid)
+      logBotGrantFailure({
+        docId: params.docId,
+        requestId: params.requestId,
+        botUid,
+        error,
+      })
     }
   }
 
   return { requesterRole: requester.finalRole, botsSucceeded, botsFailed }
-}
-
-/**
- * One-line human-visible summary of a bot-grant outcome, surfaced on the
- * decision card so a partial failure is SEEN, not just returned. Only called
- * when the request carried bots. Kept minimal: "Bot 授权:成功 N,失败 M(uid,…)".
- */
-export function botGrantSummary(succeeded: string[], failed: string[]): string {
-  const base = `Bot 授权:成功 ${succeeded.length},失败 ${failed.length}`
-  return failed.length > 0 ? `${base}(${failed.join(', ')})` : base
 }

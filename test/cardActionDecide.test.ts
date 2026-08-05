@@ -44,6 +44,10 @@ vi.mock('../src/permission/resolveRole.js', () => ({ resolveRole: vi.fn(async ()
 vi.mock('../src/api/services/grantForward.js', () => ({
   grantForwardAccess: vi.fn(async () => ({ finalRole: 'reader', changed: true })),
 }))
+vi.mock('../src/api/services/botGrantAudit.js', () => ({
+  logBotGrantFailure: vi.fn(),
+  logBotGrantSummary: vi.fn(),
+}))
 // getUser backs buildDecisionDisplay's operator-name resolution. Default returns
 // undefined (name omitted); individual tests set an implementation to assert the
 // resolved operator identity.
@@ -56,6 +60,7 @@ import {
   cardActionDecideHandler,
   CARD_ACTION_DECIDE_PATH,
 } from '../src/api/routes/cardActionDecide.js'
+import { logBotGrantFailure, logBotGrantSummary } from '../src/api/services/botGrantAudit.js'
 
 describe('callback response contract guard', () => {
   it('rejects unknown top-level keys and display values over 500 runes', () => {
@@ -633,6 +638,17 @@ describe('cardActionDecideHandler (carried Space-bot snapshot grants)', () => {
     const payload = res.payload as Record<string, unknown>
     expect(payload.disposition).toBe('applied')
     expect(Object.keys(payload).sort()).toEqual(['display', 'disposition', 'requester_uid', 'state'])
+    expect(payload).not.toHaveProperty('botGrantResult')
+    expect(payload).not.toHaveProperty('bot_summary')
+    expect(vi.mocked(logBotGrantFailure)).toHaveBeenCalledWith(expect.objectContaining({
+      docId: 'doc-1', requestId: 'req-1', botUid: 'bot_bad',
+    }))
+    expect(vi.mocked(logBotGrantSummary)).toHaveBeenCalledWith({
+      source: 'card_callback',
+      docId: 'doc-1',
+      requestId: 'req-1',
+      result: { requesterRole: 'writer', botsSucceeded: ['bot_ok'], botsFailed: ['bot_bad'] },
+    })
   })
 
   it('a lost decide() CAS (replay/duplicate) grants NO bot', async () => {

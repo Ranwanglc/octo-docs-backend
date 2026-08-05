@@ -28,6 +28,7 @@ import {
 import { requireDocRole, requireSameSpace } from '../guard.js'
 import { resolveRole } from '../../permission/resolveRole.js'
 import { grantRequestWithBots } from '../services/grantRequestWithBots.js'
+import { logBotGrantSummary } from '../services/botGrantAudit.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { parseRequestBotUids, BotUidsValidationError } from '../../util/botUids.js'
 import { notifyDocAccessRequested } from '../services/docsNotify.js'
@@ -240,6 +241,7 @@ accessRequestsRouter.post(
 
     const result = await grantRequestWithBots({
       docId: guard.meta.doc_id,
+      requestId: req.params.requestId!,
       documentName: guard.meta.document_name,
       uid: request.uid,
       roleNum: roleToNumber(grantRole),
@@ -249,6 +251,14 @@ accessRequestsRouter.post(
       botUids: request.bot_uids,
     })
     const hadBots = (request.bot_uids?.length ?? 0) > 0
+    if (hadBots) {
+      logBotGrantSummary({
+        source: 'rest',
+        docId: guard.meta.doc_id,
+        requestId: req.params.requestId!,
+        result,
+      })
+    }
     // Best-effort sibling-card sync. REST path has no card-callback finalizer, so
     // the decider (req.uid) holds a live card and is terminalized here too
     // (deciderCardHandledExternally omitted).

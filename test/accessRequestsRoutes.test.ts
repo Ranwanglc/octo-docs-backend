@@ -31,6 +31,10 @@ vi.mock('../src/permission/resolveRole.js', () => ({ resolveRole: vi.fn() }))
 vi.mock('../src/api/services/grantForward.js', () => ({
   grantForwardAccess: vi.fn(async () => ({ finalRole: 'reader', changed: true })),
 }))
+vi.mock('../src/api/services/botGrantAudit.js', () => ({
+  logBotGrantFailure: vi.fn(),
+  logBotGrantSummary: vi.fn(),
+}))
 vi.mock('../src/api/services/docsNotify.js', () => ({
   notifyDocAccessRequested: vi.fn(async () => 1),
 }))
@@ -51,6 +55,7 @@ import {
 } from '../src/db/repos/docAccessRequestRepo.js'
 import { resolveRole } from '../src/permission/resolveRole.js'
 import { grantForwardAccess } from '../src/api/services/grantForward.js'
+import { logBotGrantSummary } from '../src/api/services/botGrantAudit.js'
 import { notifyDocAccessRequested } from '../src/api/services/docsNotify.js'
 
 interface MockRes {
@@ -579,6 +584,16 @@ describe('POST /:docId/access-requests/:requestId/approve — carried Space-bot 
       },
     })
     expect(vi.mocked(docAccessRequestRepo.decide)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(logBotGrantSummary)).toHaveBeenCalledWith({
+      source: 'rest',
+      docId: 'd_1',
+      requestId: 'req_x',
+      result: {
+        requesterRole: 'writer',
+        botsSucceeded: ['bot_a', 'bot_c'],
+        botsFailed: ['bot_bad'],
+      },
+    })
   })
 
   it('already-high-role bot is not downgraded (grantForward skip) and counts as succeeded', async () => {
