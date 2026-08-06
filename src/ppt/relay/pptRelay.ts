@@ -93,6 +93,13 @@ interface Conn {
   docId: string
   documentName: string
   role: ResolvedRole
+  /**
+   * The permission epoch the cached `role` was resolved against. The role is
+   * authoritative ONLY at this epoch; once the live epoch moves past it the
+   * cached role is stale and must be re-resolved before it can authorize a
+   * mutation (see {@link guardMutation}).
+   */
+  roleEpoch: number
   name?: string
   /** Timestamps of recently persisted frames, for the sliding-window rate limit. */
   frameTimes: number[]
@@ -199,11 +206,37 @@ export class PptRelay {
       }
     }
     // Fail-closed: an unconfirmable epoch is a rejection, not a default.
+    let liveEpoch: number
     try {
-      await this.epochProvider(claims.documentName)
+      liveEpoch = await this.epochProvider(claims.documentName)
     } catch {
       socket.close(CLOSE_NOT_FOUND, 'document unavailable')
       return
+    }
+
+    // The ticket's `role`/`permission_epoch` are a SNAPSHOT taken at issuance.
+    // If the live epoch has advanced since, the user may have been downgraded or
+    // revoked between issuance and connect, so the ticket's cached role MUST NOT
+    // seed the connection's authority — otherwise a stale writer ticket could
+    // mutate simply by stamping the current epoch on its frames (PPT-EPOCH-001).
+    // Re-resolve the LIVE role server-side; if we cannot (no roleProvider), the
+    // stale ticket is rejected so the client re-mints a fresh one. A ticket at
+    // the current epoch is trusted as-is (its authority is still fresh).
+    let role: ResolvedRole = claims.role
+    if (claims.permission_epoch !== liveEpoch) {
+      if (!this.roleProvider) {
+        socket.close(CLOSE_UNAUTHORIZED, 'stale ticket epoch')
+        return
+      }
+      try {
+        role = await this.roleProvider(claims.uid, claims.docId)
+      } catch {
+        role = 'none'
+      }
+      if (role === 'none') {
+        socket.close(CLOSE_FORBIDDEN, 'access revoked')
+        return
+      }
     }
 
     const conn: Conn = {
@@ -211,7 +244,9 @@ export class PptRelay {
       uid: claims.uid,
       docId: claims.docId,
       documentName: claims.documentName,
-      role: claims.role,
+      role,
+      // The role above was validated/re-resolved against the live epoch.
+      roleEpoch: liveEpoch,
       name: claims.name,
       frameTimes: [],
     }
@@ -359,10 +394,40 @@ export class PptRelay {
       return 'stale-epoch'
     }
     if (frameEpoch !== live) return 'stale-epoch'
+    // The cached role is authoritative ONLY at the epoch it was resolved against.
+    // If the live epoch has advanced since (a downgrade/revocation not yet pushed
+    // via applyEpochBump), the cached role is stale and must NOT be honored just
+    // because the client stamped the current epoch on this frame. Re-resolve and
+    // apply DOWNGRADES only — an upgrade still requires a fresh ticket
+    // (PPT-EPOCH-003) — failing closed to `none` when re-resolution is impossible.
+    if (conn.roleEpoch !== live) {
+      await this.refreshRoleDownOnly(conn, live)
+    }
     // Only writer/admin may persist; a reader/commenter (or a downgraded socket
     // at the current epoch) is refused `forbidden-role`.
     if (!roleAtLeast(conn.role, 'writer')) return 'forbidden-role'
     return null
+  }
+
+  /**
+   * Re-resolve `conn.role` against the current `live` epoch, applying ONLY a
+   * downgrade (elevated authority needs a fresh ticket per PPT-EPOCH-003). Fails
+   * closed to `none` when no roleProvider is wired or the lookup throws, so a
+   * mutation can never ride a role that predates the live epoch. Stamps
+   * `roleEpoch = live` so a settled connection re-resolves at most once per epoch
+   * change rather than on every frame.
+   */
+  private async refreshRoleDownOnly(conn: Conn, live: number): Promise<void> {
+    let resolved: ResolvedRole = 'none'
+    if (this.roleProvider) {
+      try {
+        resolved = await this.roleProvider(conn.uid, conn.docId)
+      } catch {
+        resolved = 'none'
+      }
+    }
+    if (roleRank(resolved) < roleRank(conn.role)) conn.role = resolved
+    conn.roleEpoch = live
   }
 
   /** Sliding-window rate limit; returns retry delay ms when the frame is over. */
@@ -484,8 +549,10 @@ export class PptRelay {
   async applyEpochBump(documentName: string): Promise<void> {
     if (!this.roleProvider) return
     let newEpoch = 0
+    let epochOk = false
     try {
       newEpoch = await this.epochProvider(documentName)
+      epochOk = true
     } catch {
       /* fall through: still re-resolve roles; a lost epoch is handled per-frame */
     }
@@ -508,6 +575,11 @@ export class PptRelay {
           conn.role = role
           send(conn.socket, { ctl: 'role-changed', role, epoch: newEpoch })
         }
+        // Record that this connection's role now reflects the live epoch, so
+        // guardMutation does not re-resolve it again for the same epoch. Only
+        // stamp when we actually have the authoritative epoch — otherwise leave
+        // roleEpoch stale so the per-frame guard re-resolves later.
+        if (epochOk) conn.roleEpoch = newEpoch
       }
     }
   }

@@ -581,3 +581,96 @@ describe('PPT relay: permission epoch (PPT-EPOCH-001 / 002 / 003)', () => {
     expect(await h.store.currentSeq(DOC)).toBe(0)
   })
 })
+
+describe('PPT relay: stale-ticket epoch cutoff fails CLOSED (PPT-EPOCH-001 regression)', () => {
+  // A ticket carries the role/epoch snapshot from issuance. If the live epoch has
+  // moved on (downgrade / revocation) BEFORE the socket connects, the ticket's
+  // cached role must not seed write authority — the connection role is re-resolved
+  // server-side at connect and can never be refreshed by the epoch the client
+  // stamps on a frame.
+  it('(a) stale writer ticket + downgraded-to-reader: ops stamped with the CURRENT epoch is REFUSED', async () => {
+    const h = await setup()
+    // The user was a writer at epoch 0, then downgraded to reader at epoch 1.
+    h.setEpoch(1)
+    h.setRole('u_a', 'reader')
+    // Ticket was minted at epoch 0 with role=writer (the pre-downgrade snapshot).
+    const staleTicket = h.ticketFor({ uid: 'u_a', role: 'writer', epoch: 0 })
+    const c = await h.connect({ uid: 'u_a', role: 'writer', ticket: staleTicket })
+
+    // At connect the relay re-resolves the LIVE role: the socket is a reader now.
+    const { ready } = await helloReady(c)
+    expect(ready.role).toBe('reader')
+    expect(ready.epoch).toBe(1)
+
+    // The attack: stamp the CURRENT epoch (1) on the frame so the live-epoch check
+    // passes. It must STILL be refused forbidden-role — the stale writer role is
+    // gone — and nothing is persisted or broadcast.
+    c.send(OPS_FRAME(1, 'bypass', 1))
+    const refused = await c.recv()
+    expect(refused.ctl).toBe('refused')
+    expect(refused.code).toBe('forbidden-role')
+    expect(refused.retryable).toBe(false)
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+  })
+
+  it('(b) stale ticket for a revoked (none) user: the socket is closed 4403 at connect', async () => {
+    const h = await setup()
+    h.setEpoch(1)
+    h.setRole('u_b', 'none')
+    const staleTicket = h.ticketFor({ uid: 'u_b', role: 'writer', epoch: 0 })
+    const c = await h.connect({ uid: 'u_b', role: 'writer', ticket: staleTicket })
+    expect((await c.closed).code).toBe(4403)
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+  })
+
+  it('(c) positive control: a legitimately-still-writer connection at the current epoch works', async () => {
+    const h = await setup()
+    h.setEpoch(1)
+    h.setRole('u_c', 'writer')
+    // Fresh ticket minted at the current epoch (1): trusted authority.
+    const c = await h.connect({ uid: 'u_c', role: 'writer' })
+    const { ready } = await helloReady(c)
+    expect(ready.role).toBe('writer')
+    expect(ready.epoch).toBe(1)
+
+    c.send(OPS_FRAME(1, 'ok', 1))
+    const ack = await c.recv()
+    expect(ack.ctl).toBe('ack')
+    expect(ack.q).toBe(1)
+    expect(await h.store.currentSeq(DOC)).toBe(1)
+  })
+
+  it('a stale ticket whose user is STILL a writer re-resolves to writer and may mutate (no over-rejection)', async () => {
+    const h = await setup()
+    h.setEpoch(2)
+    h.setRole('u_d', 'writer') // still a writer at the live epoch
+    const staleTicket = h.ticketFor({ uid: 'u_d', role: 'writer', epoch: 0 })
+    const c = await h.connect({ uid: 'u_d', role: 'writer', ticket: staleTicket })
+    const { ready } = await helloReady(c)
+    expect(ready.role).toBe('writer')
+
+    c.send(OPS_FRAME(1, 'ok', 2))
+    const ack = await c.recv()
+    expect(ack.ctl).toBe('ack')
+    expect(ack.q).toBe(1)
+    expect(await h.store.currentSeq(DOC)).toBe(1)
+  })
+
+  it('per-frame guard: a downgrade after connect is enforced even without applyEpochBump', async () => {
+    const h = await setup()
+    // Connect as a legitimate writer at epoch 0 (fresh ticket).
+    const c = await h.connect({ uid: 'u_e', role: 'writer' })
+    await helloReady(c)
+
+    // Downgrade at the source and bump the epoch, but DO NOT push applyEpochBump —
+    // simulate the bump signal being missed. A frame stamped with the new live
+    // epoch must not ride the cached writer role.
+    h.setRole('u_e', 'reader')
+    h.setEpoch(1)
+    c.send(OPS_FRAME(1, 'lazy', 1))
+    const refused = await c.recv()
+    expect(refused.ctl).toBe('refused')
+    expect(refused.code).toBe('forbidden-role')
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+  })
+})
