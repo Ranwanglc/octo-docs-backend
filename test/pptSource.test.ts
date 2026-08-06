@@ -322,9 +322,9 @@ describe('PPT-SOURCE-004 cache policy', () => {
   beforeAll(async () => ({ base, close } = await listen(makeApp(provider))))
   afterAll(async () => close())
 
-  it('published bento => immutable-version cache + ETag', async () => {
+  it('published bento CONCRETE version => immutable-version cache + ETag', async () => {
     asRole('u_reader', 'reader')
-    const res = await get(base, 'd_ppt1', { mode: 'published', format: 'bento' })
+    const res = await get(base, 'd_ppt1', { mode: 'published', version: '3', format: 'bento' })
     expect(res.status).toBe(200)
     const cc = res.headers.get('cache-control') ?? ''
     expect(cc).toContain('immutable')
@@ -332,14 +332,48 @@ describe('PPT-SOURCE-004 cache policy', () => {
     expect(res.headers.get('etag')).toBe(`"${published.contentHash}"`)
   })
 
-  it('published html => text/html, NOT JSON, immutable cache', async () => {
+  it('published bento LATEST (explicit) => NOT immutable, revalidate via ETag', async () => {
+    // `latest` resolves to the newest published deck across publishes (R5), so
+    // the URL is MUTABLE — it must never carry `immutable`/long max-age or a
+    // browser would pin stale bytes. It stays content-addressed (ETag) so the
+    // client can revalidate conditionally.
     asRole('u_reader', 'reader')
-    const res = await get(base, 'd_ppt1', { mode: 'published', format: 'html' })
+    const res = await get(base, 'd_ppt1', { mode: 'published', version: 'latest', format: 'bento' })
+    expect(res.status).toBe(200)
+    const cc = res.headers.get('cache-control') ?? ''
+    expect(cc).not.toContain('immutable')
+    expect(cc).toContain('private')
+    expect(cc).toContain('no-cache')
+    expect(res.headers.get('etag')).toBe(`"${published.contentHash}"`)
+  })
+
+  it('published bento OMITTED version (defaults to latest) => NOT immutable', async () => {
+    asRole('u_reader', 'reader')
+    const res = await get(base, 'd_ppt1', { mode: 'published', format: 'bento' })
+    expect(res.status).toBe(200)
+    const cc = res.headers.get('cache-control') ?? ''
+    expect(cc).not.toContain('immutable')
+    expect(cc).toContain('private')
+    expect(cc).toContain('no-cache')
+    expect(res.headers.get('etag')).toBe(`"${published.contentHash}"`)
+  })
+
+  it('published html CONCRETE version => text/html, NOT JSON, immutable cache', async () => {
+    asRole('u_reader', 'reader')
+    const res = await get(base, 'd_ppt1', { mode: 'published', version: '3', format: 'html' })
     expect(res.status).toBe(200)
     expect(res.headers.get('content-type')).toContain('text/html')
     expect(res.headers.get('cache-control') ?? '').toContain('immutable')
     const text = await res.text()
     expect(text).toContain('<!doctype html>')
+  })
+
+  it('published html LATEST (omitted version) => text/html, NOT immutable', async () => {
+    asRole('u_reader', 'reader')
+    const res = await get(base, 'd_ppt1', { mode: 'published', format: 'html' })
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/html')
+    expect(res.headers.get('cache-control') ?? '').not.toContain('immutable')
   })
 
   it('published BOOTSTRAP is no-store (embeds short-lived signed URLs)', async () => {
@@ -353,6 +387,79 @@ describe('PPT-SOURCE-004 cache policy', () => {
     asRole('u_writer', 'writer')
     const res = await get(base, 'd_ppt1', { mode: 'draft', format: 'html' })
     expect(res.status).toBe(404) // draft has no rendered html in this fixture
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// Group C2 — Follow-up 2: an EXISTING unpublished HTML response is no-store.
+// ─────────────────────────────────────────────────────────────────────────
+describe('PPT-SOURCE-004 unpublished html cache (follow-up 2)', () => {
+  const html = '<!doctype html><html><body><h1>Working Draft</h1></body></html>'
+  const provider: PptSourceProvider = {
+    getDraft: async () => ({ deck: deck('Draft'), revision: 4, contentHash: hashBentoDeck(deck('Draft')), html, assets: [] }),
+    getLive: async () => ({ deck: deck('Live'), revision: 7, contentHash: hashBentoDeck(deck('Live')), html, assets: [] }),
+    getPublished: async () => null,
+  }
+  let base: string
+  let close: () => Promise<void>
+  beforeAll(async () => ({ base, close } = await listen(makeApp(provider))))
+  afterAll(async () => close())
+
+  it('draft html (present) => text/html + private, no-store', async () => {
+    asRole('u_writer', 'writer')
+    const res = await get(base, 'd_ppt1', { mode: 'draft', format: 'html' })
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/html')
+    expect(res.headers.get('cache-control')).toBe('private, no-store')
+    expect((await res.text())).toContain('Working Draft')
+  })
+
+  it('live html (present) => text/html + private, no-store', async () => {
+    asRole('u_writer', 'writer')
+    const res = await get(base, 'd_ppt1', { mode: 'live', format: 'html' })
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/html')
+    expect(res.headers.get('cache-control')).toBe('private, no-store')
+    expect((await res.text())).toContain('Working Draft')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// Group C3 — Follow-up 1: `version` is published-only; reject it on draft/live.
+// ─────────────────────────────────────────────────────────────────────────
+describe('PPT-SOURCE version is published-only (follow-up 1)', () => {
+  let base: string
+  let close: () => Promise<void>
+  beforeAll(async () => ({ base, close } = await listen(makeApp())))
+  afterAll(async () => close())
+
+  it('draft + version=latest => 400 VALIDATION_ERROR (field: version)', async () => {
+    asRole('u_writer', 'writer')
+    const res = await get(base, 'd_ppt1', { mode: 'draft', version: 'latest', format: 'bootstrap', origin: WEB_ORIGIN })
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: { code: string; details?: { field?: string } } }
+    expect(body.error.code).toBe('VALIDATION_ERROR')
+    expect(body.error.details?.field).toBe('version')
+  })
+
+  it('live + version=latest => 400 VALIDATION_ERROR', async () => {
+    asRole('u_writer', 'writer')
+    const res = await get(base, 'd_ppt1', { mode: 'live', version: 'latest', format: 'bootstrap', origin: WEB_ORIGIN })
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('VALIDATION_ERROR')
+  })
+
+  it('draft + version=2 (concrete) => 400 VALIDATION_ERROR', async () => {
+    asRole('u_writer', 'writer')
+    const res = await get(base, 'd_ppt1', { mode: 'draft', version: '2', format: 'bootstrap', origin: WEB_ORIGIN })
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { error: { code: string } }).error.code).toBe('VALIDATION_ERROR')
+  })
+
+  it('draft with NO version param => still allowed (200)', async () => {
+    asRole('u_writer', 'writer')
+    const res = await get(base, 'd_ppt1', { mode: 'draft', format: 'bootstrap', origin: WEB_ORIGIN })
+    expect(res.status).toBe(200)
   })
 })
 

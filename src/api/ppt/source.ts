@@ -81,12 +81,21 @@ function parseFormat(raw: unknown): PptSourceFormat {
 
 /**
  * Parse & validate `?version`; default `latest`. A concrete version is a
- * positive integer and is meaningful ONLY for `mode=published`; pairing a
- * concrete version with draft/live is a 400 (the working state has no immutable
- * sequence to select).
+ * positive integer and is meaningful ONLY for `mode=published`. The `version`
+ * param as a whole is published-only: supplying ANY explicit `version` (even
+ * `version=latest`) on draft/live is a 400 — the working state has no immutable
+ * publish sequence to select. Omitting `version` is fine in every mode and
+ * defaults to `latest`.
  */
 function parseVersion(raw: unknown, mode: PptSourceMode): 'latest' | number {
-  if (raw === undefined || raw === 'latest') return 'latest'
+  if (raw === undefined) return 'latest'
+  // An explicit version param is only meaningful for published sources.
+  if (mode !== 'published') {
+    throw new PptApiError('VALIDATION_ERROR', 'version is only valid for mode=published', {
+      details: { field: 'version' },
+    })
+  }
+  if (raw === 'latest') return 'latest'
   if (typeof raw !== 'string' || !/^\d+$/.test(raw)) {
     throw new PptApiError('VALIDATION_ERROR', 'version must be "latest" or a positive integer', {
       details: { field: 'version' },
@@ -95,11 +104,6 @@ function parseVersion(raw: unknown, mode: PptSourceMode): 'latest' | number {
   const n = Number(raw)
   if (n < 1) {
     throw new PptApiError('VALIDATION_ERROR', 'version must be a positive integer', {
-      details: { field: 'version' },
-    })
-  }
-  if (mode !== 'published') {
-    throw new PptApiError('VALIDATION_ERROR', 'a concrete version is only valid for mode=published', {
       details: { field: 'version' },
     })
   }
@@ -134,23 +138,38 @@ function resolveBootstrapOrigin(req: Request): string {
 /**
  * Apply the mode/format-appropriate cache headers.
  *
- * An IMMUTABLE published version's bento/html source is content-addressed by
- * version_seq, so it is served with a long `private, max-age, immutable` and an
- * ETag (the content hash). Everything else — draft/live (unpublished working
- * state) AND every bootstrap payload (which embeds short-lived signed asset URLs
- * that would go stale under a long cache) — is `private, no-store`. `private`
- * (never `public`) because the bytes are authorized per-reader.
+ * A CONCRETE published version's (`?version=<n>`) bento/html source is
+ * content-addressed by version_seq, so its URL never changes — it is served
+ * with a long `private, max-age, immutable` and an ETag (the content hash).
+ *
+ * A `latest`/omitted published bento/html URL is MUTABLE: once R5 resolves
+ * `latest` to the newest published deck, the same URL returns new bytes across
+ * publishes. It must therefore NOT be `immutable` — it is served `private,
+ * no-cache` with the content-hash ETag so the client always revalidates
+ * conditionally and never pins a stale deck under a long max-age.
+ *
+ * Everything else — draft/live (unpublished working state) AND every bootstrap
+ * payload (which embeds short-lived signed asset URLs that would go stale under
+ * any cache) — is `private, no-store`. `private` (never `public`) throughout
+ * because the bytes are authorized per-reader.
  */
 function applyCacheHeaders(
   res: Response,
   mode: PptSourceMode,
   format: PptSourceFormat,
+  version: 'latest' | number,
   content: PptSourceContent,
 ): void {
   res.setHeader('X-Content-Type-Options', 'nosniff')
-  const immutable = mode === 'published' && format !== 'bootstrap'
-  if (immutable) {
-    res.setHeader('Cache-Control', `private, max-age=${config.ppt.publishedMaxAgeSeconds}, immutable`)
+  const publishedSource = mode === 'published' && format !== 'bootstrap'
+  if (publishedSource) {
+    // Only a concrete numeric version addresses immutable content; `latest`
+    // (or omitted) is mutable and must revalidate.
+    if (typeof version === 'number') {
+      res.setHeader('Cache-Control', `private, max-age=${config.ppt.publishedMaxAgeSeconds}, immutable`)
+    } else {
+      res.setHeader('Cache-Control', 'private, no-cache')
+    }
     if (content.contentHash) res.setHeader('ETag', `"${content.contentHash}"`)
     return
   }
@@ -219,13 +238,13 @@ export function makePptSourceHandler(provider: PptSourceProvider) {
       if (!content.html) {
         throw new PptApiError('NOT_FOUND', 'no rendered HTML available for this source')
       }
-      applyCacheHeaders(res, mode, format, content)
+      applyCacheHeaders(res, mode, format, version, content)
       res.setHeader('Content-Type', 'text/html; charset=utf-8')
       res.status(200).send(content.html)
       return
     }
 
-    applyCacheHeaders(res, mode, format, content)
+    applyCacheHeaders(res, mode, format, version, content)
 
     if (format === 'bento') {
       // Raw bento/slides deck as the enveloped `data`.
