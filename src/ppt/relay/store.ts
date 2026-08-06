@@ -157,6 +157,11 @@ export class InMemoryPptRelayStore implements PptRelayStore {
       }
       return true
     })
+    // Deliberately DO NOT drop `byFrameId` for pruned frames: idempotent-resend
+    // dedup must survive GC (XIN-1655 C1). A frame re-sent after its op row is
+    // pruned still re-acks its original seq via the retained mapping rather than
+    // being minted a fresh seq and rebroadcast. This mirrors the DB store's
+    // `ppt_collab_frame` dedup ledger.
     return freed
   }
 }

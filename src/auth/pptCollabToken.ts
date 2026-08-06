@@ -72,7 +72,14 @@ export interface PptCollabTokenResult {
   /** The connection room key. */
   docId: string
   documentName: string
-  /** Authoritative live snapshot version at issuance (drives replay `since`). */
+  /**
+   * Authoritative live snapshot version at issuance. This is a version TAG for
+   * snapshot-change detection, NOT the replay cursor: the relay's replay `since`
+   * is an OP-SEQUENCE (0 on a fresh join, else the last `ready.q`/`op.q`/`ack.q`
+   * the client saw), a different coordinate system (XIN-1655 C5). Feeding this
+   * value in as `since` would skip ops whenever the version counter and the
+   * covered op-seq diverge.
+   */
   snapshotVersion: number
   /** Absolute browser-reachable relay WS origin; omitted when unconfigured. */
   pptWsUrl?: string

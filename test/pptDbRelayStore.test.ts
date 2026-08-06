@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
  * The relay's durability defects the GitHub reviewers found all lived in this
  * store, which no test exercised (the relay behavior tests use the in-memory
  * double). This file drives the REAL `DbPptRelayStore` + its repos against a
- * faithful in-memory fake of the three relay tables, mocked at the `db/pool`
+ * faithful in-memory fake of the four relay tables, mocked at the `db/pool`
  * seam exactly like the other transactional-repo tests (docSceneWrite,
  * shareWritePath). The fake models the parts of MySQL these paths rely on:
  *   · the `ppt_collab_seq` INSERT ... ON DUPLICATE KEY UPDATE counter is a single
@@ -16,7 +16,9 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
  *   · `(doc_id, seq)` PRIMARY KEY and `(doc_id, frame_id)` UNIQUE raise
  *     `ER_DUP_ENTRY`;
  *   · the `ppt_live_snapshot` upsert advances the version and guards covered-seq
- *     regression atomically.
+ *     regression atomically;
+ *   · the `ppt_collab_frame` dedup ledger is written on prune (INSERT IGNORE) and
+ *     read by append, so idempotent resend survives op-log GC (XIN-1655 C1).
  * Each `tx.query`/`query` handler runs synchronously, so two overlapping store
  * calls interleave only at `await` boundaries — enough to reproduce the
  * first-writer and first-snapshot races the fixes target.
@@ -30,6 +32,7 @@ function makeDb() {
   const ops = new Map<string, Map<number, OpRow>>() // docId -> seq -> row
   const seqCounter = new Map<string, number>() // docId -> last_seq
   const snapshot = new Map<string, SnapRow>() // docId -> row
+  const frames = new Map<string, Map<string, number>>() // docId -> frameId -> seq (dedup ledger, survives prune)
   const snapLocks = new Map<string, Promise<void>>() // docId -> ppt_live_snapshot row-lock queue
 
   function dupError(): Error {
@@ -40,6 +43,26 @@ function makeDb() {
 
   function route(sql: string, params: unknown[], ctx: { lastInsertId: number }): unknown[] {
     const p = params ?? []
+    // ── ppt_collab_frame: durable dedup ledger (survives op prune, C1) ──
+    if (sql.includes('SELECT seq FROM ppt_collab_frame WHERE doc_id = ? AND frame_id = ?')) {
+      const [docId, frameId] = p as [string, string]
+      const room = frames.get(docId)
+      const seq = room?.get(frameId)
+      return seq !== undefined ? [{ seq }] : []
+    }
+    if (sql.includes('INSERT IGNORE INTO ppt_collab_frame')) {
+      // INSERT IGNORE ... SELECT doc_id, frame_id, seq FROM ppt_collab_op WHERE doc_id = ? AND seq <= ?
+      const [docId, covered] = p as [string, number]
+      const opRoom = ops.get(docId)
+      if (opRoom) {
+        let ledger = frames.get(docId)
+        if (!ledger) { ledger = new Map(); frames.set(docId, ledger) }
+        for (const row of opRoom.values()) {
+          if (row.seq <= covered && !ledger.has(row.frameId)) ledger.set(row.frameId, row.seq) // IGNORE dup PK
+        }
+      }
+      return []
+    }
     // ── ppt_collab_seq: atomic counter allocate ──
     if (sql.includes('INSERT INTO ppt_collab_seq')) {
       const docId = p[0] as string
@@ -126,6 +149,7 @@ function makeDb() {
     ops,
     seqCounter,
     snapshot,
+    frames,
     query: vi.fn(async (sql: string, params: unknown[] = []) => route(sql, params, { lastInsertId: 0 })),
     transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
       const ctx = { lastInsertId: 0 }
@@ -236,6 +260,26 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
     const store = new DbPptRelayStore()
     for (const f of ['f1', 'f2', 'f3']) await store.appendOp(D, f, { f })
     expect((await store.opsSince(D, 1)).map((o) => o.seq)).toEqual([2, 3])
+  })
+
+  it('dedup survives prune via the ppt_collab_frame ledger: resend a pruned frameId -> re-acked at its ORIGINAL seq, not re-minted (C1)', async () => {
+    const store = new DbPptRelayStore()
+    const first = await store.appendOp(D, 'frame-1', { n: 1 })
+    await store.appendOp(D, 'frame-2', { n: 2 })
+    expect(first.seq).toBe(1)
+    // Snapshot covers + prunes seq 1: its ppt_collab_op row is physically deleted.
+    await store.saveSnapshot({ docId: D, coveredSeq: 1, doc: deck() })
+    await store.pruneOpsThrough(D, 1)
+    expect([...(db.ops.get(D) ?? new Map()).keys()]).toEqual([2]) // seq 1 gone from op table
+    expect(db.frames.get(D)!.get('frame-1')).toBe(1) // but its mapping is in the ledger
+
+    // A re-send of the pruned frame must NOT mint a fresh seq (which would
+    // rebroadcast a duplicate of an op the snapshot already subsumes).
+    const resend = await store.appendOp(D, 'frame-1', { n: 1 })
+    expect(resend.duplicate).toBe(true)
+    expect(resend.seq).toBe(1) // original seq, from the ledger
+    expect(await store.currentSeq(D)).toBe(2) // counter did NOT advance
+    expect((db.ops.get(D) ?? new Map()).has(1)).toBe(false) // no resurrected op row
   })
 })
 

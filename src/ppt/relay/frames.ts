@@ -97,7 +97,13 @@ export type ClientFrame = HelloFrame | NeedFrame | PresenceFrame | ByeFrame | Op
 
 export interface ReadyCtl {
   ctl: 'ready'
-  /** Highest room sequence delivered in this replay. */
+  /**
+   * Highest op sequence the client is synced through after this replay: the last
+   * op actually delivered, or the snapshot's covered seq / the resume cursor when
+   * no tail op followed. NOT the room's counter high-water — that can exceed what
+   * was delivered (e.g. a seq allocated by an append not yet visible), and
+   * reporting it would make the client skip an op it never received (XIN-1655 C6).
+   */
   q: number
   snapshotVersion: number
   epoch: number

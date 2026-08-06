@@ -2,21 +2,25 @@
  * MySQL-backed {@link PptRelayStore} (R4-B1, §7.3).
  *
  * Wires the relay's durability contract onto `ppt_collab_op` +
- * `ppt_live_snapshot` + `ppt_collab_seq`:
- *  - `appendOp` runs in a transaction: it dedups on `(doc_id, frame_id)`,
- *    allocates the next seq from the durable per-room counter (`ppt_collab_seq`,
- *    atomic increment under the counter row's lock), and inserts the frame. A
- *    committed row (and its ack) therefore always reflects a monotonic order that
- *    neither races on a room's first write nor regresses after a full-coverage
- *    prune. A concurrent resend of the same frameId that loses the
- *    `(doc_id, frame_id)` unique-key race is caught and re-acked at its original
- *    seq rather than surfaced as a permanent `storage-failed`.
+ * `ppt_live_snapshot` + `ppt_collab_seq` + `ppt_collab_frame`:
+ *  - `appendOp` runs in a transaction: it dedups on `(doc_id, frame_id)` against
+ *    BOTH the live op row and the durable dedup ledger (`ppt_collab_frame`, which
+ *    retains the mapping past a prune), allocates the next seq from the durable
+ *    per-room counter (`ppt_collab_seq`, atomic increment under the counter row's
+ *    lock), and inserts the frame. A committed row (and its ack) therefore always
+ *    reflects a monotonic order that neither races on a room's first write, nor
+ *    regresses after a full-coverage prune, nor re-mints a fresh seq for a frame
+ *    whose op row was already pruned (XIN-1655 C1). A concurrent resend of the
+ *    same frameId that loses the `(doc_id, frame_id)` unique-key race is caught
+ *    and re-acked at its original seq rather than surfaced as `storage-failed`.
  *  - `saveSnapshot` advances `snapshot_version` and writes the doc atomically in
  *    one covered-guarded upsert (§7.3).
  *  - `pruneOpsThrough` runs only AFTER `saveSnapshot` has committed (the relay
  *    engine sequences these two calls), matching "GC only after a durable
- *    snapshot", and returns the bytes reclaimed so the relay's room-budget
- *    counter stays in step.
+ *    snapshot". It copies each pruned frame's `(frame_id, seq)` into
+ *    `ppt_collab_frame` before deleting (one transaction) so dedup survives GC,
+ *    and returns the bytes reclaimed so the relay's room-budget counter stays in
+ *    step.
  */
 import { transaction } from '../../db/pool.js'
 import { pptCollabOpRepo } from '../../db/repos/pptCollabOpRepo.js'
@@ -47,6 +51,11 @@ export class DbPptRelayStore implements PptRelayStore {
     return transaction(async (tx) => {
       const existing = await pptCollabOpRepo.getSeqByFrameIdTx(tx, docId, frameId)
       if (existing !== null) return { seq: existing, duplicate: true, frameBytes }
+      // Dedup must survive op-log pruning: a frame whose op row was already pruned
+      // by a snapshot still lives in the durable dedup ledger, so re-ack its
+      // original seq instead of minting a duplicate (XIN-1655 C1).
+      const pruned = await pptCollabOpRepo.getPrunedSeqByFrameIdTx(tx, docId, frameId)
+      if (pruned !== null) return { seq: pruned, duplicate: true, frameBytes }
       const seq = await pptRelaySeqRepo.nextSeqTx(tx, docId)
       try {
         await pptCollabOpRepo.insertTx(tx, docId, seq, frameId, frameJson, frameBytes)
@@ -98,6 +107,9 @@ export class DbPptRelayStore implements PptRelayStore {
   }
 
   async pruneOpsThrough(docId: string, coveredSeq: number): Promise<number> {
-    return pptCollabOpRepo.pruneThrough(docId, coveredSeq)
+    // Copy the pruned frames' `(frame_id, seq)` into the durable dedup ledger and
+    // delete them in ONE transaction, so a frame is never delete-visible while
+    // still absent from the ledger (which would reopen the C1 duplicate window).
+    return transaction((tx) => pptCollabOpRepo.pruneThroughTx(tx, docId, coveredSeq))
   }
 }

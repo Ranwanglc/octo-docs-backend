@@ -76,4 +76,22 @@ describe('InMemoryPptRelayStore invariants (§7.3)', () => {
     const r2 = await s.saveSnapshot({ docId: 'd1', coveredSeq: 3, doc: deck() })
     expect(r2.snapshotVersion).toBe(2)
   })
+
+  it('dedup survives prune: a frame re-sent after its op row is pruned re-acks its original seq, not a fresh one (XIN-1655 C1)', async () => {
+    const s = new InMemoryPptRelayStore()
+    const first = await s.appendOp('d1', 'frame-1', { v: 1 })
+    await s.appendOp('d1', 'frame-2', { v: 2 })
+    expect(first.seq).toBe(1)
+    // A snapshot covers + prunes seq 1 (its op row is now gone).
+    await s.saveSnapshot({ docId: 'd1', coveredSeq: 1, doc: deck() })
+    await s.pruneOpsThrough('d1', 1)
+    expect((await s.opsSince('d1', 0)).map((o) => o.seq)).toEqual([2]) // seq 1 pruned
+
+    // Re-sending the pruned frameId must re-ack its ORIGINAL seq as a duplicate,
+    // never mint a new seq (which would rebroadcast a duplicate of a snapshotted op).
+    const resend = await s.appendOp('d1', 'frame-1', { v: 1 })
+    expect(resend.duplicate).toBe(true)
+    expect(resend.seq).toBe(1)
+    expect(await s.currentSeq('d1')).toBe(2) // no new seq minted
+  })
 })

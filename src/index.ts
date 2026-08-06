@@ -6,8 +6,12 @@
  * (§4.5 step 3) to refresh the per-node epoch watermark, and a SIGTERM graceful
  * shutdown that flushes documents and releases locks (§9.4).
  *
- * NOTE: In production these can be separate deployables — the Meta API is
- * stateless and horizontally scalable, while Hocuspocus nodes are stateful and
+ * NOTE: In production these can be separate deployables. The REST Meta API is
+ * stateless for its request/response endpoints, but the PPT relay attached to it
+ * (below) keeps a PROCESS-LOCAL room registry (live sockets, per-room seq/budget
+ * state) and a Redis-backed single-use ticket store, so a horizontally-scaled
+ * deployment must route a deck's relay upgrades to a consistent node (docId
+ * affinity) — the same constraint Hocuspocus has, which is stateful and
  * documentName-affinity routed (§9.1). They are colocated here for a runnable
  * scaffold.
  */

@@ -48,6 +48,8 @@ import {
 export const CLOSE_UNAUTHORIZED = 4401
 export const CLOSE_FORBIDDEN = 4403
 export const CLOSE_NOT_FOUND = 4404
+/** WS internal-error close (RFC 6455 1011): a store failure we cannot recover. */
+export const CLOSE_UNAVAILABLE = 1011
 
 export interface RelayLimits {
   maxFrameBytes: number
@@ -162,6 +164,17 @@ export class PptRelay {
   private readonly roomBytes = new Map<string, number>()
   /** Rooms whose {@link roomBytes} has been seeded from durable state. */
   private readonly roomBytesSeeded = new Set<string>()
+  /**
+   * Per-room serialization chain for seq-allocating frames (`ops`/`snap`).
+   * `onMessage` is fire-and-forget (`void`), so without this two concurrent
+   * writers could allocate seq 1 and 2 but broadcast 2 before 1 — peers would
+   * observe ops out of the authoritative room order. Chaining each mutating
+   * frame's whole persist→ack→broadcast behind the prior one guarantees live
+   * delivery follows the assigned seq (XIN-1655 C2). It also serializes the
+   * room-budget read/modify so concurrent frames cannot both pass the cap and
+   * lose an increment (the non-blocking `ensureRoomBudget` race).
+   */
+  private readonly roomChains = new Map<string, Promise<void>>()
 
   constructor(deps: PptRelayDeps) {
     this.store = deps.store
@@ -211,7 +224,16 @@ export class PptRelay {
       return
     }
     // Single-use: a replayed ticket (same jti) is rejected even if still valid.
-    const fresh = await this.ticketStore.consume(claims.jti)
+    // A store error (e.g. Redis down for RedisTicketStore) must fail CLOSED and
+    // close the just-upgraded socket rather than rejecting `onConnection` and
+    // leaking an open socket with no replay protection (XIN-1655 non-blocking).
+    let fresh: boolean
+    try {
+      fresh = await this.ticketStore.consume(claims.jti)
+    } catch {
+      socket.close(CLOSE_UNAUTHORIZED, 'ticket store unavailable')
+      return
+    }
     if (!fresh) {
       socket.close(CLOSE_UNAUTHORIZED, 'ticket already used')
       return
@@ -321,6 +343,24 @@ export class PptRelay {
     }
   }
 
+  /**
+   * Run a seq-allocating frame handler serialized behind any prior one for the
+   * SAME room, so seq allocation and the subsequent broadcast happen in the same
+   * order (XIN-1655 C2). The chained tail never rejects (a handler owns its own
+   * error surfacing via `refuse`), so one frame's failure cannot stall the room's
+   * queue. The map entry is dropped once the chain drains, bounding memory to the
+   * set of rooms with in-flight mutations.
+   */
+  private runSerialized(docId: string, task: () => Promise<void>): Promise<void> {
+    const prev = this.roomChains.get(docId) ?? Promise.resolve()
+    const run = prev.then(task, task).catch(() => {})
+    this.roomChains.set(docId, run)
+    void run.then(() => {
+      if (this.roomChains.get(docId) === run) this.roomChains.delete(docId)
+    })
+    return run
+  }
+
   private refuse(
     conn: Conn,
     code: RefusedCode,
@@ -371,50 +411,80 @@ export class PptRelay {
         conn.socket.close(1000, 'bye')
         return
       case 'ops':
-        await this.handleOps(conn, frame as OpsFrame, rawBytes)
+        // Serialize per room so the assigned seq order is also the broadcast
+        // order (XIN-1655 C2).
+        await this.runSerialized(conn.docId, () => this.handleOps(conn, frame as OpsFrame, rawBytes))
         return
       case 'snap':
-        await this.handleSnap(conn, frame as SnapFrame, rawBytes)
+        await this.runSerialized(conn.docId, () => this.handleSnap(conn, frame as SnapFrame, rawBytes))
         return
       default:
         this.refuse(conn, 'protocol-version', { message: 'unhandled frame type' })
     }
   }
 
-  /** Replay `snapshot -> ops since q -> ready` (§7.3). `need` omits the ready. */
+  /**
+   * Replay `snapshot -> ops since q -> ready` (§7.3). `need` omits the ready.
+   *
+   * `since` is an OP-SEQUENCE cursor, NOT a snapshot version (XIN-1655 C5): the
+   * client resumes from the highest op seq it has already applied — 0 on a fresh
+   * join, or the last `ready.q`/`op.q`/`ack.q` it saw on a reconnect. The
+   * `snapshotVersion` the collab-token hands the client is a version TAG for
+   * change detection, never a replay cursor; conflating the two would skip ops
+   * whenever the version counter and the covered op-seq diverge.
+   *
+   * A store failure here must never leave the client hanging with neither `ready`
+   * nor `refused` (§7.3 "never a silent drop"): the whole replay is wrapped so a
+   * failure surfaces a permanent `storage-failed` refusal and closes the socket
+   * (XIN-1655 C4).
+   */
   private async replay(conn: Conn, since: number, ready = true): Promise<void> {
-    const snap = await this.store.getSnapshot(conn.docId)
-    let fromSeq = since
-    // Only send the snapshot to a peer behind it; an already-synced peer is not
-    // forced to reapply it (PPT-COLLAB-003).
-    if (snap && since < snap.coveredSeq) {
-      send(conn.socket, { ctl: 'snapshot', snapshotVersion: snap.snapshotVersion, doc: snap.doc })
-      fromSeq = snap.coveredSeq
-    }
-    const ops = await this.store.opsSince(conn.docId, fromSeq)
-    for (const op of ops) {
-      send(conn.socket, { ctl: 'op', q: op.seq, frame: op.frame })
-    }
-    if (ready) {
-      const q = await this.store.currentSeq(conn.docId)
-      // Fallback is the connection's last-known LIVE epoch (validated at
-      // handshake), NOT the snapshot version — stamping a snapshot counter as an
-      // epoch would make every subsequent mutation fail `stale-epoch` with no
-      // recovery. If the provider is momentarily down we surface the last real
-      // epoch; a mutating frame re-checks the live epoch anyway.
-      let epoch = conn.roleEpoch
-      try {
-        epoch = await this.epochProvider(conn.documentName)
-      } catch {
-        /* keep replay usable with the last-known epoch; mutation re-checks */
+    try {
+      const snap = await this.store.getSnapshot(conn.docId)
+      let fromSeq = since
+      // Only send the snapshot to a peer behind it; an already-synced peer is not
+      // forced to reapply it (PPT-COLLAB-003).
+      if (snap && since < snap.coveredSeq) {
+        send(conn.socket, { ctl: 'snapshot', snapshotVersion: snap.snapshotVersion, doc: snap.doc })
+        fromSeq = snap.coveredSeq
       }
-      send(conn.socket, {
-        ctl: 'ready',
-        q,
-        snapshotVersion: snap?.snapshotVersion ?? 0,
-        epoch,
-        role: conn.role,
-      })
+      const ops = await this.store.opsSince(conn.docId, fromSeq)
+      // Track the highest op seq ACTUALLY delivered in this replay so `ready.q`
+      // reports what the client is truly synced through — not the counter
+      // high-water (XIN-1655 C6). The floor is `fromSeq`: after a snapshot the
+      // client is synced through `coveredSeq` even when no tail op follows; on a
+      // plain resume it is already synced through `since`.
+      let delivered = fromSeq
+      for (const op of ops) {
+        send(conn.socket, { ctl: 'op', q: op.seq, frame: op.frame })
+        delivered = op.seq
+      }
+      if (ready) {
+        // Fallback is the connection's last-known LIVE epoch (validated at
+        // handshake), NOT the snapshot version — stamping a snapshot counter as an
+        // epoch would make every subsequent mutation fail `stale-epoch` with no
+        // recovery. If the provider is momentarily down we surface the last real
+        // epoch; a mutating frame re-checks the live epoch anyway.
+        let epoch = conn.roleEpoch
+        try {
+          epoch = await this.epochProvider(conn.documentName)
+        } catch {
+          /* keep replay usable with the last-known epoch; mutation re-checks */
+        }
+        send(conn.socket, {
+          ctl: 'ready',
+          q: delivered,
+          snapshotVersion: snap?.snapshotVersion ?? 0,
+          epoch,
+          role: conn.role,
+        })
+      }
+    } catch {
+      // A store failure on replay is a permanent refusal, surfaced then closed —
+      // never a silent hang (XIN-1655 C4). The client re-mints a ticket and
+      // reconnects to retry replay.
+      this.refuse(conn, 'storage-failed', { message: 'replay failed' })
+      conn.socket.close(CLOSE_UNAVAILABLE, 'replay failed')
     }
   }
 

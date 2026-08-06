@@ -12,6 +12,15 @@
  * full-coverage prune empties the table. The authoritative monotonic counter
  * lives in {@link ../repos/pptRelaySeqRepo} (`ppt_collab_seq`); this table only
  * stores the frames at the seqs that counter hands out.
+ *
+ * Idempotent-resend dedup must OUTLIVE this table's rows. A snapshot prunes
+ * covered ops, but a client that reconnects and re-sends a frame whose op row was
+ * already pruned must STILL be re-acked at that frame's original seq — never
+ * minted a fresh seq and rebroadcast as a duplicate of an op the snapshot already
+ * subsumes (XIN-1655 C1). The `(doc_id, frame_id) -> seq` mapping is therefore
+ * copied into the durable dedup ledger `ppt_collab_frame` at prune time (see
+ * {@link pruneThroughTx}); the append path checks that ledger when the live op row
+ * is absent (see {@link getPrunedSeqByFrameIdTx}).
  */
 import { query, type Tx } from '../pool.js'
 
@@ -56,6 +65,23 @@ export const pptCollabOpRepo = {
   async getSeqByFrameIdForUpdateTx(tx: Tx, docId: string, frameId: string): Promise<number | null> {
     const rows = await tx.query<{ seq: number }>(
       `SELECT seq FROM ppt_collab_op WHERE doc_id = ? AND frame_id = ? FOR UPDATE`,
+      [docId, frameId],
+    )
+    return rows[0] ? Number(rows[0].seq) : null
+  },
+
+  /**
+   * Seq recorded in the durable dedup ledger for a frame whose op row has since
+   * been PRUNED (tx-scoped), or null if unseen. This is what makes idempotent
+   * resend survive GC (XIN-1655 C1): once a snapshot prunes seq N, the live
+   * `(doc_id, frame_id)` row is gone, so an unqualified re-send would be minted a
+   * fresh seq and rebroadcast as a duplicate. The ledger retains the original
+   * mapping past the prune, so the append path can re-ack the original seq
+   * instead of re-minting.
+   */
+  async getPrunedSeqByFrameIdTx(tx: Tx, docId: string, frameId: string): Promise<number | null> {
+    const rows = await tx.query<{ seq: number }>(
+      `SELECT seq FROM ppt_collab_frame WHERE doc_id = ? AND frame_id = ?`,
       [docId, frameId],
     )
     return rows[0] ? Number(rows[0].seq) : null
@@ -114,14 +140,26 @@ export const pptCollabOpRepo = {
    * Delete ops with `seq <= coveredSeq` (post-snapshot GC) and return the number
    * of `frame_bytes` reclaimed, so the relay's in-memory room-budget counter can
    * be decremented in step with the durable delete.
+   *
+   * Runs inside the caller's transaction and, BEFORE deleting, copies each pruned
+   * frame's `(doc_id, frame_id, seq)` into the durable dedup ledger
+   * `ppt_collab_frame` (`INSERT IGNORE`, so a re-run is a no-op). That ledger is
+   * what lets a later re-send of a pruned frame re-ack its original seq instead of
+   * being minted a duplicate (XIN-1655 C1). Copy-then-delete in ONE transaction so
+   * a frame can never be delete-visible while still absent from the ledger.
    */
-  async pruneThrough(docId: string, coveredSeq: number): Promise<number> {
-    const rows = await query<{ freed: number | null }>(
+  async pruneThroughTx(tx: Tx, docId: string, coveredSeq: number): Promise<number> {
+    const rows = await tx.query<{ freed: number | null }>(
       `SELECT COALESCE(SUM(frame_bytes), 0) AS freed FROM ppt_collab_op WHERE doc_id = ? AND seq <= ?`,
       [docId, coveredSeq],
     )
     const freed = rows[0] ? Number(rows[0].freed ?? 0) : 0
-    await query(`DELETE FROM ppt_collab_op WHERE doc_id = ? AND seq <= ?`, [docId, coveredSeq])
+    await tx.query(
+      `INSERT IGNORE INTO ppt_collab_frame (doc_id, frame_id, seq)
+       SELECT doc_id, frame_id, seq FROM ppt_collab_op WHERE doc_id = ? AND seq <= ?`,
+      [docId, coveredSeq],
+    )
+    await tx.query(`DELETE FROM ppt_collab_op WHERE doc_id = ? AND seq <= ?`, [docId, coveredSeq])
     return freed
   },
 }

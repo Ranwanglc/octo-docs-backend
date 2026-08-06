@@ -849,3 +849,111 @@ describe('PPT relay: byte-accurate limits + binding blob cap (non-blocking)', ()
     expect(await w.recv()).toMatchObject({ code: 'room-full', retryable: false })
   })
 })
+
+/**
+ * XIN-1655 GitHub round-3 blockers: per-room ordered broadcast (C2), replay
+ * failure surfacing (C4), replay-cursor coordinate (C5), and ready.q semantics
+ * (C6). Driven against the same real ws server + client harness as the suite above.
+ */
+describe('PPT relay: round-3 correctness fixes (XIN-1655)', () => {
+  it('C2: concurrent live appends broadcast in assigned seq order (per-room serialization)', async () => {
+    // A store whose FIRST snapshot read after arming is slow. In the pre-fix code
+    // handleOps allocated the seq, then awaited getSnapshot before broadcasting, so
+    // a later frame with a fast read could broadcast q=2 before q=1. The per-room
+    // serialization chain forces f1's whole persist->ack->broadcast to finish first.
+    class SlowFirstSnapshotStore extends InMemoryPptRelayStore {
+      armed = false
+      private calls = 0
+      async getSnapshot(docId: string) {
+        if (this.armed) {
+          this.calls++
+          if (this.calls === 1) await new Promise((r) => setTimeout(r, 60))
+        }
+        return super.getSnapshot(docId)
+      }
+    }
+    const store = new SlowFirstSnapshotStore()
+    const h = await setup({ store })
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    const p = await h.connect({ uid: 'u_p', role: 'writer' })
+    await helloReady(w)
+    await helloReady(p)
+    store.armed = true // the first ack-time snapshot read (f1's) is now slow
+    w.send(OPS_FRAME(1, 'f1'))
+    w.send(OPS_FRAME(2, 'f2'))
+    // Peer observes op broadcasts; recvUntil stops at q=2, so an out-of-order q=2
+    // (arriving before q=1) would yield [2] and fail the assertion.
+    const seen = await p.recvUntil((m) => m.ctl === 'op' && m.q === 2)
+    const qs = seen.filter((m) => m.ctl === 'op').map((m) => m.q)
+    expect(qs).toEqual([1, 2])
+  })
+
+  it('C4: a store failure during replay surfaces a refused + closes, never a silent hang', async () => {
+    const boom = new Error('store down')
+    const throwing: PptRelayStore = {
+      appendOp: async () => { throw boom },
+      opsSince: async () => { throw boom },
+      currentSeq: async () => { throw boom },
+      roomBytes: async () => { throw boom },
+      getSnapshot: async () => { throw boom },
+      saveSnapshot: async () => { throw boom },
+      pruneOpsThrough: async () => { throw boom },
+    }
+    const h = await setup({ store: throwing })
+    const c = await h.connect({ uid: 'u1', role: 'writer' })
+    c.send({ t: 'hello', pv: 2, since: 0 })
+    // Before the fix replay() rejected inside a void-ed onMessage, so the client
+    // got neither ready nor refused and hung. Now it gets a permanent refusal + close.
+    const refused = await c.recv()
+    expect(refused).toMatchObject({ ctl: 'refused', code: 'storage-failed', retryable: false })
+    expect((await c.closed).code).toBe(1011)
+  })
+
+  it('C5: replay `since` is an op-seq boundary (coveredSeq), independent of snapshotVersion', async () => {
+    const store = new InMemoryPptRelayStore()
+    await store.appendOp(DOC, 'f1', OPS_FRAME(1, 'f1'))
+    // Drive snapshotVersion ABOVE coveredSeq (two saves at the same covered seq),
+    // so the two coordinate systems visibly diverge.
+    await store.saveSnapshot({ docId: DOC, coveredSeq: 1, doc: deck() })
+    await store.saveSnapshot({ docId: DOC, coveredSeq: 1, doc: deck() })
+    const snap = await store.getSnapshot(DOC)
+    expect(snap!.snapshotVersion).toBe(2)
+    expect(snap!.coveredSeq).toBe(1)
+    await store.appendOp(DOC, 'f2', OPS_FRAME(2, 'f2')) // op past the snapshot boundary
+
+    const h = await setup({ store })
+    // Fresh joiner (since=0): snapshot + EVERY op after coveredSeq(1). Treating the
+    // cursor as snapshotVersion(2) would skip op seq 2 entirely.
+    const c = await h.connect({ uid: 'u1', role: 'writer' })
+    const { ready, replay } = await helloReady(c, 0)
+    expect(replay[0]!.ctl).toBe('snapshot')
+    expect(replay.filter((m) => m.ctl === 'op').map((m) => m.q)).toEqual([2])
+    expect(ready.snapshotVersion).toBe(2) // version tag surfaced as-is
+    expect(ready.q).toBe(2) // synced through op seq 2
+
+    // A reconnect resuming at the op boundary (since=coveredSeq=1) skips the
+    // snapshot and replays only the tail op — proving `since` is an op sequence.
+    const c2 = await h.connect({ uid: 'u2', role: 'writer' })
+    const { replay: replay2 } = await helloReady(c2, 1)
+    expect(replay2.some((m) => m.ctl === 'snapshot')).toBe(false)
+    expect(replay2.filter((m) => m.ctl === 'op').map((m) => m.q)).toEqual([2])
+  })
+
+  it('C6: ready.q is the last op actually delivered, not the counter high-water', async () => {
+    // A counter far ahead of the delivered ops (models a seq allocated by an
+    // append not yet visible to opsSince). Pre-fix ready.q came from currentSeq()
+    // and would over-report, making the client skip an op it never received.
+    class InflatedCounterStore extends InMemoryPptRelayStore {
+      async currentSeq(): Promise<number> {
+        return 999
+      }
+    }
+    const store = new InflatedCounterStore()
+    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(DOC, f, OPS_FRAME(1, f))
+    const h = await setup({ store })
+    const c = await h.connect({ uid: 'u1', role: 'writer' })
+    const { ready, replay } = await helloReady(c, 0)
+    expect(replay.filter((m) => m.ctl === 'op').map((m) => m.q)).toEqual([1, 2, 3])
+    expect(ready.q).toBe(3) // last delivered op, NOT currentSeq()=999
+  })
+})

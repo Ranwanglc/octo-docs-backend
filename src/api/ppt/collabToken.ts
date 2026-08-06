@@ -66,11 +66,13 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
     throw new PptApiError('FORBIDDEN', 'no access to this document')
   }
 
-  // Snapshot version seeds the client's replay `since`. Source it from the
+  // Live snapshot VERSION tag (snapshot-change detection), sourced from the
   // AUTHORITATIVE live-snapshot row (`ppt_live_snapshot`), which the relay
   // advances on each snapshot save — not `ppt_doc_state.snapshot_version`, which
   // nothing on the live path updates and so is permanently 0 (B8). Absent live
-  // snapshot => 0 (a freshly created deck before any live snapshot).
+  // snapshot => 0 (a freshly created deck before any live snapshot). This is NOT
+  // the replay cursor: the relay's replay `since` is an op-sequence the client
+  // seeds from `ready.q` (0 on first join), a distinct coordinate (XIN-1655 C5).
   const liveSnapshot = await pptLiveSnapshotRepo.get(docId)
   const snapshotVersion = liveSnapshot?.snapshotVersion ?? 0
 

@@ -385,3 +385,17 @@ CREATE TABLE ppt_collab_seq (
   last_seq BIGINT      NOT NULL DEFAULT 0,                -- highest op seq ever assigned for this room (monotonic)
   PRIMARY KEY (doc_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Durable dedup ledger for the PPT relay (R4-B1, XIN-1655 C1). Maps
+-- (doc_id, frame_id) -> the room seq the frame was assigned, and OUTLIVES the op
+-- row: when a snapshot prunes covered ops, the relay copies each pruned frame's
+-- mapping here first, so a later re-send of a pruned frame is re-acked at its
+-- ORIGINAL seq instead of being minted a fresh seq and rebroadcast as a
+-- duplicate the snapshot already subsumes. Written only on prune (INSERT IGNORE).
+CREATE TABLE ppt_collab_frame (
+  doc_id    VARCHAR(64) NOT NULL,                         -- FK-by-convention to doc_meta.doc_id (html_ppt row)
+  frame_id  VARCHAR(64) NOT NULL,                         -- globally-unique Bento frame id (dedup key)
+  seq       BIGINT      NOT NULL,                          -- room seq this frame was assigned (retained past prune)
+  pruned_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (doc_id, frame_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
