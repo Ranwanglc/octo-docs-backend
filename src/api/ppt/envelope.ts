@@ -27,6 +27,7 @@
 import { Router, json, type Request, type Response, type NextFunction } from 'express'
 import { createPptDocsRouter } from './docs.js'
 import { createPptSourceRouter } from './source.js'
+import { createPptCollabTokenRouter } from './collabToken.js'
 
 /**
  * Fixed HTTP-status-to-code map. The first ten codes are C's enum verbatim; the
@@ -205,6 +206,8 @@ export function createPptRouter(): Router {
   router.use(createPptDocsRouter())
   // R3-B1: source/bootstrap — GET /api/v1/ppt/docs/:docId/source.
   router.use(createPptSourceRouter())
+  // R4-B1: collab-token/ticket — POST /api/v1/ppt/docs/collab-token.
+  router.use(createPptCollabTokenRouter())
 
   // Terminal 404: any PPT path without a matching route returns the enveloped
   // NOT_FOUND rather than falling through to the app's bare-JSON handler.

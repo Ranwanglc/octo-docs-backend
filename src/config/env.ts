@@ -742,5 +742,36 @@ export const config = {
     // frontend refreshes via one bootstrap re-fetch when a URL 403/404s
     // (PPT-ASSET-001), so this is a soft ceiling, not a hard session bound.
     assetUrlTtlSeconds: numMin('PPT_ASSET_URL_TTL_SECONDS', 900, 1),
+
+    // R4-B1 collaboration relay (XIN-1495 §7). The Bento-frame WS relay lives
+    // INSIDE B (attached to the existing REST HTTP server on the
+    // `/api/v1/ppt/collab` upgrade path — owner-locked "no second service"), NOT
+    // the Hocuspocus server and NOT a new deployable. These knobs cover the
+    // collab-token/ticket issuance and the relay's protocol/limit envelope.
+    relay: {
+      // Bento CRDT sync protocol version the relay speaks (`SYNC_V`). A frame
+      // whose `pv` is missing or != this is refused with `protocol-version`
+      // BEFORE any decode/persist. Mirrors ppt_doc_state.bento_sync_pv.
+      protocolVersion: num('PPT_RELAY_SYNC_PV', 2),
+      // One-time WS ticket TTL (seconds). The ticket is a single-use handshake
+      // credential carried in `Sec-WebSocket-Protocol` (never a long-lived token
+      // in the URL); short so a leaked/replayed ticket is useless quickly.
+      ticketTtlSeconds: numMin('PPT_RELAY_TICKET_TTL_SECONDS', 30, 1),
+      // Public, browser-reachable relay WS origin surfaced to clients as
+      // `pptWsUrl` in the collab-token response (§7.1). Absolute ws://|wss://
+      // only; REQUIRED in production (unset/malformed is fatal — see
+      // resolveCollabPublicWsUrl), soft (warn => omit) outside production.
+      publicWsUrl: resolveCollabPublicWsUrl(str('PPT_RELAY_PUBLIC_WS_URL', '')),
+      // Bento default relay limits (§7.3). Starting values ported from Bento's
+      // upstream sync worker; load-test before production. Enforced as hard
+      // refusals: `too-large` (permanent), `rate-limited` (retryable),
+      // `room-full` (permanent).
+      maxFrameBytes: numMin('PPT_RELAY_MAX_FRAME_BYTES', 1_900_000, 1),
+      maxOpsPerFrame: numMin('PPT_RELAY_MAX_OPS_PER_FRAME', 512, 1),
+      maxFramesPerWindow: numMin('PPT_RELAY_MAX_FRAMES_PER_WINDOW', 200, 1),
+      rateWindowMs: numMin('PPT_RELAY_RATE_WINDOW_MS', 10_000, 1),
+      maxSingleBlobBytes: numMin('PPT_RELAY_MAX_SINGLE_BLOB_BYTES', 8 * 1024 * 1024, 1),
+      maxRoomFrameBytes: numMin('PPT_RELAY_MAX_ROOM_FRAME_BYTES', 96 * 1024 * 1024, 1),
+    },
   },
 } as const

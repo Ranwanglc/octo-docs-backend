@@ -337,3 +337,37 @@ CREATE TABLE ppt_idempotency (
   updated_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (space_id, scope, uid, idempotency_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Durable Bento op frames for the PPT relay (R4-B1, §7.3). One row per accepted
+-- `ops` frame, addressed by the MONOTONIC per-room sequence `(doc_id, seq)`. The
+-- relay acks a frame ONLY after its row is durably committed, then broadcasts;
+-- UNIQUE (doc_id, frame_id) makes a resent frame a no-op that re-acks its
+-- original seq rather than inserting a duplicate. Covered ops are pruned only
+-- after a live snapshot that covers them is durable.
+CREATE TABLE ppt_collab_op (
+  doc_id      VARCHAR(64) NOT NULL,                       -- FK-by-convention to doc_meta.doc_id (html_ppt row)
+  seq         BIGINT      NOT NULL,                        -- monotonic per-room sequence (relay-assigned)
+  frame_id    VARCHAR(64) NOT NULL,                        -- globally-unique Bento frame id (dedup key)
+  frame_json  MEDIUMTEXT  NOT NULL,                        -- the original `ops` frame, plaintext JSON
+  frame_bytes INT         NOT NULL DEFAULT 0,              -- byte size of frame_json (room-budget accounting)
+  created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (doc_id, seq),
+  UNIQUE KEY uq_ppt_collab_op_frame (doc_id, frame_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Authoritative live BentoDoc snapshot per PPT doc (R4-B1, §7.3). snapshot_version
+-- advances atomically on each save; covered_seq records the op prefix the snapshot
+-- subsumes, so the relay prunes ppt_collab_op rows with seq <= covered_seq only
+-- AFTER this row is durable. One row per doc (PK doc_id) — the snapshot is
+-- replaced in place, never versioned here (published versions live in ppt_version).
+CREATE TABLE ppt_live_snapshot (
+  doc_id           VARCHAR(64) NOT NULL,                  -- one authoritative live snapshot per doc
+  snapshot_version BIGINT      NOT NULL DEFAULT 0,        -- monotonic; advances atomically on each save
+  covered_seq      BIGINT      NOT NULL DEFAULT 0,        -- ppt_collab_op.seq this snapshot covers (<= are prunable)
+  doc_json         MEDIUMTEXT  NOT NULL,                  -- the authoritative BentoDoc snapshot, plaintext JSON
+  doc_sha          CHAR(64)    NOT NULL,                  -- sha256(hex) of doc_json (integrity / dedup)
+  doc_bytes        INT         NOT NULL DEFAULT 0,        -- byte size of doc_json
+  created_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (doc_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

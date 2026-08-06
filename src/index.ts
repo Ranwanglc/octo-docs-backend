@@ -17,6 +17,7 @@ import './config/loadEnv.js'
 import { config } from './config/env.js'
 import { createServer, setEpochWatermark } from './collab/server.js'
 import { createApp } from './api/app.js'
+import { createPptRelay } from './ppt/relay/index.js'
 import { epochInvalidateChannel, currentEpoch, invalidateEpochCache, type InvalidateEvent } from './permission/epoch.js'
 import { closePool, query } from './db/pool.js'
 import { assertAppendV1RoleEncoding } from './db/roleEncodingMarker.js'
@@ -72,6 +73,14 @@ async function main(): Promise<void> {
     } catch {
       /* doc gone or source unconfirmable; backstop is beforeHandleMessage */
     }
+    // R4-B1: propagate the permission change to any live PPT relay sockets on
+    // this doc — re-resolve each connection's role, notify `role-changed`, and
+    // close a revoked (now-`none`) socket. Old-epoch frames still in flight are
+    // refused by the relay's per-frame epoch check.
+    void pptRelay.applyEpochBump(event.documentName).catch((err) => {
+      // eslint-disable-next-line no-console
+      console.warn('[octo-docs] PPT relay epoch bump failed:', err)
+    })
     // TODO(§4.5 step 3): locate local connections via the connection registry
     // and close(4403) revoked / flip readOnly on downgraded connections.
   }
@@ -86,6 +95,14 @@ async function main(): Promise<void> {
     console.log(`[octo-docs] REST API listening on :${config.httpPort}`)
   })
 
+  // R4-B1: the Bento-frame PPT relay is hosted INSIDE B — attached to the REST
+  // HTTP server on the `/api/v1/ppt/collab` upgrade path (owner-locked "no second
+  // service"), NOT the Hocuspocus server above and NOT a new deployable.
+  const pptRelay = createPptRelay()
+  pptRelay.attach(httpServer)
+  // eslint-disable-next-line no-console
+  console.log('[octo-docs] PPT relay attached on /api/v1/ppt/collab')
+
   // §9.4 graceful shutdown: flush docs, then release locks, then close infra.
   const shutdown = async (signal: string): Promise<void> => {
     // eslint-disable-next-line no-console
@@ -94,6 +111,7 @@ async function main(): Promise<void> {
       await hocuspocus.destroy() // flushes in-memory docs (triggers onStoreDocument)
       // TODO(§5.3 / §9.4): releaseAllDocumentLocks() so a takeover node can
       // become primary writer immediately without waiting for the lock TTL.
+      pptRelay.close()
       httpServer.close()
       sub.disconnect()
       await closeRedis()
