@@ -34,9 +34,6 @@ export type PptSourceFormat = 'bootstrap' | 'bento' | 'html'
 export const PPT_SOURCE_MODES: readonly PptSourceMode[] = ['published', 'live', 'draft']
 export const PPT_SOURCE_FORMATS: readonly PptSourceFormat[] = ['bootstrap', 'bento', 'html']
 
-/** Modes that expose UNPUBLISHED working state — writer/admin only, never cached. */
-export const PPT_UNPUBLISHED_MODES: readonly PptSourceMode[] = ['draft', 'live']
-
 /**
  * A media/object-store reference a deck needs a signed GET URL for. Bento
  * offloads any value over `BLOB_INLINE_MAX = 64 KiB` to a SHA-256/object-keyed
@@ -114,7 +111,14 @@ function canonicalJson(value: unknown): string {
 function sortKeys(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeys)
   if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {}
+    // A null-prototype accumulator so a reserved key — notably `__proto__`, which
+    // `JSON.parse` produces as an OWN enumerable property — is stored as an own
+    // key rather than silently walking the prototype setter and vanishing. A
+    // plain `{}` inherits `Object.prototype`, so `out['__proto__'] = …` would set
+    // the prototype instead of creating a key, dropping the whole `__proto__`
+    // subtree from the canonical serialization and letting two structurally
+    // different decks collide on the same contentHash (the ETag / comment anchor).
+    const out: Record<string, unknown> = Object.create(null)
     for (const key of Object.keys(value as Record<string, unknown>).sort()) {
       out[key] = sortKeys((value as Record<string, unknown>)[key])
     }

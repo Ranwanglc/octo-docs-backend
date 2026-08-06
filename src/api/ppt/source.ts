@@ -13,9 +13,10 @@
  *      writer/admin. A reader/commenter asking for draft/live gets `403 FORBIDDEN`
  *      — the negative control this round must prove.
  *   2. CACHE POLICY (§4 / PPT-SOURCE-004, PPT-UI-004):
- *      an immutable published version's bento/html source is served with an
- *      immutable-version cache; draft/live — and ANY bootstrap payload, which
- *      embeds short-lived signed URLs — is `private, no-store`.
+ *      a published version's bento/html source is served `private, no-cache`
+ *      with a content-hash ETag, so the server re-authorizes every use and
+ *      answers a matching request with a 304; draft/live — and ANY bootstrap
+ *      payload, which embeds short-lived signed URLs — is `private, no-store`.
  *   3. SIGNED ASSET BOOTSTRAP (§8 / §9 / PPT-SEC-001, PPT-ASSET-001):
  *      the bootstrap payload carries short-lived signed asset GET URLs, never a
  *      long-lived token in the URL.
@@ -119,10 +120,25 @@ function parseVersion(raw: unknown, mode: PptSourceMode): 'latest' | number {
  * exact value the parent must postMessage into; with no `Origin` header (a
  * same-origin GET or a non-browser client) it falls back to the configured web
  * origin. It is NEVER `*`.
+ *
+ * A wildcard CORS allowlist (`CORS_ALLOWED_ORIGINS=*`, a documented deploy value)
+ * is NOT trusted to gate this transfer: `resolveAllowedOrigin` reflects any
+ * origin under `*`, which would silently turn the 403 origin gate into a no-op
+ * and let the caller's arbitrary `Origin` become the postMessage `targetOrigin`.
+ * Under `*` we therefore ignore the reflected caller origin and always return the
+ * configured `webOrigin`, so the target is a fixed, trusted origin the parent
+ * frame actually runs on — never attacker-supplied.
  */
 function resolveBootstrapOrigin(req: Request): string {
   const raw = req.headers.origin
   const origin = typeof raw === 'string' && raw !== '' ? raw : undefined
+
+  // Wildcard CORS cannot gate the bootstrap target — fall back to the trusted
+  // configured origin regardless of what the caller sent (S1 / P2-c).
+  if (config.cors.allowedOrigins.includes('*')) {
+    return withObservableEmptyOrigin(config.webOrigin, req, origin)
+  }
+
   if (origin) {
     const allowed = resolveAllowedOrigin(origin)
     if (!allowed) {
@@ -132,21 +148,45 @@ function resolveBootstrapOrigin(req: Request): string {
     }
     return allowed
   }
-  return config.webOrigin
+  return withObservableEmptyOrigin(config.webOrigin, req, origin)
+}
+
+/**
+ * The bootstrap `targetOrigin` fails safe when it resolves to `''` (an empty
+ * string matches no postMessage target, so the transfer silently never
+ * completes). That is correct but invisible: an operator who forgot to set
+ * `OCTO_WEB_ORIGIN` (default `''`) gets a broken bootstrap with no signal. Emit a
+ * one-line warning so the misconfiguration surfaces in logs instead of a silent
+ * dead bootstrap. Returns the origin unchanged.
+ */
+function withObservableEmptyOrigin(resolved: string, req: Request, requestOrigin: string | undefined): string {
+  if (resolved === '') {
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[octo-docs] ppt bootstrap targetOrigin resolved to empty string; set OCTO_WEB_ORIGIN. ' +
+        'The bootstrap postMessage target is unset and cross-frame transfer will silently fail.',
+      { docId: req.params.docId, requestOrigin: requestOrigin ?? null },
+    )
+  }
+  return resolved
 }
 
 /**
  * Apply the mode/format-appropriate cache headers.
  *
- * A CONCRETE published version's (`?version=<n>`) bento/html source is
- * content-addressed by version_seq, so its URL never changes — it is served
- * with a long `private, max-age, immutable` and an ETag (the content hash).
- *
- * A `latest`/omitted published bento/html URL is MUTABLE: once R5 resolves
- * `latest` to the newest published deck, the same URL returns new bytes across
- * publishes. It must therefore NOT be `immutable` — it is served `private,
- * no-cache` with the content-hash ETag so the client always revalidates
- * conditionally and never pins a stale deck under a long max-age.
+ * A published `bento`/`html` source (any `?version`, concrete or `latest`) is
+ * served `private, no-cache` with the content-hash ETag. The server therefore
+ * re-authorizes every use and answers a matching `If-None-Match` with a `304`,
+ * which keeps the bandwidth win of the immutable variant while binding
+ * revocation to a single request. It is deliberately NOT `immutable`: the
+ * response varies by the authenticating `token` / `X-Space-Id` headers, but the
+ * only `Vary` a concrete-version response carried was `Origin` (from the CORS
+ * layer). A browser HTTP cache keys on (URL, Vary-listed headers), so an
+ * `immutable`, up-to-a-year response with no `Vary` on the auth headers would
+ * hand a second account on the same browser profile the first account's
+ * authorized bytes with no server round-trip and no way to revoke for the life
+ * of the max-age. `private, no-cache` + ETag closes that hole without any `Vary`
+ * subtlety, and is the cleaner immutable-version contract to bless in R5.
  *
  * Everything else — draft/live (unpublished working state) AND every bootstrap
  * payload (which embeds short-lived signed asset URLs that would go stale under
@@ -157,19 +197,15 @@ function applyCacheHeaders(
   res: Response,
   mode: PptSourceMode,
   format: PptSourceFormat,
-  version: 'latest' | number,
   content: PptSourceContent,
 ): void {
   res.setHeader('X-Content-Type-Options', 'nosniff')
   const publishedSource = mode === 'published' && format !== 'bootstrap'
   if (publishedSource) {
-    // Only a concrete numeric version addresses immutable content; `latest`
-    // (or omitted) is mutable and must revalidate.
-    if (typeof version === 'number') {
-      res.setHeader('Cache-Control', `private, max-age=${config.ppt.publishedMaxAgeSeconds}, immutable`)
-    } else {
-      res.setHeader('Cache-Control', 'private, no-cache')
-    }
+    // Always revalidate: `private, no-cache` + content-hash ETag re-authorizes
+    // every use (304 on a match) instead of pinning bytes under a long,
+    // auth-blind `immutable` max-age. See the header note above.
+    res.setHeader('Cache-Control', 'private, no-cache')
     if (content.contentHash) res.setHeader('ETag', `"${content.contentHash}"`)
     return
   }
@@ -238,13 +274,13 @@ export function makePptSourceHandler(provider: PptSourceProvider) {
       if (!content.html) {
         throw new PptApiError('NOT_FOUND', 'no rendered HTML available for this source')
       }
-      applyCacheHeaders(res, mode, format, version, content)
+      applyCacheHeaders(res, mode, format, content)
       res.setHeader('Content-Type', 'text/html; charset=utf-8')
       res.status(200).send(content.html)
       return
     }
 
-    applyCacheHeaders(res, mode, format, version, content)
+    applyCacheHeaders(res, mode, format, content)
 
     if (format === 'bento') {
       // Raw bento/slides deck as the enveloped `data`.

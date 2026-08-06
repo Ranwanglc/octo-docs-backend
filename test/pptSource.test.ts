@@ -1,7 +1,7 @@
 // Env seeding MUST be the first import so config/env.ts reads it at load time.
 import './helpers/pptSourceEnv.js'
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest'
 import type { AddressInfo } from 'node:net'
 import type { Server } from 'node:http'
 import express, { Router, json, type Express } from 'express'
@@ -70,6 +70,7 @@ vi.mock('../src/db/repos/pptDocStateRepo.js', () => ({
 import { createPptSourceRouter } from '../src/api/ppt/source.js'
 import { pptErrorHandler, sendPptError } from '../src/api/ppt/envelope.js'
 import { corsMiddleware } from '../src/api/cors.js'
+import { config } from '../src/config/env.js'
 import { setOctoIdentity, type OctoIdentity, type OctoUser } from '../src/auth/octoIdentity.js'
 import { verifySignedUrl } from '../src/storage/objectStore.js'
 import { hashBentoDeck, type PptSourceContent, type PptSourceProvider } from '../src/ppt/source.js'
@@ -322,13 +323,23 @@ describe('PPT-SOURCE-004 cache policy', () => {
   beforeAll(async () => ({ base, close } = await listen(makeApp(provider))))
   afterAll(async () => close())
 
-  it('published bento CONCRETE version => immutable-version cache + ETag', async () => {
+  it('published bento CONCRETE version => private, no-cache + ETag (NOT immutable — no cross-account poisoning)', async () => {
+    // P1-1: the concrete-version response used to be `immutable`, up-to-1yr, with
+    // no `Vary` on the authenticating token/X-Space-Id headers — a second account
+    // on the same browser profile would be served the first account's authorized
+    // bytes from the per-profile HTTP cache with no server round-trip, and
+    // revocation was unenforceable for the life of the max-age. The `immutable`
+    // branch is deleted: every published source now revalidates (`no-cache`) and
+    // the server re-authorizes each use, so the ETag still delivers the 304
+    // bandwidth win with revocation bounded to a single request.
     asRole('u_reader', 'reader')
     const res = await get(base, 'd_ppt1', { mode: 'published', version: '3', format: 'bento' })
     expect(res.status).toBe(200)
     const cc = res.headers.get('cache-control') ?? ''
-    expect(cc).toContain('immutable')
+    expect(cc).not.toContain('immutable')
+    expect(cc).not.toContain('max-age')
     expect(cc).toContain('private')
+    expect(cc).toContain('no-cache')
     expect(res.headers.get('etag')).toBe(`"${published.contentHash}"`)
   })
 
@@ -358,12 +369,14 @@ describe('PPT-SOURCE-004 cache policy', () => {
     expect(res.headers.get('etag')).toBe(`"${published.contentHash}"`)
   })
 
-  it('published html CONCRETE version => text/html, NOT JSON, immutable cache', async () => {
+  it('published html CONCRETE version => text/html, NOT JSON, private no-cache (NOT immutable)', async () => {
     asRole('u_reader', 'reader')
     const res = await get(base, 'd_ppt1', { mode: 'published', version: '3', format: 'html' })
     expect(res.status).toBe(200)
     expect(res.headers.get('content-type')).toContain('text/html')
-    expect(res.headers.get('cache-control') ?? '').toContain('immutable')
+    const cc = res.headers.get('cache-control') ?? ''
+    expect(cc).not.toContain('immutable')
+    expect(cc).toContain('no-cache')
     const text = await res.text()
     expect(text).toContain('<!doctype html>')
   })
@@ -541,6 +554,107 @@ describe('PPT bootstrap origin safety', () => {
     const body = (await res.json()) as { data: { targetOrigin: string } }
     expect(body.data.targetOrigin).toBe(WEB_ORIGIN)
     expect(body.data.targetOrigin).not.toBe('*')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// Group E2 — wildcard-CORS origin gate is NOT a no-op (S1 / P2-c).
+// ─────────────────────────────────────────────────────────────────────────
+describe('PPT bootstrap origin gate under wildcard CORS (S1 / P2-c)', () => {
+  let base: string
+  let close: () => Promise<void>
+  let savedAllowed: string[]
+  beforeAll(async () => ({ base, close } = await listen(makeApp())))
+  afterAll(async () => close())
+  beforeEach(() => {
+    savedAllowed = [...config.cors.allowedOrigins]
+  })
+  afterEach(() => {
+    // Mutate the array in place (readonly property, mutable array) and restore.
+    config.cors.allowedOrigins.length = 0
+    config.cors.allowedOrigins.push(...savedAllowed)
+  })
+
+  it('CORS_ALLOWED_ORIGINS=* does NOT reflect the caller Origin as targetOrigin — falls back to trusted webOrigin', async () => {
+    // Under `*`, resolveAllowedOrigin echoes any origin, so delegating to it would
+    // let the caller's arbitrary Origin become the postMessage targetOrigin
+    // (origin gate = no-op). The route must instead pin the configured webOrigin.
+    config.cors.allowedOrigins.length = 0
+    config.cors.allowedOrigins.push('*')
+    asRole('u_writer', 'writer')
+    const res = await get(base, 'd_ppt1', {
+      mode: 'draft',
+      format: 'bootstrap',
+      origin: 'https://evil.example.com',
+    })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { data: { targetOrigin: string } }
+    expect(body.data.targetOrigin).toBe(WEB_ORIGIN)
+    expect(body.data.targetOrigin).not.toBe('https://evil.example.com')
+    expect(body.data.targetOrigin).not.toBe('*')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// Group E3 — empty targetOrigin (no Origin + empty webOrigin) is observable (S2).
+// ─────────────────────────────────────────────────────────────────────────
+describe('PPT bootstrap empty targetOrigin is observable (S2)', () => {
+  let base: string
+  let close: () => Promise<void>
+  beforeAll(async () => ({ base, close } = await listen(makeApp())))
+  afterAll(async () => close())
+
+  it('no Origin + unset OCTO_WEB_ORIGIN => warns and still fails safe (empty targetOrigin)', async () => {
+    const cfg = config as unknown as { webOrigin: string }
+    const savedWebOrigin = cfg.webOrigin
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      cfg.webOrigin = ''
+      asRole('u_writer', 'writer')
+      const res = await get(base, 'd_ppt1', { mode: 'draft', format: 'bootstrap' })
+      expect(res.status).toBe(200)
+      const body = (await res.json()) as { data: { targetOrigin: string } }
+      // Fails safe: '' matches no postMessage target, so the transfer never leaks.
+      expect(body.data.targetOrigin).toBe('')
+      // …but the misconfig is now visible instead of a silent dead bootstrap.
+      expect(warn).toHaveBeenCalled()
+      const logged = warn.mock.calls.map((c) => String(c[0])).join('\n')
+      expect(logged).toContain('OCTO_WEB_ORIGIN')
+    } finally {
+      warn.mockRestore()
+      cfg.webOrigin = savedWebOrigin
+    }
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────
+// Group E4 — hashBentoDeck preserves a `__proto__` subtree (P1-2 collision).
+// ─────────────────────────────────────────────────────────────────────────
+describe('hashBentoDeck preserves __proto__ subtree (P1-2 collision)', () => {
+  // `JSON.parse` (the shape a persisted `draft_doc` is read back as) produces an
+  // OWN, enumerable `__proto__` key. The pre-fix canonicaliser copied keys into a
+  // plain `{}`, so `out['__proto__'] = …` walked Object.prototype's setter
+  // instead of creating an own key — the whole `__proto__` subtree vanished from
+  // the serialization and two structurally different decks collided on the same
+  // contentHash (the ETag / comment anchor / cache key).
+  function deckWithProtoSubtree(owner: string): BentoDoc {
+    const nested = JSON.parse(`{"marker":"x","__proto__":{"owner":"${owner}"}}`)
+    const d = deck('Collision') as unknown as Record<string, unknown>
+    d.meta = nested
+    return d as unknown as BentoDoc
+  }
+
+  it('two decks differing ONLY in a __proto__-keyed subtree hash differently', () => {
+    const a = deckWithProtoSubtree('alice')
+    const b = deckWithProtoSubtree('bob')
+    expect(hashBentoDeck(a)).not.toBe(hashBentoDeck(b))
+  })
+
+  it('a __proto__ subtree present vs absent hashes differently (subtree is not dropped)', () => {
+    const withProto = deckWithProtoSubtree('alice')
+    const withoutProto = deck('Collision') as unknown as Record<string, unknown>
+    withoutProto.meta = JSON.parse('{"marker":"x"}')
+    expect(hashBentoDeck(withProto)).not.toBe(hashBentoDeck(withoutProto as unknown as BentoDoc))
   })
 })
 
