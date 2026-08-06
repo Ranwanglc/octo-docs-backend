@@ -728,4 +728,24 @@ export const config = {
     // retention: drop view rows older than this many days (0 = unbounded).
     retainDays: num('DOC_VIEW_RETAIN_DAYS', 90),
   },
+
+  // R3-B1 PPT (html_ppt) source/bootstrap loading (XIN-1495 §4 / §8).
+  // GET /api/v1/ppt/docs/:docId/source access + cache policy knobs. The bootstrap
+  // payload embeds SHORT-LIVED signed asset GET URLs (never a long-lived token in
+  // the URL) minted through the shared object-store presigner, and published
+  // content is served with an immutable-version cache while draft/live and any
+  // bootstrap are private/no-store.
+  ppt: {
+    // TTL for the signed asset GET URLs embedded in a bootstrap payload. Mirrors
+    // C's 15-minute authorized-render window (asset_sig.go); short enough that a
+    // leaked URL expires quickly, long enough to load a deck's media once. The
+    // frontend refreshes via one bootstrap re-fetch when a URL 403/404s
+    // (PPT-ASSET-001), so this is a soft ceiling, not a hard session bound.
+    assetUrlTtlSeconds: numMin('PPT_ASSET_URL_TTL_SECONDS', 900, 1),
+    // max-age stamped on an IMMUTABLE published version's bento/html source. The
+    // content is content-addressed by version_seq, so it never changes under a
+    // given URL — a long max-age + `immutable` lets the browser skip revalidation.
+    // Kept `private` (never `public`) because the bytes are authorized per-reader.
+    publishedMaxAgeSeconds: numMin('PPT_PUBLISHED_MAX_AGE_SECONDS', 31_536_000, 0),
+  },
 } as const
