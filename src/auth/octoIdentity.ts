@@ -13,6 +13,7 @@
  */
 import { config } from '../config/env.js'
 import { Singleflight, TtlCache } from '../util/singleflight.js'
+import { parseOwnedBotUidsStrict } from '../util/botUids.js'
 
 export interface OctoUser {
   uid: string
@@ -94,6 +95,27 @@ export interface OctoIdentity {
    * reads/writes), never loosens it.
    */
   isSpaceMember(uid: string, spaceId: string, token: string): Promise<boolean>
+
+  /**
+   * (user-bot grants) Resolve the bot uids the caller (`uid`, holding `token`)
+   * OWNS in Space `spaceId` — octo-server's `owned_bots_by_space[spaceId]`,
+   * derived from each bot's `robot.creator_uid == uid` AND the bot's active
+   * `space_member` row in `spaceId`. Reuses the SAME authoritative path as
+   * isSpaceMember: POST /v1/auth/verify?include=context, whose response the
+   * server scopes to the TOKEN holder — this never inspects a third party's
+   * bots. Used to gate a Docs access request's `bot_uids` snapshot: a submitted
+   * bot is admissible only if it is in this set.
+   *
+   * `uid` is asserted against verify's resolved uid so a token/uid disagreement
+   * can never confirm ownership.
+   *
+   * FAIL-CLOSED: any transport failure / non-200 / malformed body / a response
+   * that did not carry space context / a token-uid mismatch returns `[]` (the
+   * caller then owns no admissible bots, so a non-empty submitted set is
+   * rejected). A transient octo-server outage therefore TIGHTENS the gate
+   * (rejects the bot snapshot), never widens it.
+   */
+  ownedBotsInSpace(uid: string, spaceId: string, token: string): Promise<string[]>
 }
 
 /**
@@ -242,6 +264,43 @@ export class HttpOctoIdentity implements OctoIdentity {
     return results.filter((u): u is OctoUser => u !== null)
   }
 
+  async ownedBotsInSpace(uid: string, spaceId: string, token: string): Promise<string[]> {
+    // A missing principal/space can own no admissible bots, and an absent token
+    // cannot authorize the verify call. Short out before any IO (fail-closed).
+    if (!uid || !spaceId || !token) return []
+    let res: Response
+    try {
+      res = await fetch(`${this.baseUrl}/v1/auth/verify?include=context`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token }),
+      })
+    } catch {
+      // Authoritative source unreachable => cannot confirm ownership => [].
+      return []
+    }
+    if (!res.ok) return []
+    const body = (await res.json().catch(() => null)) as
+      | { uid?: unknown; context_included?: unknown; owned_bots_by_space?: unknown }
+      | null
+    if (!body) return []
+    // verify answers for the TOKEN holder, so the uid it resolves must be the
+    // uid we are gating on; a mismatch can never confirm ownership.
+    if (typeof body.uid !== 'string' || body.uid !== uid) return []
+    // context is opt-in: a pre-context octo-server omits these fields. Without
+    // context we cannot confirm ownership => fail-closed (never treat an absent
+    // map as "owns everything").
+    if (body.context_included !== true) return []
+    const map = body.owned_bots_by_space
+    if (typeof map !== 'object' || map === null || Array.isArray(map)) return []
+    // Extract only THIS space's list; parseOwnedBotUidsStrict fails the WHOLE
+    // list closed on any illegal/duplicate element (=> []), so a garbled octo-
+    // server body can never authorize a partial set. It is NOT count-capped, so
+    // an owner of > MAX_BOT_UIDS bots still gets the complete authoritative set.
+    const list = (map as Record<string, unknown>)[spaceId]
+    return parseOwnedBotUidsStrict(list)
+  }
+
   async isSpaceMember(uid: string, spaceId: string, token: string): Promise<boolean> {
     // A missing principal or space can never be a real active membership, and an
     // absent caller token cannot authorize a verify call; short out before any
@@ -342,6 +401,10 @@ export class MiddlewareOctoIdentity implements OctoIdentity {
 
   isSpaceMember(uid: string, spaceId: string, token: string): Promise<boolean> {
     return this.delegate.isSpaceMember(uid, spaceId, token)
+  }
+
+  ownedBotsInSpace(uid: string, spaceId: string, token: string): Promise<string[]> {
+    return this.delegate.ownedBotsInSpace(uid, spaceId, token)
   }
 }
 

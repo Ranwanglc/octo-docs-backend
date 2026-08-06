@@ -9,6 +9,7 @@
  */
 import { query } from '../pool.js'
 import { newRequestId } from '../../util/ids.js'
+import { parseStoredBotUids } from '../../util/botUids.js'
 
 export const REQUEST_STATUS_PENDING = 1
 export const REQUEST_STATUS_APPROVED = 2
@@ -24,6 +25,7 @@ export interface DocAccessRequestRow {
   request_id: string
   decided_by: string
   decision_note: string
+  bot_uids: string[] // normalized snapshot of the requester's own Space bots (JSON column); [] when none
   created_at: Date
   updated_at: Date
 }
@@ -44,25 +46,37 @@ export const docAccessRequestRepo = {
    * any row, so the callback resolves it as not_found instead of applying to a
    * newer request. The (doc_id, uid) PK still collapses duplicates to one row.
    * Returns the row's (now current) request_id and status.
+   *
+   * `botUids` is the requester's own Space-bot snapshot (already gated by the
+   * route to the caller's owned_bots_by_space[doc.space_id] subset). It is
+   * re-normalized here and OVERWRITTEN on every (re)submit alongside request_id,
+   * so a re-submit's snapshot fully replaces the prior one — an approval always
+   * acts on the exact bot set of the submission its (rotated) request_id names.
+   * Omitted / empty => stored as `[]` (the zero-bot legacy path).
    */
   async submit(params: {
     docId: string
     uid: string
     requestedRoleNum: number
     reason: string
+    botUids?: string[]
   }): Promise<{ requestId: string; status: number }> {
     const candidateId = newRequestId()
+    // Re-check fail-closed at the DB boundary (the route already strict-validated)
+    // and store canonical JSON text so the column value is stable/order-independent.
+    const botUidsJson = JSON.stringify(parseStoredBotUids(params.botUids ?? []))
     await query(
-      `INSERT INTO doc_access_request (doc_id, uid, requested_role, reason, status, request_id)
-       VALUES (?, ?, ?, ?, ${REQUEST_STATUS_PENDING}, ?)
+      `INSERT INTO doc_access_request (doc_id, uid, requested_role, reason, status, request_id, bot_uids)
+       VALUES (?, ?, ?, ?, ${REQUEST_STATUS_PENDING}, ?, CAST(? AS JSON))
        ON DUPLICATE KEY UPDATE
          requested_role = VALUES(requested_role),
          reason         = VALUES(reason),
          status         = ${REQUEST_STATUS_PENDING},
          decided_by     = '',
          decision_note  = '',
-         request_id     = VALUES(request_id)`,
-      [params.docId, params.uid, params.requestedRoleNum, params.reason, candidateId],
+         request_id     = VALUES(request_id),
+         bot_uids       = VALUES(bot_uids)`,
+      [params.docId, params.uid, params.requestedRoleNum, params.reason, candidateId, botUidsJson],
     )
     // request_id is now rotated to candidateId on both insert and duplicate-update,
     // but read back the authoritative row to return the real stored id + status
@@ -77,10 +91,13 @@ export const docAccessRequestRepo = {
 
   /** List requests for a doc filtered by status (admin pull; default pending). */
   async listByStatus(docId: string, status: number): Promise<DocAccessRequestRow[]> {
-    return query<DocAccessRequestRow>(
+    const rows = await query<DocAccessRequestRow>(
       'SELECT * FROM doc_access_request WHERE doc_id = ? AND status = ? ORDER BY created_at ASC',
       [docId, status],
     )
+    // Fail-closed normalize the JSON snapshot on the read path so a corrupt /
+    // hand-edited DB value can never authorize a bot downstream.
+    return rows.map((r) => ({ ...r, bot_uids: parseStoredBotUids((r as { bot_uids?: unknown }).bot_uids) }))
   },
 
   /** Fetch a single request by (doc_id, request_id) for approve/deny addressing. */
@@ -89,7 +106,9 @@ export const docAccessRequestRepo = {
       'SELECT * FROM doc_access_request WHERE doc_id = ? AND request_id = ? LIMIT 1',
       [docId, requestId],
     )
-    return rows[0] ?? null
+    const row = rows[0]
+    if (!row) return null
+    return { ...row, bot_uids: parseStoredBotUids((row as { bot_uids?: unknown }).bot_uids) }
   },
 
   /**

@@ -49,6 +49,7 @@ function baseParams() {
     title: 'Test Doc',
     requesterUid: 'u-req',
     reason: 'need edit',
+    botUids: [],
   }
 }
 
@@ -112,6 +113,25 @@ describe('notifyDocAccessRequested', () => {
     expect(body.docs_card.actor_name).toBe('申请人小明')
     expect(body.docs_card.excerpt).toBe('need edit')
     expect(typeof body.docs_card.updated_at).toBe('string')
+  })
+
+  it('shows the bot count and every bot uid before approval', async () => {
+    await notifyDocAccessRequested({ ...baseParams(), botUids: ['bot_a', 'bot_b'] })
+    const [, init] = (fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit]
+    const body = JSON.parse(init.body as string)
+    expect(body.docs_card.excerpt).toBe('Bots (2): bot_a, bot_b\nneed edit')
+  })
+
+  it('caps access-request excerpts at 300 runes while always retaining the bot count', async () => {
+    await notifyDocAccessRequested({
+      ...baseParams(),
+      reason: '理'.repeat(400),
+      botUids: Array.from({ length: 50 }, (_, i) => `bot_${i}_${'😀'.repeat(20)}`),
+    })
+    const [, init] = (fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [string, RequestInit]
+    const excerpt = JSON.parse(init.body as string).docs_card.excerpt as string
+    expect([...excerpt]).toHaveLength(300)
+    expect(excerpt.startsWith('Bots (50)')).toBe(true)
   })
 
   it('counts only delivered[]; a filtered recipient is not counted', async () => {

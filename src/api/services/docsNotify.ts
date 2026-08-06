@@ -122,6 +122,25 @@ export interface AccessRequestNotifyParams {
   requesterUid: string
   /** Free-text reason (already trimmed/capped at 512 by the caller). */
   reason: string
+  /** Server-validated bot principals that approval will grant. */
+  botUids: string[]
+}
+
+function accessRequestExcerpt(reason: string, botUids: string[]): string {
+  const takeRunes = (value: string, limit: number): string => [...value].slice(0, Math.max(0, limit)).join('')
+  if (botUids.length === 0) return takeRunes(reason, 300)
+
+  const count = `Bots (${botUids.length})`
+  let excerpt = count
+  for (const uid of botUids) {
+    const next = `${excerpt === count ? ': ' : ', '}${uid}`
+    if ([...(excerpt + next)].length > 300) break
+    excerpt += next
+  }
+  if (reason && [...excerpt].length < 300) {
+    excerpt += `\n${takeRunes(reason, 300 - [...excerpt].length - 1)}`
+  }
+  return excerpt
 }
 
 /**
@@ -299,7 +318,7 @@ export async function notifyDocAccessRequested(p: AccessRequestNotifyParams): Pr
       title: p.title,
       actor_uid: p.requesterUid,
       actor_name: actorName,
-      excerpt: p.reason,
+      excerpt: accessRequestExcerpt(p.reason, p.botUids),
       updated_at: formatCardTimestamp(new Date()),
     }
 

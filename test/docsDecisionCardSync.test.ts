@@ -233,6 +233,36 @@ describe('syncDecisionCards', () => {
     expect(bodyOf(fetchMock, 0).deny_reason).toBe('权限不足')
   })
 
+  it('does not send unsupported bot summary fields to mutate', async () => {
+    repo.listByRequest.mockResolvedValue([row('u-admin1')])
+    await syncDecisionCards({
+      ...baseParams(),
+      denied: false,
+      deciderCardHandledExternally: true,
+    })
+    expect(bodyOf(fetchMock, 0)).not.toHaveProperty('bot_summary')
+  })
+
+  it('does not claim bot-grant outcomes in the re-notify fallback', async () => {
+    repo.listByRequest.mockResolvedValue([row('u-admin1')])
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.includes('/v1/internal/cards/mutate')) return { ok: false, status: 500 }
+      return { ok: true, status: 200 }
+    })
+    await syncDecisionCards({
+      ...baseParams(),
+      denied: false,
+      deciderCardHandledExternally: true,
+    })
+    const notifyIdx = fetchMock.mock.calls.findIndex((c) =>
+      (c[0] as string).includes('/v1/internal/notify'),
+    )
+    expect(notifyIdx).toBeGreaterThanOrEqual(0)
+    const card = (bodyOf(fetchMock, notifyIdx) as unknown as { docs_card: Record<string, string> })
+      .docs_card
+    expect(card.excerpt).toBe('')
+  })
+
   it('never throws even when the ledger lookup fails (best-effort)', async () => {
     repo.listByRequest.mockRejectedValue(new Error('db down'))
     await expect(syncDecisionCards(baseParams())).resolves.toBeUndefined()

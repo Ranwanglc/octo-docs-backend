@@ -24,6 +24,11 @@ import { formatCardTimestamp, formatCardTimestampFromSeconds } from '../../util/
  * than blow the callback.
  */
 const OPERATOR_LOOKUP_TIMEOUT_MS = 1200
+const MAX_DISPLAY_RUNES = 500
+
+function truncateDisplay(value: string): string {
+  return [...value].slice(0, MAX_DISPLAY_RUNES).join('')
+}
 
 /**
  * Resolve the operator's display name — bounded and best-effort. Returns '' when
@@ -54,7 +59,7 @@ export async function resolveOperatorName(operatorUid: string, callerToken?: str
         hint: 'set OCTO_SERVER_TOKEN if approver names should appear on access cards',
       })
     }
-    return name
+    return truncateDisplay(name)
   } catch (err) {
     // eslint-disable-next-line no-console
     console.warn('[octo-docs] decision card: operator name lookup failed', {
@@ -103,7 +108,7 @@ async function assembleDisplay(
   decidedAtDisplay: string,
   callerToken?: string,
 ): Promise<{ display: Record<string, string>; operatorName: string }> {
-  const display: Record<string, string> = { title: title || '文档访问申请' }
+  const display: Record<string, string> = { title: truncateDisplay(title || '文档访问申请') }
   const operatorName = await resolveOperatorName(operatorUid, callerToken)
   if (operatorName) display.operator_name = operatorName
   if (decidedAtDisplay) display.decided_at = decidedAtDisplay

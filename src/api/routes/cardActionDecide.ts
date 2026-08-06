@@ -27,7 +27,8 @@ import {
 } from '../../db/repos/docAccessRequestRepo.js'
 import { docCardActionReceiptRepo } from '../../db/repos/docCardActionReceiptRepo.js'
 import { resolveRole } from '../../permission/resolveRole.js'
-import { grantForwardAccess } from '../services/grantForward.js'
+import { grantRequestWithBots } from '../services/grantRequestWithBots.js'
+import { logBotGrantSummary } from '../services/botGrantAudit.js'
 import { syncDecisionCards } from '../services/docsDecisionCardSync.js'
 import { buildDecisionDisplay, buildDecisionDisplayAt } from '../services/decisionDisplay.js'
 import { isAccessRequestRole, roleFromNumber } from '../../permission/role.js'
@@ -70,6 +71,24 @@ interface DecisionResult {
   state: DecisionState
   requester_uid?: string
   display?: Record<string, string>
+}
+
+const DECISION_RESULT_KEYS = new Set(['disposition', 'state', 'requester_uid', 'display'])
+const MAX_DISPLAY_RUNES = 500
+
+/** Keep the callback response aligned with octo-server's strict decoder. */
+export function assertDecisionResultContract(value: unknown): asserts value is DecisionResult {
+  if (!isRecord(value) || Object.keys(value).some((key) => !DECISION_RESULT_KEYS.has(key))) {
+    throw new Error('invalid decision result shape')
+  }
+  if (value.display !== undefined) {
+    if (!isRecord(value.display)) throw new Error('invalid decision display')
+    for (const displayValue of Object.values(value.display)) {
+      if (typeof displayValue !== 'string' || [...displayValue].length > MAX_DISPLAY_RUNES) {
+        throw new Error('invalid decision display value')
+      }
+    }
+  }
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -266,15 +285,29 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
   // stale-requested_role escalation: a foreign/concurrent event that did not win
   // the CAS falls into the report-only branch above and grants nothing.
   if (req.decision === 'approve') {
-    // Grant the requested role via the shared only-up max-merge path. Idempotent
-    // (resolveRole skip / GREATEST upsert).
-    await grantForwardAccess({
+    // The stored, already-admissible snapshot. The repo read path normalizes it
+    // to an array (fail-closed); `?? []` is defense-in-depth for any caller that
+    // bypasses that path.
+    const botUids = request.bot_uids ?? []
+    // Grant the requested role to the requester AND their carried Space-bot
+    // snapshot via the shared only-up max-merge path. Idempotent (resolveRole
+    // skip / GREATEST upsert). Per-bot failures are isolated and never fail the
+    // callback — the request is already approved (the CAS won above), and the
+    // grant is gated on transitioned===true so bots are granted exactly once
+    // (a redelivery/replay of the same event falls into the report-only branch
+    // above and grants nothing, so no bot is ever double-granted).
+    const result = await grantRequestWithBots({
       docId,
+      requestId,
       documentName: meta.document_name,
       uid: request.uid,
       roleNum: Number(request.requested_role),
       grantedBy: req.operator_uid,
+      botUids,
     })
+    if (botUids.length > 0) {
+      logBotGrantSummary({ source: 'card_callback', docId, requestId, result })
+    }
   }
 
   // Sibling-card sync (task docs-access-decision-card-sync): drive every OTHER
@@ -294,7 +327,6 @@ async function computeDecision(req: DecisionRequest): Promise<DecisionResult> {
     req.operator_uid,
     req.acted_at,
   )
-
   void syncDecisionCards({
     requestId,
     spaceId: meta.space_id,
@@ -331,20 +363,28 @@ async function decideIdempotently(req: DecisionRequest): Promise<DecisionResult>
   const claimed = await docCardActionReceiptRepo.claim(req.event_id)
   if (!claimed) {
     const stored = await docCardActionReceiptRepo.getResponse(req.event_id)
-    if (stored != null) return JSON.parse(stored) as DecisionResult
+    if (stored != null) {
+      const replay: unknown = JSON.parse(stored)
+      assertDecisionResultContract(replay)
+      return replay
+    }
     // Claimed but not finalized (prior crash or in-flight peer) → re-execute.
     // Safe: computeDecision applies the grant ONLY when its decide() CAS wins, so
     // a concurrent sibling that re-executes here cannot double- or stale-grant —
     // the CAS admits exactly one grantor per request regardless of claim outcome.
   }
   const result = await computeDecision(req)
+  assertDecisionResultContract(result)
   const won = await docCardActionReceiptRepo.finalize(req.event_id, JSON.stringify(result))
   if (won) return result
   // A concurrent execution finalized first — return its stored response so all
   // deliveries converge on one identical result. Fall back to our own result
   // only if the row is somehow unreadable (never expected post-finalize).
   const stored = await docCardActionReceiptRepo.getResponse(req.event_id)
-  return stored != null ? (JSON.parse(stored) as DecisionResult) : result
+  if (stored == null) return result
+  const replay: unknown = JSON.parse(stored)
+  assertDecisionResultContract(replay)
+  return replay
 }
 
 /** Express handler for POST CARD_ACTION_DECIDE_PATH. Requires an express.raw body. */
