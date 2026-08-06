@@ -13,9 +13,6 @@
  * `bye`) are allowed for every role.
  */
 
-/** Bento CRDT sync protocol version constant (`SYNC_V`). */
-export const SYNC_V = 2
-
 /** The five Bento op kinds the relay accepts (§7.2). */
 export const OP_KINDS = ['set', 'ins', 'del', 'ord', 'txt'] as const
 export type OpKind = (typeof OP_KINDS)[number]
@@ -24,11 +21,6 @@ const OP_KIND_SET: ReadonlySet<string> = new Set(OP_KINDS)
 /** Client → server frame types. */
 export const CLIENT_FRAME_TYPES = ['hello', 'ops', 'need', 'p', 'bye', 'snap'] as const
 export type ClientFrameType = (typeof CLIENT_FRAME_TYPES)[number]
-
-/** Frame types that MUTATE durable state and therefore require writer/admin. */
-export const PERSISTED_FRAME_TYPES: ReadonlySet<ClientFrameType> = new Set(['ops', 'snap'])
-/** Ephemeral frames every connected role may send. */
-export const EPHEMERAL_FRAME_TYPES: ReadonlySet<ClientFrameType> = new Set(['hello', 'need', 'p', 'bye'])
 
 /**
  * Refused-frame codes (§7.3). Retry classification is fixed: ONLY `rate-limited`

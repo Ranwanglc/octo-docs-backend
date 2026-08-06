@@ -1,26 +1,37 @@
 /**
  * Production wiring for the PPT relay (R4-B1).
  *
- * Composes the relay's default dependencies: the MySQL-backed durable store, the
- * authoritative permission-epoch reader (Redis cache -> DB fallback), a role
- * re-resolver for downgrade enforcement, and the doc-liveness guard. The relay
- * itself is transport-agnostic; {@link PptRelay.attach} binds it to B's existing
- * REST HTTP server on the `/api/v1/ppt/collab` upgrade path — no second service.
+ * Composes the relay's default dependencies: the MySQL-backed durable store, a
+ * Redis-backed single-use ticket store (so the ticket contract holds across relay
+ * nodes), the authoritative permission-epoch reader (Redis cache -> DB fallback),
+ * a share-aware role re-resolver for downgrade enforcement, and the doc-liveness
+ * guard. The relay itself is transport-agnostic; {@link PptRelay.attach} binds it
+ * to B's existing REST HTTP server on the `/api/v1/ppt/collab` upgrade path — no
+ * second service.
  */
 import { PptRelay } from './pptRelay.js'
 import { DbPptRelayStore } from './dbStore.js'
+import { RedisTicketStore } from '../../auth/pptCollabToken.js'
 import { currentEpoch } from '../../permission/epoch.js'
-import { resolveRole } from '../../permission/resolveRole.js'
+import { recheckCurrentRole } from '../../permission/resolveRole.js'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
 
 /** Build the production relay wired to DB/Redis-backed dependencies. */
 export function createPptRelay(): PptRelay {
   return new PptRelay({
     store: new DbPptRelayStore(),
+    // Single-use tickets must be single-use across the whole relay fleet, not
+    // just within one process — wire the shared Redis store.
+    ticketStore: new RedisTicketStore(),
     epochProvider: (documentName) => currentEpoch(documentName),
-    // Downgrade enforcement re-resolves the DIRECT authoritative role (owner /
-    // member row); a removed member resolves to 'none' and the socket is closed.
-    roleProvider: (uid, docId) => resolveRole(uid, docId),
+    // Downgrade enforcement re-resolves the EFFECTIVE role the same way issuance
+    // did (`recheckCurrentRole` = max(direct, share-derived)), folding in an
+    // `anyone_in_space` share grant via the token-carried `space_member` claim —
+    // so this seam never disagrees with issuance and wrongly revokes a legitimate
+    // share writer. It reads share settings FRESH from the doc row, so a scope
+    // narrowing still tightens immediately, and returns 'none' for a
+    // missing/soft-deleted doc or a removed member (fail-closed).
+    roleProvider: (ctx) => recheckCurrentRole(ctx.documentName, ctx.uid, ctx.spaceMember),
     docStatusProvider: async (docId) => {
       const meta = await docMetaRepo.getByDocId(docId)
       return meta && meta.status !== 0 ? 'live' : 'deleted'

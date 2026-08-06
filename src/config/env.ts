@@ -123,17 +123,17 @@ export function requireSafeSigningSecret(secret: string): string {
  * test suite still boot without the var. Returns '' to mean "omit the field";
  * callers must not emit an empty or malformed URL.
  */
-export function resolveCollabPublicWsUrl(raw: string): string {
+export function resolveCollabPublicWsUrl(raw: string, varName = 'COLLAB_TOKEN_PUBLIC_WS_URL'): string {
   const value = raw.trim()
   if (value === '') {
     if (process.env.NODE_ENV === 'production') {
       throw new Error(
-        'COLLAB_TOKEN_PUBLIC_WS_URL must be set in production (refusing to run: clients cannot reach the collab WS without it)',
+        `${varName} must be set in production (refusing to run: clients cannot reach the collab WS without it)`,
       )
     }
     // eslint-disable-next-line no-console
     console.warn(
-      '[config] COLLAB_TOKEN_PUBLIC_WS_URL is not set; collab-token responses will omit collabWsUrl. ' +
+      `[config] ${varName} is not set; collab-token responses will omit the public WS URL. ` +
         'This is fatal in production — set an absolute ws:// or wss:// URL there.',
     )
     return ''
@@ -141,13 +141,13 @@ export function resolveCollabPublicWsUrl(raw: string): string {
   if (!/^wss?:\/\//i.test(value)) {
     if (process.env.NODE_ENV === 'production') {
       throw new Error(
-        `COLLAB_TOKEN_PUBLIC_WS_URL must be an absolute ws:// or wss:// URL, got: ${value} (refusing to run)`,
+        `${varName} must be an absolute ws:// or wss:// URL, got: ${value} (refusing to run)`,
       )
     }
     // eslint-disable-next-line no-console
     console.warn(
-      `[config] COLLAB_TOKEN_PUBLIC_WS_URL must be an absolute ws:// or wss:// URL, got: ${value}. ` +
-        'Ignoring it; collabWsUrl will be omitted. This is fatal in production.',
+      `[config] ${varName} must be an absolute ws:// or wss:// URL, got: ${value}. ` +
+        'Ignoring it; the public WS URL will be omitted. This is fatal in production.',
     )
     return ''
   }
@@ -761,7 +761,7 @@ export const config = {
       // `pptWsUrl` in the collab-token response (§7.1). Absolute ws://|wss://
       // only; REQUIRED in production (unset/malformed is fatal — see
       // resolveCollabPublicWsUrl), soft (warn => omit) outside production.
-      publicWsUrl: resolveCollabPublicWsUrl(str('PPT_RELAY_PUBLIC_WS_URL', '')),
+      publicWsUrl: resolveCollabPublicWsUrl(str('PPT_RELAY_PUBLIC_WS_URL', ''), 'PPT_RELAY_PUBLIC_WS_URL'),
       // Bento default relay limits (§7.3). Starting values ported from Bento's
       // upstream sync worker; load-test before production. Enforced as hard
       // refusals: `too-large` (permanent), `rate-limited` (retryable),

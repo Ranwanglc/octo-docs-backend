@@ -371,3 +371,17 @@ CREATE TABLE ppt_live_snapshot (
   updated_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (doc_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Durable per-room sequence counter for the PPT relay (R4-B1, §7.3). `last_seq`
+-- is the highest op sequence ever ASSIGNED to the room; the relay allocates the
+-- next seq by atomically incrementing this row inside the append transaction.
+-- This is the authoritative seq source, decoupled from ppt_collab_op contents:
+--   · a brand-new room has a row to lock on the very first append, so two first
+--     writers cannot both mint seq=1 (the primary-key insert serializes them);
+--   · the counter NEVER regresses when a full-coverage snapshot prunes every
+--     ppt_collab_op row, so a reused seq can never silently overwrite/replay.
+CREATE TABLE ppt_collab_seq (
+  doc_id   VARCHAR(64) NOT NULL,                          -- FK-by-convention to doc_meta.doc_id (html_ppt row)
+  last_seq BIGINT      NOT NULL DEFAULT 0,                -- highest op seq ever assigned for this room (monotonic)
+  PRIMARY KEY (doc_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

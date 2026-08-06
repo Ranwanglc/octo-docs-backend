@@ -39,40 +39,50 @@ export const pptLiveSnapshotRepo = {
     return { snapshotVersion: Number(row.snapshot_version), coveredSeq: Number(row.covered_seq), doc }
   },
 
-  /** Current version under a row lock (0 when none), tx-scoped. */
-  async versionForUpdateTx(tx: Tx, docId: string): Promise<number> {
-    const rows = await tx.query<{ snapshot_version: number }>(
-      `SELECT snapshot_version FROM ppt_live_snapshot WHERE doc_id = ? FOR UPDATE`,
-      [docId],
-    )
-    return rows[0] ? Number(rows[0].snapshot_version) : 0
-  },
-
   /**
-   * Upsert the live snapshot at an already-computed version (tx-scoped). The
-   * caller advances `version` under the lock taken by {@link versionForUpdateTx},
-   * so the write is atomic w.r.t. concurrent snapshot saves for the same doc.
+   * Persist a snapshot AND advance the version ATOMICALLY, in one upsert (§7.3).
+   *
+   * A single `INSERT ... ON DUPLICATE KEY UPDATE` on the `(doc_id)` row: the
+   * INSERT (first snapshot) or the ON DUPLICATE branch (subsequent saves) takes
+   * the row's exclusive lock, so two concurrent first savers can no longer both
+   * read version 0 and both ack version 1 — they serialize and receive 1 then 2.
+   *
+   * The write also fails-safe against a covered-seq regression (P0-3): the
+   * version, doc, sha and byte columns are only replaced when the incoming
+   * `coveredSeq` is >= the stored one, and `covered_seq` moves via `GREATEST`, so
+   * `doc_json` and `covered_seq` always advance together — a late snapshot that
+   * covers LESS than the current one neither rewinds the coverage nor overwrites
+   * the doc with a shorter prefix. The caller reads the authoritative
+   * post-write `(snapshot_version, covered_seq)` back on the same connection.
    */
-  async upsertTx(
+  async upsertAdvanceTx(
     tx: Tx,
     docId: string,
-    snapshotVersion: number,
     coveredSeq: number,
     doc: BentoDoc,
-  ): Promise<void> {
+  ): Promise<{ snapshotVersion: number; coveredSeq: number }> {
     const docJson = JSON.stringify(doc)
     const sha = createHash('sha256').update(docJson).digest('hex')
     const bytes = Buffer.byteLength(docJson, 'utf8')
     await tx.query(
       `INSERT INTO ppt_live_snapshot (doc_id, snapshot_version, covered_seq, doc_json, doc_sha, doc_bytes)
-       VALUES (?, ?, ?, ?, ?, ?)
+       VALUES (?, 1, ?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE
-         snapshot_version = VALUES(snapshot_version),
-         covered_seq      = VALUES(covered_seq),
-         doc_json         = VALUES(doc_json),
-         doc_sha          = VALUES(doc_sha),
-         doc_bytes        = VALUES(doc_bytes)`,
-      [docId, snapshotVersion, coveredSeq, docJson, sha, bytes],
+         snapshot_version = IF(VALUES(covered_seq) >= covered_seq, snapshot_version + 1, snapshot_version),
+         doc_json         = IF(VALUES(covered_seq) >= covered_seq, VALUES(doc_json), doc_json),
+         doc_sha          = IF(VALUES(covered_seq) >= covered_seq, VALUES(doc_sha), doc_sha),
+         doc_bytes        = IF(VALUES(covered_seq) >= covered_seq, VALUES(doc_bytes), doc_bytes),
+         covered_seq      = GREATEST(covered_seq, VALUES(covered_seq))`,
+      [docId, coveredSeq, docJson, sha, bytes],
     )
+    const rows = await tx.query<{ snapshot_version: number; covered_seq: number }>(
+      `SELECT snapshot_version, covered_seq FROM ppt_live_snapshot WHERE doc_id = ?`,
+      [docId],
+    )
+    const row = rows[0]
+    return {
+      snapshotVersion: row ? Number(row.snapshot_version) : 1,
+      coveredSeq: row ? Number(row.covered_seq) : coveredSeq,
+    }
   },
 }

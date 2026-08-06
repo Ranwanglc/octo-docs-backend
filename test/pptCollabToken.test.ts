@@ -54,6 +54,18 @@ vi.mock('../src/db/repos/pptDocStateRepo.js', () => ({
     ),
   },
 }))
+// B8: the issued snapshotVersion is now sourced from the authoritative live
+// snapshot (ppt_live_snapshot), not ppt_doc_state.snapshot_version (which nothing
+// on the live path advances). Mock it to mirror `currentState`.
+vi.mock('../src/db/repos/pptLiveSnapshotRepo.js', () => ({
+  pptLiveSnapshotRepo: {
+    get: vi.fn(async (docId: string) =>
+      currentState && currentState.docId === docId
+        ? { snapshotVersion: currentState.snapshotVersion, coveredSeq: 0, doc: {} }
+        : null,
+    ),
+  },
+}))
 // docViewHistoryRepo is touched by the legacy issueCollabToken fallback ingest.
 vi.mock('../src/db/repos/docViewHistoryRepo.js', () => ({
   docViewHistoryRepo: { upsertViewWithPrune: vi.fn(async () => undefined) },

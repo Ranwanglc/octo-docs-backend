@@ -25,6 +25,7 @@
 import jwt from 'jsonwebtoken'
 import { randomUUID } from 'node:crypto'
 import { config } from '../config/env.js'
+import { getRedis, rkey } from '../db/redis.js'
 import type { Role } from '../permission/role.js'
 
 /** JWT audience for the primary relay token. */
@@ -46,6 +47,13 @@ export interface PptCollabClaims {
   permission_epoch: number
   /** Server-trusted display name resolved at issuance; absent when unknown. */
   name?: string
+  /**
+   * The caller's space-membership at issuance (§4.4). Carried so the relay can
+   * re-resolve the SAME effective role issuance did — folding in an
+   * `anyone_in_space` share grant via `recheckCurrentRole` — without holding the
+   * caller's octo session token on the socket. Fail-closed: absent => false.
+   */
+  space_member?: boolean
 }
 
 /** Enveloped `data` payload of a successful `collab-token` issuance (§7.1). */
@@ -80,6 +88,8 @@ export interface IssuePptCollabInput {
   permission_epoch: number
   snapshotVersion: number
   name?: string
+  /** Caller's space-membership at issuance (fold-in for share-derived re-resolve). */
+  spaceMember?: boolean
 }
 
 /**
@@ -97,6 +107,7 @@ export function issuePptCollabToken(input: IssuePptCollabInput): PptCollabTokenR
     role: input.role,
     permission_epoch: input.permission_epoch,
     ...(name !== undefined ? { name } : {}),
+    ...(input.spaceMember !== undefined ? { space_member: input.spaceMember } : {}),
   }
 
   const tokenTtl = config.collabToken.ttlSeconds
@@ -135,7 +146,7 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
     throw new Error('invalid ppt collab token payload')
   }
   const d = decoded as Record<string, unknown>
-  const { uid, docId, documentName, role, permission_epoch: epoch, name, jti } = d
+  const { uid, docId, documentName, role, permission_epoch: epoch, name, jti, space_member: spaceMember } = d
   if (
     typeof uid !== 'string' ||
     typeof docId !== 'string' ||
@@ -152,6 +163,7 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
     role,
     permission_epoch: epoch,
     ...(typeof name === 'string' && name !== '' ? { name } : {}),
+    ...(typeof spaceMember === 'boolean' ? { space_member: spaceMember } : {}),
     ...(typeof jti === 'string' ? { jti } : {}),
   }
 }
@@ -222,5 +234,37 @@ export class InMemoryTicketStore implements TicketStore {
     for (const [jti, exp] of this.used) {
       if (exp <= now) this.used.delete(jti)
     }
+  }
+}
+
+/**
+ * Redis-backed single-use ticket store, so the single-use contract holds ACROSS
+ * relay nodes (the whole point of the ticket — an `InMemoryTicketStore` only
+ * guards replay within one process, which a horizontally-scaled relay violates).
+ *
+ * `consume(jti)` is a single atomic `SET <key> 1 NX EX <ttl>`: it returns `true`
+ * only for the node that first sets the key and `false` for every replay on any
+ * node while the key lives. The key auto-expires at the ticket TTL (plus a small
+ * clock-skew slack), so consumed jtis do not accumulate.
+ *
+ * FAIL-CLOSED on a Redis error: a ticket that cannot be atomically consumed is
+ * rejected rather than admitted, matching the epoch reader's posture (a store we
+ * cannot confirm must not silently drop replay protection). This is a security
+ * control; availability of the shared store is a hard dependency of the relay,
+ * which already needs Redis/DB for the epoch cutoff.
+ */
+export class RedisTicketStore implements TicketStore {
+  private readonly ttlSeconds: number
+
+  constructor(ttlSeconds = config.ppt.relay.ticketTtlSeconds) {
+    // Retain a consumed jti a little past its own expiry so a replay inside the
+    // validity window still hits the store (clock skew slack).
+    this.ttlSeconds = Math.max(1, Math.floor(ttlSeconds + 5))
+  }
+
+  async consume(jti: string): Promise<boolean> {
+    const key = rkey('ppt-ticket', jti)
+    const res = await getRedis().set(key, '1', 'EX', this.ttlSeconds, 'NX')
+    return res === 'OK'
   }
 }

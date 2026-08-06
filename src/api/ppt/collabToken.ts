@@ -24,8 +24,9 @@ import { Router, type Request, type Response, type NextFunction, type Router as 
 import { loadPptDocForRead } from './pptDocGuard.js'
 import { PptApiError, sendPptData } from './envelope.js'
 import { pptAuthMiddleware, pptSpaceContextMiddleware } from './auth.js'
-import { pptDocStateRepo } from '../../db/repos/pptDocStateRepo.js'
+import { pptLiveSnapshotRepo } from '../../db/repos/pptLiveSnapshotRepo.js'
 import { parseDocumentName, isDocTypeConsistentWithName } from '../../permission/documentName.js'
+import { SHARE_SCOPE_ANYONE } from '../../permission/shareScope.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { issuePptCollabToken } from '../../auth/pptCollabToken.js'
 import type { Role } from '../../permission/role.js'
@@ -65,10 +66,13 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
     throw new PptApiError('FORBIDDEN', 'no access to this document')
   }
 
-  // Snapshot version seeds the client's replay `since`. Absent state row is 0
-  // (a freshly created deck before any live snapshot).
-  const state = await pptDocStateRepo.getByDocId(docId)
-  const snapshotVersion = state?.snapshotVersion ?? 0
+  // Snapshot version seeds the client's replay `since`. Source it from the
+  // AUTHORITATIVE live-snapshot row (`ppt_live_snapshot`), which the relay
+  // advances on each snapshot save — not `ppt_doc_state.snapshot_version`, which
+  // nothing on the live path updates and so is permanently 0 (B8). Absent live
+  // snapshot => 0 (a freshly created deck before any live snapshot).
+  const liveSnapshot = await pptLiveSnapshotRepo.get(docId)
+  const snapshotVersion = liveSnapshot?.snapshotVersion ?? 0
 
   // Trusted display name (§4.7(b)): resolved from the octo directory at issuance,
   // best-effort — an unavailable name never blocks token issuance.
@@ -80,6 +84,20 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
     /* best-effort: presence falls back to client-supplied name */
   }
 
+  // Space-membership claim (§4.4). Only meaningful — and only worth the extra
+  // lookup — for an `anyone_in_space` deck, where a space member with no
+  // doc_member row is a share-derived writer; a restricted deck's share-derived
+  // role is always 'none', so membership is irrelevant and costs zero IO. The
+  // relay carries this to re-resolve the same effective role on downgrade checks.
+  let spaceMember = false
+  if (meta.share_scope === SHARE_SCOPE_ANYONE) {
+    try {
+      spaceMember = await getOctoIdentity().isSpaceMember(uid, meta.space_id, token ?? '')
+    } catch {
+      spaceMember = false // fail-closed: a lookup error never widens access
+    }
+  }
+
   const result = issuePptCollabToken({
     uid,
     docId,
@@ -87,6 +105,7 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
     role: role as Role,
     permission_epoch: meta.permission_epoch,
     snapshotVersion,
+    spaceMember,
     ...(displayName !== '' ? { name: displayName } : {}),
   })
   sendPptData(res, result)

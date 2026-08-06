@@ -70,6 +70,25 @@ function defaultLimits(): RelayLimits {
   }
 }
 
+/**
+ * Context handed to the role re-resolver when a connection's cached role must be
+ * re-validated (connect-time stale epoch, per-frame downgrade, or an epoch bump).
+ *
+ * It carries `documentName` and `spaceMember` — not just `(uid, docId)` — so the
+ * relay can re-resolve the SAME effective role issuance did: `resolveEffectiveRole`
+ * / `recheckCurrentRole` need the connection key and the caller's space-membership
+ * claim to fold in an `anyone_in_space` share grant. Resolving with a direct-only
+ * seam here would disagree with issuance and wrongly revoke a legitimate share
+ * writer (see B6 / P1-7).
+ */
+export interface RoleResolutionContext {
+  uid: string
+  docId: string
+  documentName: string
+  /** Space-membership claim minted at issuance (fail-closed to false). */
+  spaceMember: boolean
+}
+
 export interface PptRelayDeps {
   /** Durable op/snapshot store. */
   store: PptRelayStore
@@ -79,8 +98,8 @@ export interface PptRelayDeps {
   ticketStore?: TicketStore
   /** Authoritative live epoch for a documentName (fail-closed: throw => reject). */
   epochProvider: (documentName: string) => Promise<number>
-  /** Re-resolve a connection's role on an epoch bump (default: none => close). */
-  roleProvider?: (uid: string, docId: string) => Promise<ResolvedRole>
+  /** Re-resolve a connection's effective role (default: none => close). */
+  roleProvider?: (ctx: RoleResolutionContext) => Promise<ResolvedRole>
   /** Doc liveness for the doc-deleted guard (default: assume live). */
   docStatusProvider?: (docId: string) => Promise<'live' | 'deleted'>
   protocolVersion?: number
@@ -101,6 +120,8 @@ interface Conn {
    */
   roleEpoch: number
   name?: string
+  /** Space-membership claim minted at issuance (fed to role re-resolution). */
+  spaceMember: boolean
   /** Timestamps of recently persisted frames, for the sliding-window rate limit. */
   frameTimes: number[]
 }
@@ -132,13 +153,15 @@ export class PptRelay {
   private readonly verifyTicket: (ticket: string) => PptCollabClaims & { jti: string }
   private readonly ticketStore: TicketStore
   private readonly epochProvider: (documentName: string) => Promise<number>
-  private readonly roleProvider?: (uid: string, docId: string) => Promise<ResolvedRole>
+  private readonly roleProvider?: (ctx: RoleResolutionContext) => Promise<ResolvedRole>
   private readonly docStatusProvider?: (docId: string) => Promise<'live' | 'deleted'>
   private readonly pv: number
   private readonly limits: RelayLimits
   private readonly rooms = new Map<string, Set<Conn>>()
   /** Cumulative persisted frame bytes per room (room-full guard). */
   private readonly roomBytes = new Map<string, number>()
+  /** Rooms whose {@link roomBytes} has been seeded from durable state. */
+  private readonly roomBytesSeeded = new Set<string>()
 
   constructor(deps: PptRelayDeps) {
     this.store = deps.store
@@ -223,13 +246,19 @@ export class PptRelay {
     // stale ticket is rejected so the client re-mints a fresh one. A ticket at
     // the current epoch is trusted as-is (its authority is still fresh).
     let role: ResolvedRole = claims.role
+    const spaceMember = claims.space_member === true
     if (claims.permission_epoch !== liveEpoch) {
       if (!this.roleProvider) {
         socket.close(CLOSE_UNAUTHORIZED, 'stale ticket epoch')
         return
       }
       try {
-        role = await this.roleProvider(claims.uid, claims.docId)
+        role = await this.roleProvider({
+          uid: claims.uid,
+          docId: claims.docId,
+          documentName: claims.documentName,
+          spaceMember,
+        })
       } catch {
         role = 'none'
       }
@@ -248,6 +277,7 @@ export class PptRelay {
       // The role above was validated/re-resolved against the live epoch.
       roleEpoch: liveEpoch,
       name: claims.name,
+      spaceMember,
       frameTimes: [],
     }
     this.addToRoom(conn)
@@ -273,7 +303,13 @@ export class PptRelay {
     const room = this.rooms.get(conn.docId)
     if (!room) return
     room.delete(conn)
-    if (room.size === 0) this.rooms.delete(conn.docId)
+    if (room.size === 0) {
+      this.rooms.delete(conn.docId)
+      // Drop the process-local budget for an empty room; it re-seeds from durable
+      // state when the room is next joined, so this only bounds memory.
+      this.roomBytes.delete(conn.docId)
+      this.roomBytesSeeded.delete(conn.docId)
+    }
   }
 
   private broadcast(conn: Conn, frame: ServerFrame): void {
@@ -316,6 +352,10 @@ export class PptRelay {
       return
     }
     const frame = result.frame
+    // Byte size of the wire frame for the size/room limits. `raw.length` is a
+    // UTF-16 code-unit count that UNDERCOUNTS multi-byte JSON; the limits are
+    // byte budgets, so measure real UTF-8 bytes.
+    const rawBytes = Buffer.byteLength(raw, 'utf8')
     switch (frame.t) {
       case 'hello':
         await this.replay(conn, typeof frame.since === 'number' ? frame.since : 0)
@@ -331,10 +371,10 @@ export class PptRelay {
         conn.socket.close(1000, 'bye')
         return
       case 'ops':
-        await this.handleOps(conn, frame as OpsFrame, raw.length)
+        await this.handleOps(conn, frame as OpsFrame, rawBytes)
         return
       case 'snap':
-        await this.handleSnap(conn, frame as SnapFrame, raw.length)
+        await this.handleSnap(conn, frame as SnapFrame, rawBytes)
         return
       default:
         this.refuse(conn, 'protocol-version', { message: 'unhandled frame type' })
@@ -357,11 +397,16 @@ export class PptRelay {
     }
     if (ready) {
       const q = await this.store.currentSeq(conn.docId)
-      let epoch = snap?.snapshotVersion ?? 0
+      // Fallback is the connection's last-known LIVE epoch (validated at
+      // handshake), NOT the snapshot version — stamping a snapshot counter as an
+      // epoch would make every subsequent mutation fail `stale-epoch` with no
+      // recovery. If the provider is momentarily down we surface the last real
+      // epoch; a mutating frame re-checks the live epoch anyway.
+      let epoch = conn.roleEpoch
       try {
         epoch = await this.epochProvider(conn.documentName)
       } catch {
-        /* keep replay usable; a mutating frame will re-check epoch */
+        /* keep replay usable with the last-known epoch; mutation re-checks */
       }
       send(conn.socket, {
         ctl: 'ready',
@@ -373,9 +418,14 @@ export class PptRelay {
     }
   }
 
-  /** Shared pre-persist validation for `ops`/`snap` (returns a code or null). */
-  private async guardMutation(conn: Conn, frameEpoch: number, rawBytes: number): Promise<RefusedCode | null> {
-    if (rawBytes > this.limits.maxFrameBytes) return 'too-large'
+  /**
+   * Shared pre-persist validation for `ops`/`snap` (returns a code or null).
+   * `maxBytes` is the size gate for THIS frame kind: an op frame uses the small
+   * per-frame limit, a snapshot the larger single-blob limit — so the snapshot
+   * blob budget actually binds rather than being pre-empted by the op-frame cap.
+   */
+  private async guardMutation(conn: Conn, frameEpoch: number, rawBytes: number, maxBytes: number): Promise<RefusedCode | null> {
+    if (rawBytes > maxBytes) return 'too-large'
     if (this.docStatusProvider) {
       try {
         if ((await this.docStatusProvider(conn.docId)) === 'deleted') return 'doc-deleted'
@@ -421,7 +471,12 @@ export class PptRelay {
     let resolved: ResolvedRole = 'none'
     if (this.roleProvider) {
       try {
-        resolved = await this.roleProvider(conn.uid, conn.docId)
+        resolved = await this.roleProvider({
+          uid: conn.uid,
+          docId: conn.docId,
+          documentName: conn.documentName,
+          spaceMember: conn.spaceMember,
+        })
       } catch {
         resolved = 'none'
       }
@@ -443,6 +498,28 @@ export class PptRelay {
     return null
   }
 
+  /**
+   * Return the room's current persisted-byte budget usage, seeding it once from
+   * durable state. The counter is process-local, so on a fresh process (restart,
+   * or another node) it would otherwise start at 0 and ignore already-persisted
+   * ops; seeding from the store's `roomBytes` makes the first frame per room
+   * account for the durable backlog. A seed failure leaves the room unseeded so a
+   * later frame retries rather than pinning a wrong 0.
+   */
+  private async ensureRoomBudget(docId: string): Promise<number> {
+    if (!this.roomBytesSeeded.has(docId)) {
+      try {
+        const durable = await this.store.roomBytes(docId)
+        // Do not clobber bytes counted by frames that landed during the seed read.
+        this.roomBytes.set(docId, Math.max(durable, this.roomBytes.get(docId) ?? 0))
+        this.roomBytesSeeded.add(docId)
+      } catch {
+        /* leave unseeded; retry on the next frame */
+      }
+    }
+    return this.roomBytes.get(docId) ?? 0
+  }
+
   private async handleOps(conn: Conn, frame: OpsFrame, rawBytes: number): Promise<void> {
     const k = typeof frame.k === 'number' ? frame.k : undefined
     const frameId = typeof frame.frameId === 'string' ? frame.frameId : undefined
@@ -458,15 +535,18 @@ export class PptRelay {
       this.refuse(conn, 'too-large', { k, frameId, message: 'op count exceeds per-frame limit' })
       return
     }
-    const guardCode = await this.guardMutation(conn, typeof frame.epoch === 'number' ? frame.epoch : -1, rawBytes)
+    const guardCode = await this.guardMutation(conn, typeof frame.epoch === 'number' ? frame.epoch : -1, rawBytes, this.limits.maxFrameBytes)
     if (guardCode) {
       this.refuse(conn, guardCode, { k, frameId })
       return
     }
     // Room-full: a room whose durable frame bytes would exceed the cap refuses
-    // further persisted frames (permanent).
-    const roomUsed = this.roomBytes.get(conn.docId) ?? 0
-    if (roomUsed + rawBytes > this.limits.maxRoomFrameBytes) {
+    // further persisted frames (permanent). The budget is measured in PERSISTED
+    // frame bytes (what a prune later reclaims), seeded once from durable state so
+    // a restart does not silently reset the room to empty (see ensureRoomBudget).
+    const frameBytes = Buffer.byteLength(JSON.stringify(frame), 'utf8')
+    const roomUsed = await this.ensureRoomBudget(conn.docId)
+    if (roomUsed + frameBytes > this.limits.maxRoomFrameBytes) {
       this.refuse(conn, 'room-full', { k, frameId, message: 'room frame budget exhausted' })
       return
     }
@@ -488,10 +568,18 @@ export class PptRelay {
       this.refuse(conn, 'storage-failed', { k, frameId, message: 'durable persistence failed' })
       return
     }
-    if (!duplicate) this.roomBytes.set(conn.docId, roomUsed + rawBytes)
+    if (!duplicate) this.roomBytes.set(conn.docId, roomUsed + frameBytes)
 
-    const snap = await this.store.getSnapshot(conn.docId)
-    const snapshotVersion = snap?.snapshotVersion ?? 0
+    // Post-commit: the write is DURABLE, so the sender MUST get an ack (never a
+    // silent drop, §7.3). Reading the snapshot version for the ack is best-effort
+    // — a failure there must not swallow the ack for an already-persisted op.
+    let snapshotVersion = 0
+    try {
+      const snap = await this.store.getSnapshot(conn.docId)
+      snapshotVersion = snap?.snapshotVersion ?? 0
+    } catch {
+      /* keep the ack: the op is durable regardless of the snapshot read */
+    }
     // Ack the sender ONLY after the durable write.
     send(conn.socket, { ctl: 'ack', k: frame.k, q: seq, snapshotVersion })
     // Broadcast to peers only for a first-seen frame (no echo, no double-apply).
@@ -500,11 +588,10 @@ export class PptRelay {
 
   private async handleSnap(conn: Conn, frame: SnapFrame, rawBytes: number): Promise<void> {
     const k = typeof frame.k === 'number' ? frame.k : undefined
-    if (rawBytes > this.limits.maxSingleBlobBytes) {
-      this.refuse(conn, 'too-large', { k, message: 'snapshot exceeds single-blob limit' })
-      return
-    }
-    const guardCode = await this.guardMutation(conn, typeof frame.epoch === 'number' ? frame.epoch : -1, rawBytes)
+    // The single-blob limit is enforced inside guardMutation (as this frame's
+    // size gate) so a legitimately large snapshot is not pre-empted by the small
+    // per-op-frame cap.
+    const guardCode = await this.guardMutation(conn, typeof frame.epoch === 'number' ? frame.epoch : -1, rawBytes, this.limits.maxSingleBlobBytes)
     if (guardCode) {
       this.refuse(conn, guardCode, { k })
       return
@@ -529,14 +616,30 @@ export class PptRelay {
       this.refuse(conn, 'storage-failed', { k, message: 'snapshot persistence failed' })
       return
     }
-    // GC only AFTER the snapshot is durable (§7.3).
-    await this.store.pruneOpsThrough(conn.docId, covered)
+    // GC only AFTER the snapshot is durable (§7.3). The snapshot is already
+    // committed, so a prune failure must NOT swallow the ack (the pruned ops are
+    // subsumed by the durable snapshot; leaving them just defers GC). Reclaim the
+    // freed bytes from the room budget so it does not monotonically grow.
+    try {
+      const freed = await this.store.pruneOpsThrough(conn.docId, covered)
+      if (this.roomBytesSeeded.has(conn.docId)) {
+        const used = this.roomBytes.get(conn.docId) ?? 0
+        this.roomBytes.set(conn.docId, Math.max(0, used - freed))
+      }
+    } catch {
+      /* keep the ack: the snapshot is durable; prune is best-effort GC */
+    }
     send(conn.socket, { ctl: 'ack', k: frame.k ?? 0, q: covered, snapshotVersion })
   }
 
   /**
-   * React to a permission-epoch bump on a room (§7.4). Re-resolves each
-   * connection's role and applies ONLY the safe direction on the live socket:
+   * React to a permission-epoch bump on a room (§7.4). A doc soft-delete bumps
+   * the epoch and publishes the SAME invalidation event (see
+   * `docMetaRepo.softDelete` + `refreshAndPublish`), so this is also the live
+   * signal that wires {@link closeRoomForDeleted}: a deleted doc closes its
+   * sockets with 4404 (document deleted), which takes precedence over the role
+   * path below (a revoked-but-live doc closes 4403). Otherwise it re-resolves
+   * each connection's role and applies ONLY the safe direction on the live socket:
    *   · `none`      → close the socket (4403); access revoked.
    *   · a DOWNGRADE → lower `conn.role` and notify `role-changed` so the client
    *                   disables editing; old-epoch frames in flight are refused.
@@ -544,9 +647,33 @@ export class PptRelay {
    *                   authority requires a FRESH token/ticket (PPT-EPOCH-003), so
    *                   the old socket stays non-mutating until the client
    *                   reconnects. We do not raise privileges mid-connection.
-   * No-op when no `roleProvider` was injected.
+   * No-op for the role path when no `roleProvider` was injected (deletion-close
+   * still runs).
    */
   async applyEpochBump(documentName: string): Promise<void> {
+    // Deletion takes precedence: a doc that is now gone closes 4404, not 4403.
+    // (This also covers the case where deletion is the only reason for the bump.)
+    if (this.docStatusProvider) {
+      const docIds = new Set<string>()
+      for (const room of this.rooms.values()) {
+        for (const conn of room) {
+          if (conn.documentName === documentName) docIds.add(conn.docId)
+        }
+      }
+      for (const docId of docIds) {
+        let deleted = false
+        try {
+          deleted = (await this.docStatusProvider(docId)) === 'deleted'
+        } catch {
+          // A transient status-lookup failure is NOT treated as deletion here;
+          // the role path below still fails closed (resolve throws => 'none' =>
+          // 4403), so the socket is not left authorized.
+          deleted = false
+        }
+        if (deleted) this.closeRoomForDeleted(docId)
+      }
+    }
+
     if (!this.roleProvider) return
     let newEpoch = 0
     let epochOk = false
@@ -561,7 +688,12 @@ export class PptRelay {
         if (conn.documentName !== documentName) continue
         let role: ResolvedRole
         try {
-          role = await this.roleProvider(conn.uid, conn.docId)
+          role = await this.roleProvider({
+            uid: conn.uid,
+            docId: conn.docId,
+            documentName: conn.documentName,
+            spaceMember: conn.spaceMember,
+          })
         } catch {
           role = 'none'
         }

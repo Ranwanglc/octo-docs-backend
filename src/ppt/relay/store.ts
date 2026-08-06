@@ -31,6 +31,8 @@ export interface AppendOpResult {
   seq: number
   /** True when `(docId, frameId)` already existed — `seq` is the original. */
   duplicate: boolean
+  /** Byte size of the persisted frame JSON (room-budget accounting). */
+  frameBytes: number
 }
 
 export interface RelaySnapshot {
@@ -62,6 +64,8 @@ export interface PptRelayStore {
   opsSince(docId: string, sinceSeq: number): Promise<PersistedOp[]>
   /** Highest assigned room sequence for the doc (0 when none). */
   currentSeq(docId: string): Promise<number>
+  /** Sum of persisted frame bytes still present for the room (budget seeding). */
+  roomBytes(docId: string): Promise<number>
   /** Latest durable snapshot, or null when none exists yet. */
   getSnapshot(docId: string): Promise<RelaySnapshot | null>
   /**
@@ -69,12 +73,12 @@ export interface PptRelayStore {
    * covered ops via {@link pruneOpsThrough} only AFTER this resolves.
    */
   saveSnapshot(input: SaveSnapshotInput): Promise<SaveSnapshotResult>
-  /** Delete persisted ops with `seq <= coveredSeq` (post-snapshot GC). */
-  pruneOpsThrough(docId: string, coveredSeq: number): Promise<void>
+  /** Delete persisted ops with `seq <= coveredSeq`; returns the bytes reclaimed. */
+  pruneOpsThrough(docId: string, coveredSeq: number): Promise<number>
 }
 
 interface RoomState {
-  ops: PersistedOp[]
+  ops: Array<PersistedOp & { bytes: number }>
   seq: number
   byFrameId: Map<string, number>
   snapshot: RelaySnapshot | null
@@ -99,22 +103,30 @@ export class InMemoryPptRelayStore implements PptRelayStore {
 
   async appendOp(docId: string, frameId: string, frame: unknown): Promise<AppendOpResult> {
     const r = this.room(docId)
+    const bytes = Buffer.byteLength(JSON.stringify(frame), 'utf8')
     const existing = r.byFrameId.get(frameId)
-    if (existing !== undefined) return { seq: existing, duplicate: true }
+    if (existing !== undefined) {
+      const prev = r.ops.find((o) => o.seq === existing)
+      return { seq: existing, duplicate: true, frameBytes: prev?.bytes ?? bytes }
+    }
     const seq = r.seq + 1
     r.seq = seq
-    r.ops.push({ seq, frameId, frame })
+    r.ops.push({ seq, frameId, frame, bytes })
     r.byFrameId.set(frameId, seq)
-    return { seq, duplicate: false }
+    return { seq, duplicate: false, frameBytes: bytes }
   }
 
   async opsSince(docId: string, sinceSeq: number): Promise<PersistedOp[]> {
     const r = this.room(docId)
-    return r.ops.filter((o) => o.seq > sinceSeq).map((o) => ({ ...o }))
+    return r.ops.filter((o) => o.seq > sinceSeq).map((o) => ({ seq: o.seq, frameId: o.frameId, frame: o.frame }))
   }
 
   async currentSeq(docId: string): Promise<number> {
     return this.room(docId).seq
+  }
+
+  async roomBytes(docId: string): Promise<number> {
+    return this.room(docId).ops.reduce((sum, o) => sum + o.bytes, 0)
   }
 
   async getSnapshot(docId: string): Promise<RelaySnapshot | null> {
@@ -124,13 +136,27 @@ export class InMemoryPptRelayStore implements PptRelayStore {
 
   async saveSnapshot(input: SaveSnapshotInput): Promise<SaveSnapshotResult> {
     const r = this.room(input.docId)
-    const snapshotVersion = (r.snapshot?.snapshotVersion ?? 0) + 1
-    r.snapshot = { snapshotVersion, coveredSeq: input.coveredSeq, doc: input.doc }
-    return { snapshotVersion }
+    const cur = r.snapshot
+    // Mirror the DB store's atomic covered-guard: only advance the version and
+    // replace the doc when the incoming coverage does not regress (P0-3).
+    if (!cur || input.coveredSeq >= cur.coveredSeq) {
+      const snapshotVersion = (cur?.snapshotVersion ?? 0) + 1
+      r.snapshot = { snapshotVersion, coveredSeq: input.coveredSeq, doc: input.doc }
+      return { snapshotVersion }
+    }
+    return { snapshotVersion: cur.snapshotVersion }
   }
 
-  async pruneOpsThrough(docId: string, coveredSeq: number): Promise<void> {
+  async pruneOpsThrough(docId: string, coveredSeq: number): Promise<number> {
     const r = this.room(docId)
-    r.ops = r.ops.filter((o) => o.seq > coveredSeq)
+    let freed = 0
+    r.ops = r.ops.filter((o) => {
+      if (o.seq <= coveredSeq) {
+        freed += o.bytes
+        return false
+      }
+      return true
+    })
+    return freed
   }
 }

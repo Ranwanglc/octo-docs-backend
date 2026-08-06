@@ -94,7 +94,13 @@ interface Harness {
 
 const harnesses: Harness[] = []
 
-async function setup(opts: { store?: PptRelayStore; limits?: Partial<RelayLimits> } = {}): Promise<Harness> {
+async function setup(
+  opts: {
+    store?: PptRelayStore
+    limits?: Partial<RelayLimits>
+    roleProvider?: (ctx: { uid: string; docId: string; documentName: string; spaceMember: boolean }) => Promise<ResolvedRole>
+  } = {},
+): Promise<Harness> {
   const store = opts.store ?? new InMemoryPptRelayStore()
   let liveEpoch = 0
   const roleMap = new Map<string, ResolvedRole>()
@@ -103,7 +109,7 @@ async function setup(opts: { store?: PptRelayStore; limits?: Partial<RelayLimits
   const relay = new PptRelay({
     store,
     epochProvider: async () => liveEpoch,
-    roleProvider: async (uid: string) => roleMap.get(uid) ?? 'writer',
+    roleProvider: opts.roleProvider ?? (async ({ uid }) => roleMap.get(uid) ?? 'writer'),
     docStatusProvider: async () => docStatus,
     limits: opts.limits,
   })
@@ -374,9 +380,10 @@ describe('PPT relay: refused retry classification (PPT-WS-006)', () => {
       },
       opsSince: async () => [],
       currentSeq: async () => 0,
+      roomBytes: async () => 0,
       getSnapshot: async () => null,
       saveSnapshot: async () => ({ snapshotVersion: 1 }),
-      pruneOpsThrough: async () => undefined,
+      pruneOpsThrough: async () => 0,
     }
     const h = await setup({ store: failing })
     const w = await h.connect({ uid: 'u_w', role: 'writer' })
@@ -672,5 +679,173 @@ describe('PPT relay: stale-ticket epoch cutoff fails CLOSED (PPT-EPOCH-001 regre
     expect(refused.ctl).toBe('refused')
     expect(refused.code).toBe('forbidden-role')
     expect(await h.store.currentSeq(DOC)).toBe(0)
+  })
+})
+
+describe('PPT relay: share-aware role re-resolution (B6 / P1-7)', () => {
+  // A resolver that mirrors the PRODUCTION seam: a space-share member with no
+  // doc_member row resolves to `writer` ONLY when the connection carried a
+  // positive `space_member` claim — a direct-only resolver would return `none`
+  // and wrongly revoke a legitimate share writer after any epoch bump.
+  const shareResolver = async (ctx: {
+    uid: string
+    docId: string
+    documentName: string
+    spaceMember: boolean
+  }): Promise<ResolvedRole> => {
+    expect(ctx.docId).toBe(DOC)
+    expect(ctx.documentName).toBe(DOCNAME)
+    return ctx.spaceMember ? 'writer' : 'none'
+  }
+
+  it('a stale-epoch ticket for a share writer re-resolves to writer (not revoked) when space_member is carried', async () => {
+    const h = await setup({ roleProvider: shareResolver })
+    h.setEpoch(1) // live epoch advanced past the ticket's epoch 0
+    // A legitimate ticket minted before the bump, carrying the space_member claim.
+    const ticket = issuePptCollabToken({
+      uid: 'u_share',
+      docId: DOC,
+      documentName: DOCNAME,
+      role: 'writer',
+      permission_epoch: 0,
+      snapshotVersion: 0,
+      spaceMember: true,
+    }).ticket
+    const c = await h.connect({ uid: 'u_share', role: 'writer', ticket })
+    const { ready } = await helloReady(c)
+    expect(ready.role).toBe('writer') // re-resolved via the share path, not revoked
+    // And it can actually mutate at the live epoch.
+    c.send(OPS_FRAME(1, 'sh1', 1))
+    expect(await c.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+  })
+
+  it('a stale-epoch ticket for a non-member fails closed (4403)', async () => {
+    const h = await setup({ roleProvider: shareResolver })
+    h.setEpoch(1)
+    const ticket = issuePptCollabToken({
+      uid: 'u_out',
+      docId: DOC,
+      documentName: DOCNAME,
+      role: 'writer',
+      permission_epoch: 0,
+      snapshotVersion: 0,
+      spaceMember: false,
+    }).ticket
+    const c = await h.connect({ uid: 'u_out', role: 'writer', ticket })
+    expect((await c.closed).code).toBe(4403)
+  })
+})
+
+describe('PPT relay: doc-deletion closes the room 4404 via the invalidate signal (B5)', () => {
+  it('applyEpochBump closes live sockets with 4404 when the doc is deleted', async () => {
+    const h = await setup()
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    const b = await h.connect({ uid: 'u_b', role: 'reader' })
+    await helloReady(a)
+    await helloReady(b)
+    // Doc soft-delete bumps the epoch and publishes the same invalidate event
+    // that drives applyEpochBump; the relay must close 4404 (not 4403).
+    h.setDocStatus('deleted')
+    await h.relay.applyEpochBump(DOCNAME)
+    expect((await a.closed).code).toBe(4404)
+    expect((await b.closed).code).toBe(4404)
+    expect(h.relay.roomSize(DOC)).toBe(0)
+  })
+})
+
+describe('PPT relay: no silent drops post-commit (B7 / P1-12)', () => {
+  it('an op still ACKs when the durable write succeeded but the snapshot read throws', async () => {
+    const base = new InMemoryPptRelayStore()
+    const store: PptRelayStore = {
+      appendOp: (d, f, fr) => base.appendOp(d, f, fr),
+      opsSince: (d, s) => base.opsSince(d, s),
+      currentSeq: (d) => base.currentSeq(d),
+      roomBytes: (d) => base.roomBytes(d),
+      getSnapshot: async (d) => {
+        // Fail the post-commit snapshot read (there is a persisted op by then),
+        // but let the pre-op replay read succeed so the client reaches `ready`.
+        if ((await base.currentSeq(d)) > 0) throw new Error('snapshot read down')
+        return base.getSnapshot(d)
+      },
+      saveSnapshot: (i) => base.saveSnapshot(i),
+      pruneOpsThrough: (d, c) => base.pruneOpsThrough(d, c),
+    }
+    const h = await setup({ store })
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+    w.send(OPS_FRAME(7, 'commit1'))
+    const ack = await w.recv()
+    expect(ack.ctl).toBe('ack') // durable op is acked despite the snapshot read failing
+    expect(ack.q).toBe(1)
+    expect(await base.currentSeq(DOC)).toBe(1)
+  })
+
+  it('a snapshot still ACKs when the post-save prune throws', async () => {
+    const base = new InMemoryPptRelayStore()
+    const store: PptRelayStore = {
+      appendOp: (d, f, fr) => base.appendOp(d, f, fr),
+      opsSince: (d, s) => base.opsSince(d, s),
+      currentSeq: (d) => base.currentSeq(d),
+      roomBytes: (d) => base.roomBytes(d),
+      getSnapshot: (d) => base.getSnapshot(d),
+      saveSnapshot: (i) => base.saveSnapshot(i),
+      pruneOpsThrough: async () => {
+        throw new Error('prune down')
+      },
+    }
+    const h = await setup({ store })
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+    w.send(OPS_FRAME(1, 'op1'))
+    await w.recv() // ack for the op
+    w.send({ t: 'snap', pv: 2, k: 2, epoch: 0, q: 1, doc: deck() })
+    const ack = await w.recv()
+    expect(ack.ctl).toBe('ack') // snapshot durable -> acked even though GC failed
+    expect(ack.snapshotVersion).toBe(1)
+  })
+})
+
+describe('PPT relay: byte-accurate limits + binding blob cap (non-blocking)', () => {
+  it('measures UTF-8 bytes, not code units, for the frame-size limit', async () => {
+    // Each 4-byte emoji is one UTF-16 surrogate pair (2 code units). A frame whose
+    // real UTF-8 size exceeds the cap but whose `raw.length` does not must still be
+    // refused too-large.
+    const h = await setup({ limits: { maxFrameBytes: 200 } })
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+    const bigValue = '😀'.repeat(60) // 240 UTF-8 bytes, 120 UTF-16 code units
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'big', epoch: 0, ops: [{ kind: 'set', key: 's1e1', prop: 'text', value: bigValue }] })
+    expect(await w.recv()).toMatchObject({ code: 'too-large', retryable: false })
+  })
+
+  it('a large snapshot is accepted where an equally large op frame is refused (blob cap binds)', async () => {
+    // maxFrameBytes (op cap) is small; maxSingleBlobBytes (snapshot cap) is large.
+    // The snapshot must not be pre-empted by the op-frame cap.
+    const h = await setup({ limits: { maxFrameBytes: 300, maxSingleBlobBytes: 200_000 } })
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+    // An op frame over the 300-byte op cap: refused.
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'bigop', epoch: 0, ops: [{ kind: 'set', key: 'k', prop: 'p', value: 'x'.repeat(400) }] })
+    expect(await w.recv()).toMatchObject({ code: 'too-large' })
+    // A snapshot of similar size: accepted (under the blob cap).
+    const big = deck('x'.repeat(400))
+    w.send({ t: 'snap', pv: 2, k: 2, epoch: 0, q: 0, doc: big })
+    expect(await w.recv()).toMatchObject({ ctl: 'ack', snapshotVersion: 1 })
+  })
+
+  it('room-full budget is seeded from durable state so a fresh process counts existing ops', async () => {
+    const store = new InMemoryPptRelayStore()
+    // Seed durable ops totalling some bytes BEFORE any socket connects (models a
+    // process that restarted with a non-empty room).
+    await store.appendOp(DOC, 'seed1', { t: 'ops', ops: [{ kind: 'set', key: 'k', prop: 'p', value: 'y'.repeat(400) }] })
+    const seeded = await store.roomBytes(DOC)
+    expect(seeded).toBeGreaterThan(0)
+    const h = await setup({ store, limits: { maxRoomFrameBytes: seeded + 10 } })
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+    // The very first frame this process sees would fit if the counter started at
+    // 0, but seeding from durable state pushes it over the room cap.
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'over', epoch: 0, ops: [{ kind: 'set', key: 'k', prop: 'p', value: 'z'.repeat(50) }] })
+    expect(await w.recv()).toMatchObject({ code: 'room-full', retryable: false })
   })
 })
