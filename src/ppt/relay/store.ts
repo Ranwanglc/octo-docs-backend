@@ -60,8 +60,15 @@ export interface PptRelayStore {
    * and DO NOT create a second row.
    */
   appendOp(docId: string, frameId: string, frame: unknown): Promise<AppendOpResult>
-  /** Ops with `seq > sinceSeq`, ascending. */
-  opsSince(docId: string, sinceSeq: number): Promise<PersistedOp[]>
+  /**
+   * Seq already recorded for `(docId, frameId)`, or null if unseen. A CURRENT
+   * read of the dedup ledger used by the relay BEFORE its room-full/rate gates so
+   * a known-duplicate resend (whose original ack was lost) re-acks its stored seq
+   * instead of being permanently refused `room-full`/`rate-limited` (XIN-1660 D3).
+   */
+  frameSeq(docId: string, frameId: string): Promise<number | null>
+  /** Ops with `seq > sinceSeq`, ascending. Bounded to `limit` rows when given. */
+  opsSince(docId: string, sinceSeq: number, limit?: number): Promise<PersistedOp[]>
   /** Highest assigned room sequence for the doc (0 when none). */
   currentSeq(docId: string): Promise<number>
   /** Sum of persisted frame bytes still present for the room (budget seeding). */
@@ -116,9 +123,20 @@ export class InMemoryPptRelayStore implements PptRelayStore {
     return { seq, duplicate: false, frameBytes: bytes }
   }
 
-  async opsSince(docId: string, sinceSeq: number): Promise<PersistedOp[]> {
+  async frameSeq(docId: string, frameId: string): Promise<number | null> {
+    // `byFrameId` is the in-memory dedup ledger; it is retained past prune (see
+    // pruneOpsThrough), so a resend of an already-persisted frame is found here
+    // even after its op row is gone — the analog of the DB store's
+    // append-time `ppt_collab_frame` ledger (XIN-1660 D1/D3).
+    const seq = this.room(docId).byFrameId.get(frameId)
+    return seq ?? null
+  }
+
+  async opsSince(docId: string, sinceSeq: number, limit?: number): Promise<PersistedOp[]> {
     const r = this.room(docId)
-    return r.ops.filter((o) => o.seq > sinceSeq).map((o) => ({ seq: o.seq, frameId: o.frameId, frame: o.frame }))
+    const tail = r.ops.filter((o) => o.seq > sinceSeq)
+    const bounded = limit !== undefined && limit >= 0 ? tail.slice(0, limit) : tail
+    return bounded.map((o) => ({ seq: o.seq, frameId: o.frameId, frame: o.frame }))
   }
 
   async currentSeq(docId: string): Promise<number> {

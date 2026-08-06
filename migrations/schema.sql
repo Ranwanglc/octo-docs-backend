@@ -386,16 +386,19 @@ CREATE TABLE ppt_collab_seq (
   PRIMARY KEY (doc_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Durable dedup ledger for the PPT relay (R4-B1, XIN-1655 C1). Maps
--- (doc_id, frame_id) -> the room seq the frame was assigned, and OUTLIVES the op
--- row: when a snapshot prunes covered ops, the relay copies each pruned frame's
--- mapping here first, so a later re-send of a pruned frame is re-acked at its
--- ORIGINAL seq instead of being minted a fresh seq and rebroadcast as a
--- duplicate the snapshot already subsumes. Written only on prune (INSERT IGNORE).
+-- Durable dedup authority for the PPT relay (R4-B1, XIN-1655 C1 / XIN-1660 D1-D2).
+-- Maps (doc_id, frame_id) -> the room seq the frame was assigned. Written at APPEND
+-- time with (doc_id, frame_id) as the PRIMARY KEY, so it is the single dedup
+-- authority: the relay's append inserts here and lets the PK raise ER_DUP_ENTRY on a
+-- resend (a CURRENT-read dedup that catches a resend whose transaction opened before
+-- the original committed), then re-acks the original seq via a locking read. The
+-- mapping OUTLIVES the op row: a snapshot prunes ppt_collab_op with a plain DELETE,
+-- but this ledger is never pruned, so a re-send of a pruned frame still re-acks its
+-- ORIGINAL seq instead of being minted a fresh one and rebroadcast.
 CREATE TABLE ppt_collab_frame (
-  doc_id    VARCHAR(64) NOT NULL,                         -- FK-by-convention to doc_meta.doc_id (html_ppt row)
-  frame_id  VARCHAR(64) NOT NULL,                         -- globally-unique Bento frame id (dedup key)
-  seq       BIGINT      NOT NULL,                          -- room seq this frame was assigned (retained past prune)
-  pruned_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  doc_id      VARCHAR(64) NOT NULL,                        -- FK-by-convention to doc_meta.doc_id (html_ppt row)
+  frame_id    VARCHAR(64) NOT NULL,                        -- globally-unique Bento frame id (dedup key)
+  seq         BIGINT      NOT NULL,                         -- room seq this frame was assigned (retained past prune)
+  recorded_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), -- when the mapping was recorded (append time)
   PRIMARY KEY (doc_id, frame_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

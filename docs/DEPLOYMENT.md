@@ -13,10 +13,17 @@ The service is a single process that exposes **two** listeners:
 | Hocuspocus collaborative WS | `1234` (`HOCUSPOCUS_PORT`) | real-time Yjs sync |
 | REST metadata API | `3000` (`HTTP_PORT`) | docs CRUD, collab-token, invites, attachments |
 
-> The two listeners are colocated in one process (`src/index.ts`). The REST API
-> is stateless and horizontally scalable; the Hocuspocus nodes are stateful and
-> documentName-affinity routed. They can be split into separate deployables
-> later — this guide assumes the colocated process the image ships today.
+> The two listeners are colocated in one process (`src/index.ts`). The REST API's
+> request/response endpoints are stateless and horizontally scalable, but the PPT
+> collaboration relay attached to that server (on the `/api/v1/ppt/collab` WS
+> upgrade path) keeps a **process-local** room registry (live sockets, per-room
+> sequence and byte-budget state). A horizontally-scaled deployment must therefore
+> route a given deck's relay upgrades to a **consistent node (docId affinity)** —
+> the same class of constraint the Hocuspocus nodes have (stateful,
+> documentName-affinity routed). The stateless REST endpoints can still be split
+> off later; the relay cannot be freely load-balanced across nodes without such
+> affinity (or a shared/broadcast transport). This guide assumes the colocated
+> process the image ships today.
 
 ---
 

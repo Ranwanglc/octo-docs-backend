@@ -13,14 +13,11 @@
  * lives in {@link ../repos/pptRelaySeqRepo} (`ppt_collab_seq`); this table only
  * stores the frames at the seqs that counter hands out.
  *
- * Idempotent-resend dedup must OUTLIVE this table's rows. A snapshot prunes
- * covered ops, but a client that reconnects and re-sends a frame whose op row was
- * already pruned must STILL be re-acked at that frame's original seq — never
- * minted a fresh seq and rebroadcast as a duplicate of an op the snapshot already
- * subsumes (XIN-1655 C1). The `(doc_id, frame_id) -> seq` mapping is therefore
- * copied into the durable dedup ledger `ppt_collab_frame` at prune time (see
- * {@link pruneThroughTx}); the append path checks that ledger when the live op row
- * is absent (see {@link getPrunedSeqByFrameIdTx}).
+ * Idempotent-resend dedup is owned by the durable ledger `ppt_collab_frame` (see
+ * {@link ../repos/pptCollabFrameRepo}), which is written at APPEND time and
+ * OUTLIVES this table's rows. A snapshot prunes covered ops from here with a plain
+ * `DELETE` (see {@link pruneThroughTx}); the mapping a resent frame needs to re-ack
+ * its original seq survives in that ledger, never in this table.
  */
 import { query, type Tx } from '../pool.js'
 
@@ -46,47 +43,6 @@ function toOp(row: RawRow): PptCollabOpRow {
 }
 
 export const pptCollabOpRepo = {
-  /** Seq already assigned to this frame id, or null if unseen (tx-scoped). */
-  async getSeqByFrameIdTx(tx: Tx, docId: string, frameId: string): Promise<number | null> {
-    const rows = await tx.query<{ seq: number }>(
-      `SELECT seq FROM ppt_collab_op WHERE doc_id = ? AND frame_id = ?`,
-      [docId, frameId],
-    )
-    return rows[0] ? Number(rows[0].seq) : null
-  },
-
-  /**
-   * Locking twin of {@link getSeqByFrameIdTx} used on the duplicate-frame retry
-   * path. A locking read (`FOR UPDATE`) reads the LATEST committed row rather than
-   * the transaction's start-of-tx snapshot, so after a concurrent resend of the
-   * same frameId loses the `(doc_id, frame_id)` unique-key race we can still read
-   * the winner's assigned seq and re-ack it as a duplicate.
-   */
-  async getSeqByFrameIdForUpdateTx(tx: Tx, docId: string, frameId: string): Promise<number | null> {
-    const rows = await tx.query<{ seq: number }>(
-      `SELECT seq FROM ppt_collab_op WHERE doc_id = ? AND frame_id = ? FOR UPDATE`,
-      [docId, frameId],
-    )
-    return rows[0] ? Number(rows[0].seq) : null
-  },
-
-  /**
-   * Seq recorded in the durable dedup ledger for a frame whose op row has since
-   * been PRUNED (tx-scoped), or null if unseen. This is what makes idempotent
-   * resend survive GC (XIN-1655 C1): once a snapshot prunes seq N, the live
-   * `(doc_id, frame_id)` row is gone, so an unqualified re-send would be minted a
-   * fresh seq and rebroadcast as a duplicate. The ledger retains the original
-   * mapping past the prune, so the append path can re-ack the original seq
-   * instead of re-minting.
-   */
-  async getPrunedSeqByFrameIdTx(tx: Tx, docId: string, frameId: string): Promise<number | null> {
-    const rows = await tx.query<{ seq: number }>(
-      `SELECT seq FROM ppt_collab_frame WHERE doc_id = ? AND frame_id = ?`,
-      [docId, frameId],
-    )
-    return rows[0] ? Number(rows[0].seq) : null
-  },
-
   /** Insert one op frame at an already-computed seq (tx-scoped). */
   async insertTx(
     tx: Tx,
@@ -103,8 +59,21 @@ export const pptCollabOpRepo = {
     )
   },
 
-  /** Ops with `seq > sinceSeq`, ascending (replay). */
-  async since(docId: string, sinceSeq: number): Promise<PptCollabOpRow[]> {
+  /**
+   * Ops with `seq > sinceSeq`, ascending (replay). When `limit` is given, at most
+   * `limit` rows are returned (the next page starts at the last returned seq), so a
+   * huge op backlog is streamed in bounded batches on replay rather than read
+   * unbounded into memory (XIN-1660 hardening).
+   */
+  async since(docId: string, sinceSeq: number, limit?: number): Promise<PptCollabOpRow[]> {
+    if (limit !== undefined && limit >= 0) {
+      const rows = await query<RawRow>(
+        `SELECT seq, frame_id, frame_json FROM ppt_collab_op
+          WHERE doc_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
+        [docId, sinceSeq, limit],
+      )
+      return rows.map(toOp)
+    }
     const rows = await query<RawRow>(
       `SELECT seq, frame_id, frame_json FROM ppt_collab_op
         WHERE doc_id = ? AND seq > ? ORDER BY seq ASC`,
@@ -141,12 +110,11 @@ export const pptCollabOpRepo = {
    * of `frame_bytes` reclaimed, so the relay's in-memory room-budget counter can
    * be decremented in step with the durable delete.
    *
-   * Runs inside the caller's transaction and, BEFORE deleting, copies each pruned
-   * frame's `(doc_id, frame_id, seq)` into the durable dedup ledger
-   * `ppt_collab_frame` (`INSERT IGNORE`, so a re-run is a no-op). That ledger is
-   * what lets a later re-send of a pruned frame re-ack its original seq instead of
-   * being minted a duplicate (XIN-1655 C1). Copy-then-delete in ONE transaction so
-   * a frame can never be delete-visible while still absent from the ledger.
+   * A plain `DELETE` inside the caller's transaction. Dedup no longer needs a
+   * copy-at-prune step — the `ppt_collab_frame` ledger is written at APPEND time
+   * and outlives the op row — so this avoids the old `INSERT IGNORE … SELECT`,
+   * whose shared next-key locks over the gap ABOVE `coveredSeq` blocked a
+   * concurrent append there into `ER_LOCK_WAIT_TIMEOUT` (XIN-1660 D2).
    */
   async pruneThroughTx(tx: Tx, docId: string, coveredSeq: number): Promise<number> {
     const rows = await tx.query<{ freed: number | null }>(
@@ -154,11 +122,6 @@ export const pptCollabOpRepo = {
       [docId, coveredSeq],
     )
     const freed = rows[0] ? Number(rows[0].freed ?? 0) : 0
-    await tx.query(
-      `INSERT IGNORE INTO ppt_collab_frame (doc_id, frame_id, seq)
-       SELECT doc_id, frame_id, seq FROM ppt_collab_op WHERE doc_id = ? AND seq <= ?`,
-      [docId, coveredSeq],
-    )
     await tx.query(`DELETE FROM ppt_collab_op WHERE doc_id = ? AND seq <= ?`, [docId, coveredSeq])
     return freed
   },

@@ -84,7 +84,7 @@ class WsClient {
 interface Harness {
   relay: PptRelay
   store: PptRelayStore
-  connect: (opts: { uid: string; role: Role; name?: string; ticket?: string }) => Promise<WsClient>
+  connect: (opts: { uid: string; role: Role; name?: string; ticket?: string; path?: string }) => Promise<WsClient>
   ticketFor: (opts: { uid: string; role: Role; name?: string; epoch?: number }) => string
   setEpoch: (e: number) => void
   setRole: (uid: string, r: ResolvedRole) => void
@@ -129,9 +129,9 @@ async function setup(
       ...(o.name ? { name: o.name } : {}),
     }).ticket
 
-  const connect = (o: { uid: string; role: Role; name?: string; ticket?: string }): Promise<WsClient> => {
+  const connect = (o: { uid: string; role: Role; name?: string; ticket?: string; path?: string }): Promise<WsClient> => {
     const ticket = o.ticket ?? ticketFor(o)
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/ppt/collab`, ['ppt-relay', ticket])
+    const ws = new WebSocket(`ws://127.0.0.1:${port}${o.path ?? '/api/v1/ppt/collab'}`, ['ppt-relay', ticket])
     const client = new WsClient(ws)
     return new Promise<WsClient>((res, rej) => {
       ws.on('open', () => res(client))
@@ -378,6 +378,7 @@ describe('PPT relay: refused retry classification (PPT-WS-006)', () => {
       appendOp: async () => {
         throw new Error('boom')
       },
+      frameSeq: async () => null,
       opsSince: async () => [],
       currentSeq: async () => 0,
       roomBytes: async () => 0,
@@ -758,7 +759,8 @@ describe('PPT relay: no silent drops post-commit (B7 / P1-12)', () => {
     const base = new InMemoryPptRelayStore()
     const store: PptRelayStore = {
       appendOp: (d, f, fr) => base.appendOp(d, f, fr),
-      opsSince: (d, s) => base.opsSince(d, s),
+      frameSeq: (d, f) => base.frameSeq(d, f),
+      opsSince: (d, s, l) => base.opsSince(d, s, l),
       currentSeq: (d) => base.currentSeq(d),
       roomBytes: (d) => base.roomBytes(d),
       getSnapshot: async (d) => {
@@ -784,7 +786,8 @@ describe('PPT relay: no silent drops post-commit (B7 / P1-12)', () => {
     const base = new InMemoryPptRelayStore()
     const store: PptRelayStore = {
       appendOp: (d, f, fr) => base.appendOp(d, f, fr),
-      opsSince: (d, s) => base.opsSince(d, s),
+      frameSeq: (d, f) => base.frameSeq(d, f),
+      opsSince: (d, s, l) => base.opsSince(d, s, l),
       currentSeq: (d) => base.currentSeq(d),
       roomBytes: (d) => base.roomBytes(d),
       getSnapshot: (d) => base.getSnapshot(d),
@@ -892,6 +895,7 @@ describe('PPT relay: round-3 correctness fixes (XIN-1655)', () => {
     const boom = new Error('store down')
     const throwing: PptRelayStore = {
       appendOp: async () => { throw boom },
+      frameSeq: async () => { throw boom },
       opsSince: async () => { throw boom },
       currentSeq: async () => { throw boom },
       roomBytes: async () => { throw boom },
@@ -955,5 +959,155 @@ describe('PPT relay: round-3 correctness fixes (XIN-1655)', () => {
     const { ready, replay } = await helloReady(c, 0)
     expect(replay.filter((m) => m.ctl === 'op').map((m) => m.q)).toEqual([1, 2, 3])
     expect(ready.q).toBe(3) // last delivered op, NOT currentSeq()=999
+  })
+})
+
+/**
+ * XIN-1660 GitHub round-4 blockers + hardening: known-duplicate resend bypasses the
+ * room-full / rate gates (D3), handleSnap preflight reads are guarded so a storage
+ * failure surfaces instead of hanging (D4), ephemeral frames are byte-capped and
+ * rate-limited, replay is paginated, and the client-supplied resume cursor is
+ * clamped to the real delivered boundary.
+ */
+describe('PPT relay: round-4 fixes (XIN-1660)', () => {
+  // Compute the persisted byte size of an ops frame exactly as handleOps does, so a
+  // test can pin a room/rate budget to "one frame".
+  const frameBytes = (frame: unknown): number => Buffer.byteLength(JSON.stringify(frame), 'utf8')
+
+  it('D3: a known-duplicate resend at the room-full cap is re-acked, not refused room-full', async () => {
+    const first = OPS_FRAME(1, 'dup-room')
+    const h = await setup({ limits: { maxRoomFrameBytes: frameBytes(first) } })
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+
+    // First frame fills the room exactly to the cap.
+    w.send(first)
+    expect((await w.recv()).q).toBe(1)
+
+    // A brand-new frame now exceeds the cap -> permanent room-full.
+    w.send(OPS_FRAME(2, 'new-over'))
+    expect(await w.recv()).toMatchObject({ code: 'room-full', retryable: false })
+
+    // But RESENDING the already-durable frame (its ack was "lost") must bypass the
+    // room-full gate and re-ack its original seq — the idempotent-resend contract.
+    w.send(OPS_FRAME(1, 'dup-room'))
+    const reack = await w.recv()
+    expect(reack.ctl).toBe('ack')
+    expect(reack.q).toBe(1)
+    expect(await h.store.currentSeq(DOC)).toBe(1) // no new seq minted
+  })
+
+  it('D3: a known-duplicate resend when the rate window is full is re-acked, not refused rate-limited', async () => {
+    const h = await setup({ limits: { maxFramesPerWindow: 1 } })
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+
+    // The single rate slot is consumed by the first (new) frame.
+    w.send(OPS_FRAME(1, 'dup-rate'))
+    expect((await w.recv()).q).toBe(1)
+
+    // A brand-new frame is now rate-limited (the ONLY retryable refusal).
+    w.send(OPS_FRAME(2, 'new-rl'))
+    expect(await w.recv()).toMatchObject({ code: 'rate-limited', retryable: true })
+
+    // Resending the durable frame bypasses the rate gate and re-acks.
+    w.send(OPS_FRAME(1, 'dup-rate'))
+    const reack = await w.recv()
+    expect(reack.ctl).toBe('ack')
+    expect(reack.q).toBe(1)
+  })
+
+  it('D4: a handleSnap preflight read failure surfaces storage-failed, never a silent hang', async () => {
+    // currentSeq throws only after replay has completed, so the client reaches
+    // `ready` and then the snap's preflight read (currentSeq) fails.
+    class SnapPreflightFailStore extends InMemoryPptRelayStore {
+      failCurrentSeq = false
+      failGetSnapshot = false
+      override async currentSeq(docId: string): Promise<number> {
+        if (this.failCurrentSeq) throw new Error('currentSeq down')
+        return super.currentSeq(docId)
+      }
+      override async getSnapshot(docId: string): ReturnType<InMemoryPptRelayStore['getSnapshot']> {
+        if (this.failGetSnapshot) throw new Error('getSnapshot down')
+        return super.getSnapshot(docId)
+      }
+    }
+    // currentSeq path.
+    const s1 = new SnapPreflightFailStore()
+    const h1 = await setup({ store: s1 })
+    const w1 = await h1.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w1)
+    s1.failCurrentSeq = true
+    w1.send({ t: 'snap', pv: 2, k: 5, epoch: 0, q: 0, doc: deck() })
+    expect(await w1.recv()).toMatchObject({ ctl: 'refused', code: 'storage-failed', retryable: false })
+
+    // getSnapshot path (the second preflight read).
+    const s2 = new SnapPreflightFailStore()
+    const h2 = await setup({ store: s2 })
+    const w2 = await h2.connect({ uid: 'u_w2', role: 'writer' })
+    await helloReady(w2)
+    s2.failGetSnapshot = true
+    w2.send({ t: 'snap', pv: 2, k: 6, epoch: 0, q: 0, doc: deck() })
+    expect(await w2.recv()).toMatchObject({ ctl: 'refused', code: 'storage-failed', retryable: false })
+  })
+
+  it('hardening: an oversized ephemeral frame is refused too-large', async () => {
+    const h = await setup({ limits: { maxEphemeralFrameBytes: 80 } })
+    const c = await h.connect({ uid: 'u_e', role: 'writer' })
+    await helloReady(c)
+    // A presence frame whose wire size exceeds the ephemeral cap.
+    c.send({ t: 'p', pv: 2, presence: { cursor: 'x'.repeat(200) } })
+    expect(await c.recv()).toMatchObject({ code: 'too-large', retryable: false })
+  })
+
+  it('hardening: ephemeral frames are rate-limited in a window SEPARATE from ops', async () => {
+    const h = await setup({ limits: { maxFramesPerWindow: 2 } })
+    const c = await h.connect({ uid: 'u_e', role: 'writer' })
+    // helloReady sends one ephemeral `hello` (window now holds 1).
+    await helloReady(c)
+    // One more ephemeral `p` fills the window (holds 2); the next is rate-limited.
+    c.send({ t: 'p', pv: 2, presence: { c: 1 } })
+    c.send({ t: 'p', pv: 2, presence: { c: 2 } })
+    expect(await c.recv()).toMatchObject({ code: 'rate-limited', retryable: true })
+
+    // The OPS window is separate: a persisted op still gets through despite the
+    // ephemeral window being full.
+    c.send(OPS_FRAME(1, 'ops-after-ephemeral-rl'))
+    expect(await c.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+  })
+
+  it('hardening: replay streams a backlog larger than the page size, in order and complete', async () => {
+    const store = new InMemoryPptRelayStore()
+    for (let i = 1; i <= 5; i++) await store.appendOp(DOC, `f${i}`, OPS_FRAME(i, `f${i}`))
+    const h = await setup({ store, limits: { replayPageSize: 2 } }) // 5 ops across 3 pages
+    const c = await h.connect({ uid: 'u1', role: 'writer' })
+    const { ready, replay } = await helloReady(c, 0)
+    expect(replay.filter((m) => m.ctl === 'op').map((m) => m.q)).toEqual([1, 2, 3, 4, 5])
+    expect(ready.q).toBe(5)
+  })
+
+  it('hardening: a bogus (too-large) resume cursor is clamped, not endorsed back in ready.q', async () => {
+    const store = new InMemoryPptRelayStore()
+    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(DOC, f, OPS_FRAME(1, f))
+    const h = await setup({ store })
+    const c = await h.connect({ uid: 'u1', role: 'writer' })
+    // Client claims to be synced through seq 99999 (bogus). ready.q must report the
+    // REAL high-water (3), never the unvalidated cursor — else the client would skip
+    // every future op below 99999.
+    const { ready, replay } = await helloReady(c, 99999)
+    expect(replay.filter((m) => m.ctl === 'op')).toHaveLength(0)
+    expect(ready.q).toBe(3)
+  })
+
+  it('hardening: an upgrade on a non-relay path is rejected (socket destroyed)', async () => {
+    const h = await setup()
+    await expect(h.connect({ uid: 'u1', role: 'writer', path: '/not/the/relay' })).rejects.toThrow()
+  })
+
+  it('hardening: the relay negotiates the ppt-relay subprotocol (ticket is never echoed)', async () => {
+    const h = await setup()
+    const c = await h.connect({ uid: 'u1', role: 'writer' })
+    expect(c.ws.protocol).toBe('ppt-relay')
+    c.close()
   })
 })

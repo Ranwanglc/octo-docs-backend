@@ -36,7 +36,7 @@ import {
   type RefusedCode,
   type ServerFrame,
 } from './frames.js'
-import type { PptRelayStore } from './store.js'
+import type { PptRelayStore, RelaySnapshot } from './store.js'
 import {
   verifyPptRelayTicket,
   InMemoryTicketStore,
@@ -58,6 +58,10 @@ export interface RelayLimits {
   rateWindowMs: number
   maxSingleBlobBytes: number
   maxRoomFrameBytes: number
+  /** Byte cap for ephemeral frames (`hello`/`need`/`p`/`bye`). */
+  maxEphemeralFrameBytes: number
+  /** Max op rows read per replay batch (bounds replay memory). */
+  replayPageSize: number
 }
 
 function defaultLimits(): RelayLimits {
@@ -69,6 +73,8 @@ function defaultLimits(): RelayLimits {
     rateWindowMs: r.rateWindowMs,
     maxSingleBlobBytes: r.maxSingleBlobBytes,
     maxRoomFrameBytes: r.maxRoomFrameBytes,
+    maxEphemeralFrameBytes: r.maxEphemeralFrameBytes,
+    replayPageSize: r.replayPageSize,
   }
 }
 
@@ -126,6 +132,12 @@ interface Conn {
   spaceMember: boolean
   /** Timestamps of recently persisted frames, for the sliding-window rate limit. */
   frameTimes: number[]
+  /**
+   * Timestamps of recent EPHEMERAL frames (`hello`/`need`/`p`), rate-limited in a
+   * SEPARATE window from persisted `ops`/`snap` so a presence/handshake flood
+   * neither consumes the op budget nor is masked by it (XIN-1660 hardening).
+   */
+  ephemeralFrameTimes: number[]
 }
 
 function send(socket: WebSocket, frame: ServerFrame): void {
@@ -187,7 +199,21 @@ export class PptRelay {
     this.limits = { ...defaultLimits(), ...(deps.limits ?? {}) }
     // noServer: the relay owns no listener of its own — it is attached to B's
     // existing HTTP server (no second service).
-    this.wss = new WebSocketServer({ noServer: true })
+    //
+    // Hardening (XIN-1660):
+    //  - `maxPayload` caps a single WS message at the largest legitimate frame (a
+    //    snapshot blob), so an oversized/DoS frame is dropped at the transport
+    //    layer (close 1009) before the relay ever parses it.
+    //  - `handleProtocols` explicitly negotiates the `ppt-relay` subprotocol so the
+    //    single-use ticket carried alongside it in `Sec-WebSocket-Protocol` is never
+    //    reflected back as the selected subprotocol (order-independent, unlike the
+    //    ws default of echoing the first offered token).
+    this.wss = new WebSocketServer({
+      noServer: true,
+      maxPayload: this.limits.maxSingleBlobBytes,
+      handleProtocols: (protocols) =>
+        protocols.has(PPT_RELAY_SUBPROTOCOL) ? PPT_RELAY_SUBPROTOCOL : false,
+    })
   }
 
   /** Attach to an existing HTTP server, handling upgrades on `/api/v1/ppt/collab`. */
@@ -197,9 +223,18 @@ export class PptRelay {
       try {
         pathname = new URL(req.url ?? '', 'http://localhost').pathname
       } catch {
+        socket.destroy()
         return
       }
-      if (pathname !== path) return // let other upgrade handlers (Hocuspocus) win
+      if (pathname !== path) {
+        // The relay is the only upgrade handler on B's REST HTTP server (Hocuspocus
+        // runs its own listener), so an upgrade on any other path is unroutable.
+        // Reject and destroy it rather than leaving the socket dangling until it
+        // times out — an unmatched-upgrade DoS/leak surface (XIN-1660 hardening).
+        socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
+        socket.destroy()
+        return
+      }
       this.wss.handleUpgrade(req, socket, head, (ws) => {
         this.wss.emit('connection', ws, req)
       })
@@ -301,6 +336,7 @@ export class PptRelay {
       name: claims.name,
       spaceMember,
       frameTimes: [],
+      ephemeralFrameTimes: [],
     }
     this.addToRoom(conn)
 
@@ -378,6 +414,26 @@ export class PptRelay {
     })
   }
 
+  /**
+   * Byte-cap + rate-limit an ephemeral frame (`hello`/`need`/`p`). Returns true
+   * (and has already sent the refusal) when the frame must be dropped. Ephemeral
+   * frames were previously unguarded — only `ops`/`snap` were capped — leaving a
+   * floodable ingress; they use a SEPARATE rate window from persisted frames so a
+   * presence/handshake flood neither drains the op budget nor is hidden by it.
+   */
+  private enforceEphemeralLimits(conn: Conn, rawBytes: number): boolean {
+    if (rawBytes > this.limits.maxEphemeralFrameBytes) {
+      this.refuse(conn, 'too-large', { message: 'ephemeral frame exceeds size limit' })
+      return true
+    }
+    const retryInMs = this.rateLimited(conn.ephemeralFrameTimes)
+    if (retryInMs !== null) {
+      this.refuse(conn, 'rate-limited', { retryInMs })
+      return true
+    }
+    return false
+  }
+
   private async onMessage(conn: Conn, raw: string): Promise<void> {
     let parsed: unknown
     try {
@@ -398,15 +454,24 @@ export class PptRelay {
     const rawBytes = Buffer.byteLength(raw, 'utf8')
     switch (frame.t) {
       case 'hello':
+        if (this.enforceEphemeralLimits(conn, rawBytes)) return
         await this.replay(conn, typeof frame.since === 'number' ? frame.since : 0)
         return
       case 'need':
+        if (this.enforceEphemeralLimits(conn, rawBytes)) return
         await this.replay(conn, typeof frame.since === 'number' ? frame.since : 0, /* ready */ false)
         return
       case 'p':
+        if (this.enforceEphemeralLimits(conn, rawBytes)) return
         this.broadcast(conn, { ctl: 'presence', uid: conn.uid, ...(conn.name ? { name: conn.name } : {}), presence: (frame as { presence?: unknown }).presence })
         return
       case 'bye':
+        // `bye` is terminal (it closes the socket), so it is byte-capped but not
+        // rate-limited — a flood of them is bounded by the close on the first.
+        if (rawBytes > this.limits.maxEphemeralFrameBytes) {
+          this.refuse(conn, 'too-large', { message: 'ephemeral frame exceeds size limit' })
+          return
+        }
         this.broadcast(conn, { ctl: 'presence', uid: conn.uid, ...(conn.name ? { name: conn.name } : {}), presence: undefined })
         conn.socket.close(1000, 'bye')
         return
@@ -433,13 +498,22 @@ export class PptRelay {
    * change detection, never a replay cursor; conflating the two would skip ops
    * whenever the version counter and the covered op-seq diverge.
    *
+   * `since` is client-supplied and unvalidated, so it is CLAMPED to the room's real
+   * high-water (`currentSeq`) before use: a bogus/oversized cursor would otherwise
+   * be endorsed straight back in `ready.q`, making the client believe it is synced
+   * through a seq that does not exist and skip every future op below it (XIN-1660).
+   *
    * A store failure here must never leave the client hanging with neither `ready`
    * nor `refused` (§7.3 "never a silent drop"): the whole replay is wrapped so a
    * failure surfaces a permanent `storage-failed` refusal and closes the socket
    * (XIN-1655 C4).
    */
-  private async replay(conn: Conn, since: number, ready = true): Promise<void> {
+  private async replay(conn: Conn, rawSince: number, ready = true): Promise<void> {
     try {
+      // Clamp the client-supplied cursor to the real delivered boundary: it can
+      // never legitimately exceed the highest seq the room ever assigned.
+      const highWater = await this.store.currentSeq(conn.docId)
+      const since = Math.max(0, Math.min(rawSince, highWater))
       const snap = await this.store.getSnapshot(conn.docId)
       let fromSeq = since
       // Only send the snapshot to a peer behind it; an already-synced peer is not
@@ -448,16 +522,27 @@ export class PptRelay {
         send(conn.socket, { ctl: 'snapshot', snapshotVersion: snap.snapshotVersion, doc: snap.doc })
         fromSeq = snap.coveredSeq
       }
-      const ops = await this.store.opsSince(conn.docId, fromSeq)
       // Track the highest op seq ACTUALLY delivered in this replay so `ready.q`
       // reports what the client is truly synced through — not the counter
       // high-water (XIN-1655 C6). The floor is `fromSeq`: after a snapshot the
       // client is synced through `coveredSeq` even when no tail op follows; on a
       // plain resume it is already synced through `since`.
+      //
+      // Ops are streamed in bounded PAGES so a huge backlog is never read
+      // unbounded into memory (XIN-1660 hardening): fetch up to `replayPageSize`
+      // rows past the cursor, send them, advance the cursor, and stop when a short
+      // page signals the tail.
       let delivered = fromSeq
-      for (const op of ops) {
-        send(conn.socket, { ctl: 'op', q: op.seq, frame: op.frame })
-        delivered = op.seq
+      let cursor = fromSeq
+      const pageSize = this.limits.replayPageSize
+      for (;;) {
+        const page = await this.store.opsSince(conn.docId, cursor, pageSize)
+        for (const op of page) {
+          send(conn.socket, { ctl: 'op', q: op.seq, frame: op.frame })
+          delivered = op.seq
+          cursor = op.seq
+        }
+        if (page.length < pageSize) break
       }
       if (ready) {
         // Fallback is the connection's last-known LIVE epoch (validated at
@@ -555,16 +640,19 @@ export class PptRelay {
     conn.roleEpoch = live
   }
 
-  /** Sliding-window rate limit; returns retry delay ms when the frame is over. */
-  private rateLimited(conn: Conn): number | null {
+  /** Sliding-window rate limit over `times`; returns retry delay ms when over. */
+  private rateLimited(times: number[]): number | null {
     const now = Date.now()
     const windowStart = now - this.limits.rateWindowMs
-    conn.frameTimes = conn.frameTimes.filter((t) => t > windowStart)
-    if (conn.frameTimes.length >= this.limits.maxFramesPerWindow) {
-      const oldest = conn.frameTimes[0] ?? now
+    // Compact in place so the caller's array stays the live window.
+    let write = 0
+    for (const t of times) if (t > windowStart) times[write++] = t
+    times.length = write
+    if (times.length >= this.limits.maxFramesPerWindow) {
+      const oldest = times[0] ?? now
       return Math.max(1, oldest + this.limits.rateWindowMs - now)
     }
-    conn.frameTimes.push(now)
+    times.push(now)
     return null
   }
 
@@ -610,6 +698,30 @@ export class PptRelay {
       this.refuse(conn, guardCode, { k, frameId })
       return
     }
+    // D3: a KNOWN-DUPLICATE resend (its original ack was lost) must bypass the
+    // room-full / rate gates and re-ack its stored seq — never be permanently
+    // refused `room-full` / `rate-limited`, which would break the idempotent-resend
+    // contract the durable dedup was built for. The lookup is a CURRENT read of the
+    // dedup ledger; it runs BEFORE the byte/rate accounting so a duplicate consumes
+    // neither budget nor a rate slot and is not rebroadcast. A lookup failure falls
+    // through to the normal path (appendOp still dedups authoritatively).
+    let known: number | null = null
+    try {
+      known = await this.store.frameSeq(conn.docId, frameId)
+    } catch {
+      /* fall through: appendOp's ledger PK remains the authoritative dedup */
+    }
+    if (known !== null) {
+      let snapshotVersion = 0
+      try {
+        const snap = await this.store.getSnapshot(conn.docId)
+        snapshotVersion = snap?.snapshotVersion ?? 0
+      } catch {
+        /* keep the re-ack: the frame is already durable regardless of this read */
+      }
+      send(conn.socket, { ctl: 'ack', k: frame.k, q: known, snapshotVersion })
+      return
+    }
     // Room-full: a room whose durable frame bytes would exceed the cap refuses
     // further persisted frames (permanent). The budget is measured in PERSISTED
     // frame bytes (what a prune later reclaims), seeded once from durable state so
@@ -620,7 +732,7 @@ export class PptRelay {
       this.refuse(conn, 'room-full', { k, frameId, message: 'room frame budget exhausted' })
       return
     }
-    const retryInMs = this.rateLimited(conn)
+    const retryInMs = this.rateLimited(conn.frameTimes)
     if (retryInMs !== null) {
       this.refuse(conn, 'rate-limited', { k, frameId, retryInMs })
       return
@@ -671,11 +783,31 @@ export class PptRelay {
       return
     }
     const covered = typeof frame.q === 'number' ? frame.q : -1
-    const currentSeq = await this.store.currentSeq(conn.docId)
-    const existing = await this.store.getSnapshot(conn.docId)
+    // D4: the preflight reads run inside `runSerialized`, whose chain tail is
+    // `.catch(()=>{})` — an unguarded throw here is swallowed, so the writer gets
+    // neither `ack` nor `refused` and hangs (the same defect class C4 closed in
+    // `replay()`). Wrap them so a storage failure surfaces `storage-failed`.
+    let currentSeq: number
+    let existing: RelaySnapshot | null
+    try {
+      currentSeq = await this.store.currentSeq(conn.docId)
+      existing = await this.store.getSnapshot(conn.docId)
+    } catch {
+      this.refuse(conn, 'storage-failed', { k, message: 'snapshot preflight failed' })
+      return
+    }
     // A snapshot must cover a real, non-regressing prefix of the op log.
     if (covered < 0 || covered > currentSeq || (existing && covered < existing.coveredSeq)) {
       this.refuse(conn, 'snapshot-conflict', { k, message: 'snapshot covered seq conflicts with the op log' })
+      return
+    }
+    // Rate-limit the persisted snapshot alongside `ops` (shared window): only ops
+    // were rate-limited before, so a client could flood `snap` frames uncapped
+    // (XIN-1660 hardening). Checked after the conflict guard so a rejected snapshot
+    // does not consume a rate slot.
+    const retryInMs = this.rateLimited(conn.frameTimes)
+    if (retryInMs !== null) {
+      this.refuse(conn, 'rate-limited', { k, retryInMs })
       return
     }
     let snapshotVersion: number

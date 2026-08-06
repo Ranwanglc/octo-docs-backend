@@ -772,6 +772,15 @@ export const config = {
       rateWindowMs: numMin('PPT_RELAY_RATE_WINDOW_MS', 10_000, 1),
       maxSingleBlobBytes: numMin('PPT_RELAY_MAX_SINGLE_BLOB_BYTES', 8 * 1024 * 1024, 1),
       maxRoomFrameBytes: numMin('PPT_RELAY_MAX_ROOM_FRAME_BYTES', 96 * 1024 * 1024, 1),
+      // Byte cap for the EPHEMERAL frames (`hello`/`need`/`p`): they carry only a
+      // small resume cursor or presence payload, so this is far tighter than the
+      // op/blob caps. Previously only `ops`/`snap` were byte-capped, leaving these
+      // frames an unbounded ingress a client could flood (XIN-1660 hardening).
+      maxEphemeralFrameBytes: numMin('PPT_RELAY_MAX_EPHEMERAL_FRAME_BYTES', 64 * 1024, 1),
+      // Page size for replay: `opsSince` reads at most this many op rows per batch
+      // so a huge backlog streams in bounded chunks rather than being read
+      // unbounded into memory on a single replay (XIN-1660 hardening).
+      replayPageSize: numMin('PPT_RELAY_REPLAY_PAGE_SIZE', 1000, 1),
     },
   },
 } as const

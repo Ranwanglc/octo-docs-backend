@@ -103,6 +103,9 @@ export interface ReadyCtl {
    * no tail op followed. NOT the room's counter high-water — that can exceed what
    * was delivered (e.g. a seq allocated by an append not yet visible), and
    * reporting it would make the client skip an op it never received (XIN-1655 C6).
+   * The resume cursor is client-supplied, so it is CLAMPED to the room's real
+   * high-water before it can seed this value — a bogus client number can never be
+   * endorsed back as a synced boundary (XIN-1660).
    */
   q: number
   snapshotVersion: number
