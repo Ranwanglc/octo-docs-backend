@@ -26,6 +26,7 @@
  */
 import { Router, json, type Request, type Response, type NextFunction } from 'express'
 import { createPptDocsRouter } from './docs.js'
+import { createPptSourceRouter } from './source.js'
 
 /**
  * Fixed HTTP-status-to-code map. The first ten codes are C's enum verbatim; the
@@ -202,6 +203,8 @@ export function createPptRouter(): Router {
   // directly and a malformed body is enveloped by pptErrorHandler.
   // R2-B1: human create — POST /api/v1/ppt/docs.
   router.use(createPptDocsRouter())
+  // R3-B1: source/bootstrap — GET /api/v1/ppt/docs/:docId/source.
+  router.use(createPptSourceRouter())
 
   // Terminal 404: any PPT path without a matching route returns the enveloped
   // NOT_FOUND rather than falling through to the app's bare-JSON handler.

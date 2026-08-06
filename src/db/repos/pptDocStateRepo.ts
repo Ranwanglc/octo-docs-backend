@@ -23,6 +23,12 @@ export interface PptDocState {
   bentoSyncPv: number
 }
 
+/** {@link PptDocState} plus the materialized `draft_doc` deck (R3-B1 source read). */
+export interface PptDocSource extends PptDocState {
+  /** The persisted working deck (materialized from a template at create time). */
+  draftDoc: BentoDoc
+}
+
 export interface CreatePptDocStateInput {
   docId: string
   templateId: string
@@ -105,5 +111,39 @@ export const pptDocStateRepo = {
       [docId],
     )
     return rows[0] ? toState(rows[0]) : null
+  },
+
+  /**
+   * Fetch the scalar state PLUS the materialized `draft_doc` deck for source
+   * loading (R3-B1). Separate from {@link getByDocId} because the deck blob is
+   * large (MEDIUMTEXT) and most callers only need the counters — the source
+   * route is the one path that needs the actual bytes.
+   *
+   * `draft_doc` is persisted as a JSON string (MEDIUMTEXT); it is parsed back to
+   * a {@link BentoDoc} here. A row whose stored deck is not valid JSON is a
+   * corrupt row, surfaced as a thrown error rather than a silent null so the
+   * caller renders a 500 rather than a misleading 404. Returns null only when
+   * there is NO state row for the doc.
+   */
+  async getSource(docId: string): Promise<PptDocSource | null> {
+    const rows = await query<PptDocStateRow & { draft_doc: string }>(
+      `SELECT doc_id, template_id, draft_revision, snapshot_version, published_version_seq,
+              ppt_format_version, bento_sync_pv, draft_doc
+         FROM ppt_doc_state
+        WHERE doc_id = ?`,
+      [docId],
+    )
+    const row = rows[0]
+    if (!row) return null
+    // mysql2 returns MEDIUMTEXT as a string; be tolerant of a driver/column that
+    // already hands back a parsed object (e.g. a JSON column in a future schema).
+    const raw = row.draft_doc
+    let draftDoc: BentoDoc
+    if (typeof raw === 'string') {
+      draftDoc = JSON.parse(raw) as BentoDoc
+    } else {
+      draftDoc = raw as unknown as BentoDoc
+    }
+    return { ...toState(row), draftDoc }
   },
 }
