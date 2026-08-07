@@ -33,8 +33,11 @@ import { pptCollabOpRepo } from '../../db/repos/pptCollabOpRepo.js'
 import { pptLiveSnapshotRepo } from '../../db/repos/pptLiveSnapshotRepo.js'
 import { pptRelaySeqRepo } from '../../db/repos/pptRelaySeqRepo.js'
 import {
+  canonicalPayloadHash,
+  DuplicateFramePayloadError,
   withStoreRetry,
   type AppendOpResult,
+  type FrameIdentity,
   type PersistedOp,
   type PptRelayStore,
   type RelaySnapshot,
@@ -58,7 +61,8 @@ export class DbPptRelayStore implements PptRelayStore {
   async appendOp(docId: string, frameId: string, frame: unknown): Promise<AppendOpResult> {
     const frameJson = JSON.stringify(frame)
     const frameBytes = Buffer.byteLength(frameJson, 'utf8')
-    return withStoreRetry('append', () => this.appendOpOnce(docId, frameId, frameJson, frameBytes))
+    const payloadHash = canonicalPayloadHash(frame)
+    return withStoreRetry('append', () => this.appendOpOnce(docId, frameId, frameJson, frameBytes, payloadHash))
   }
 
   private appendOpOnce(
@@ -66,26 +70,33 @@ export class DbPptRelayStore implements PptRelayStore {
     frameId: string,
     frameJson: string,
     frameBytes: number,
+    payloadHash: string,
   ): Promise<AppendOpResult> {
     return transaction(async (tx) => {
       // Fast-path: a resend whose ledger row is already committed AND visible in
       // this tx's snapshot re-acks without allocating (burning) a fresh seq. NOT
       // the authority for the concurrent race — the ledger PK insert below is —
       // so a snapshot miss here is still caught by `ER_DUP_ENTRY` (XIN-1660 D1).
-      const existing = await pptCollabFrameRepo.getSeqByFrameIdTx(tx, docId, frameId)
-      if (existing !== null) return { seq: existing, duplicate: true, frameBytes }
+      const existing = await pptCollabFrameRepo.getByFrameIdTx(tx, docId, frameId)
+      if (existing !== null) {
+        if (existing.payloadHash !== null && existing.payloadHash !== payloadHash) throw new DuplicateFramePayloadError(frameId)
+        return { seq: existing.seq, duplicate: true, frameBytes }
+      }
       const seq = await pptRelaySeqRepo.nextSeqTx(tx, docId)
       try {
         // Dedup authority: the `(doc_id, frame_id)` PRIMARY KEY, written at APPEND
         // time so the uniqueness check is a CURRENT read, not a snapshot read.
-        await pptCollabFrameRepo.insertTx(tx, docId, frameId, seq)
+        await pptCollabFrameRepo.insertTx(tx, docId, frameId, seq, payloadHash)
       } catch (err) {
         // A concurrent resend of the same frameId won the ledger race: re-read the
         // winner's seq (LOCKING read = latest committed) and re-ack it as a
         // duplicate — never a permanent failure, never a re-minted seq.
         if (isDuplicateKeyError(err)) {
-          const orig = await pptCollabFrameRepo.getSeqByFrameIdForUpdateTx(tx, docId, frameId)
-          if (orig !== null) return { seq: orig, duplicate: true, frameBytes }
+          const orig = await pptCollabFrameRepo.getByFrameIdForUpdateTx(tx, docId, frameId)
+          if (orig !== null) {
+            if (orig.payloadHash !== null && orig.payloadHash !== payloadHash) throw new DuplicateFramePayloadError(frameId)
+            return { seq: orig.seq, duplicate: true, frameBytes }
+          }
         }
         throw err
       }
@@ -118,6 +129,10 @@ export class DbPptRelayStore implements PptRelayStore {
   /** Seq recorded for a frame id, or null if unseen (pre-gate dedup lookup, D3). */
   async frameSeq(docId: string, frameId: string): Promise<number | null> {
     return pptCollabFrameRepo.getSeqByFrameId(docId, frameId)
+  }
+
+  async frameIdentity(docId: string, frameId: string): Promise<FrameIdentity | null> {
+    return pptCollabFrameRepo.getByFrameId(docId, frameId)
   }
 
   async opsSince(docId: string, sinceSeq: number, limit?: number): Promise<PersistedOp[]> {
@@ -177,7 +192,8 @@ export class DbPptRelayStore implements PptRelayStore {
         },
       }
       try {
-        await conn.beginTransaction()
+        await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')
+        await conn.execute('START TRANSACTION WITH CONSISTENT SNAPSHOT')
         const highWater = await pptRelaySeqRepo.currentSeqTx(tx, docId)
         const snap = await pptLiveSnapshotRepo.getTx(tx, docId)
         const snapshot: RelaySnapshot | null = snap
@@ -199,7 +215,7 @@ export class DbPptRelayStore implements PptRelayStore {
           fromSeq: sinceSeq,
           nextPage: async () => {
             if (closed) return []
-            const rows = await pptCollabOpRepo.sinceTx(tx, docId, cursor, limits.pageRows)
+            const rows = await withStoreRetry('openReplay.nextPage', () => pptCollabOpRepo.sinceTx(tx, docId, cursor, limits.pageRows))
             const page: PersistedOp[] = []
             let bytes = 0
             for (const row of rows) {

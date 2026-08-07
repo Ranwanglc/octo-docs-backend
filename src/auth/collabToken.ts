@@ -15,6 +15,8 @@ import jwt from 'jsonwebtoken'
 import { config } from '../config/env.js'
 import type { Role } from '../permission/role.js'
 
+export const LEGACY_COLLAB_AUD = 'legacy-collab'
+
 export interface CollabClaims {
   uid: string
   documentName: string
@@ -76,7 +78,7 @@ export function signCollabToken(claims: CollabClaims): CollabTokenResult {
       ...(claims.space_member === true ? { space_member: true } : {}),
     },
     config.collabToken.secret,
-    { algorithm: 'HS256', expiresIn: ttl },
+    { algorithm: 'HS256', audience: LEGACY_COLLAB_AUD, expiresIn: ttl },
   )
   const expiresAt = new Date((Math.floor(Date.now() / 1000) + ttl) * 1000).toISOString()
   const result: CollabTokenResult = {
@@ -106,10 +108,17 @@ export function verifyCollabToken(token: string): CollabClaims {
     throw new Error('invalid collab token payload')
   }
   const d = decoded as Record<string, unknown>
+  const aud = d.aud
+  if (aud !== undefined && aud !== LEGACY_COLLAB_AUD) {
+    throw new Error('invalid collab token audience')
+  }
   const uid = d.uid
   const documentName = d.documentName
   const role = d.role
   const permission_epoch = d.permission_epoch
+  if (d.kind === 'html_ppt' || (typeof documentName === 'string' && documentName.includes(':ppt:'))) {
+    throw new Error('ppt collab credentials are not valid on the legacy collab endpoint')
+  }
   if (
     typeof uid !== 'string' ||
     typeof documentName !== 'string' ||

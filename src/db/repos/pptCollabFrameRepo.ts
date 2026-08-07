@@ -35,12 +35,17 @@ export const pptCollabFrameRepo = {
    * bypasses the room-full/rate gates and re-acks its original seq rather than
    * being permanently refused (XIN-1660 D3).
    */
-  async getSeqByFrameId(docId: string, frameId: string): Promise<number | null> {
-    const rows = await query<{ seq: number }>(
-      `SELECT seq FROM ppt_collab_frame WHERE doc_id = ? AND frame_id = ?`,
+  async getByFrameId(docId: string, frameId: string): Promise<{ seq: number; payloadHash: string | null } | null> {
+    const rows = await query<{ seq: number; payload_hash?: string | null }>(
+      `SELECT seq, payload_hash FROM ppt_collab_frame WHERE doc_id = ? AND frame_id = ?`,
       [docId, frameId],
     )
-    return rows[0] ? Number(rows[0].seq) : null
+    return rows[0] ? { seq: Number(rows[0].seq), payloadHash: rows[0].payload_hash ?? null } : null
+  },
+
+  async getSeqByFrameId(docId: string, frameId: string): Promise<number | null> {
+    const row = await this.getByFrameId(docId, frameId)
+    return row?.seq ?? null
   },
 
   /**
@@ -51,12 +56,17 @@ export const pptCollabFrameRepo = {
    * race — that is the PRIMARY-KEY insert below — so a snapshot miss here is
    * still caught by {@link insertTx}'s `ER_DUP_ENTRY`.
    */
-  async getSeqByFrameIdTx(tx: Tx, docId: string, frameId: string): Promise<number | null> {
-    const rows = await tx.query<{ seq: number }>(
-      `SELECT seq FROM ppt_collab_frame WHERE doc_id = ? AND frame_id = ?`,
+  async getByFrameIdTx(tx: Tx, docId: string, frameId: string): Promise<{ seq: number; payloadHash: string | null } | null> {
+    const rows = await tx.query<{ seq: number; payload_hash?: string | null }>(
+      `SELECT seq, payload_hash FROM ppt_collab_frame WHERE doc_id = ? AND frame_id = ?`,
       [docId, frameId],
     )
-    return rows[0] ? Number(rows[0].seq) : null
+    return rows[0] ? { seq: Number(rows[0].seq), payloadHash: rows[0].payload_hash ?? null } : null
+  },
+
+  async getSeqByFrameIdTx(tx: Tx, docId: string, frameId: string): Promise<number | null> {
+    const row = await this.getByFrameIdTx(tx, docId, frameId)
+    return row?.seq ?? null
   },
 
   /**
@@ -66,12 +76,17 @@ export const pptCollabFrameRepo = {
    * `(doc_id, frame_id)` PRIMARY-KEY race we can still read the winner's assigned
    * seq and re-ack it as a duplicate instead of surfacing `storage-failed`.
    */
-  async getSeqByFrameIdForUpdateTx(tx: Tx, docId: string, frameId: string): Promise<number | null> {
-    const rows = await tx.query<{ seq: number }>(
-      `SELECT seq FROM ppt_collab_frame WHERE doc_id = ? AND frame_id = ? FOR UPDATE`,
+  async getByFrameIdForUpdateTx(tx: Tx, docId: string, frameId: string): Promise<{ seq: number; payloadHash: string | null } | null> {
+    const rows = await tx.query<{ seq: number; payload_hash?: string | null }>(
+      `SELECT seq, payload_hash FROM ppt_collab_frame WHERE doc_id = ? AND frame_id = ? FOR UPDATE`,
       [docId, frameId],
     )
-    return rows[0] ? Number(rows[0].seq) : null
+    return rows[0] ? { seq: Number(rows[0].seq), payloadHash: rows[0].payload_hash ?? null } : null
+  },
+
+  async getSeqByFrameIdForUpdateTx(tx: Tx, docId: string, frameId: string): Promise<number | null> {
+    const row = await this.getByFrameIdForUpdateTx(tx, docId, frameId)
+    return row?.seq ?? null
   },
 
   /**
@@ -80,10 +95,10 @@ export const pptCollabFrameRepo = {
    * frame raises `ER_DUP_ENTRY`, which the caller catches to re-ack the original
    * seq. Runs inside the caller's append transaction.
    */
-  async insertTx(tx: Tx, docId: string, frameId: string, seq: number): Promise<void> {
+  async insertTx(tx: Tx, docId: string, frameId: string, seq: number, payloadHash: string): Promise<void> {
     await tx.query(
-      `INSERT INTO ppt_collab_frame (doc_id, frame_id, seq) VALUES (?, ?, ?)`,
-      [docId, frameId, seq],
+      `INSERT INTO ppt_collab_frame (doc_id, frame_id, seq, payload_hash) VALUES (?, ?, ?, ?)`,
+      [docId, frameId, seq, payloadHash],
     )
   },
 

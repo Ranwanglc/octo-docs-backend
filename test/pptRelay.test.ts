@@ -1,7 +1,7 @@
 // Env seeding MUST be first so config/env.ts reads it at load time.
 import './helpers/pptRelayEnv.js'
 
-import { describe, it, expect, afterEach } from 'vitest'
+import { describe, it, expect, afterEach, vi } from 'vitest'
 import { createServer, type Server as HttpServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { WebSocket } from 'ws'
@@ -310,6 +310,24 @@ describe('PPT relay: op kinds + ack/broadcast ordering (PPT-WS-003 / PPT-WS-005)
     // B does not receive a second broadcast for the duplicate.
     await expect(b.recv(250)).rejects.toThrow()
   })
+
+  it('a resent frameId with a different payload is refused and not re-acked', async () => {
+    const h = await setup()
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    await helloReady(a)
+
+    a.send(OPS_FRAME(1, 'dup-mismatch', 0, [{ kind: 'set', key: 's1e1', prop: 'x', value: 1 }]))
+    expect(await a.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+
+    a.send(OPS_FRAME(2, 'dup-mismatch', 0, [{ kind: 'set', key: 's1e1', prop: 'x', value: 2 }]))
+    expect(await a.recv()).toMatchObject({
+      ctl: 'refused',
+      code: 'protocol-version',
+      frameId: 'dup-mismatch',
+      retryable: false,
+    })
+    expect(await h.store.currentSeq(DOC)).toBe(1)
+  })
 })
 
 describe('PPT relay: protocol version (PPT-WS-004)', () => {
@@ -398,7 +416,7 @@ describe('PPT relay: refused retry classification (PPT-WS-006)', () => {
     expect(await w.recv()).toMatchObject({ code: 'storage-failed', retryable: false })
 
     // doc-deleted: flip status; the next mutating frame is refused doc-deleted.
-    const h2 = await setup()
+    const h2 = await setup({ limits: { docStatusCacheTtlMs: 0 } })
     const w2 = await h2.connect({ uid: 'u_w', role: 'writer' })
     await helloReady(w2)
     h2.setDocStatus('deleted')
@@ -472,6 +490,23 @@ describe('PPT relay: convergence + presence (PPT-COLLAB-001 / PPT-COLLAB-002)', 
 })
 
 describe('PPT relay: snapshot + GC + offline replay (PPT-COLLAB-003 / PPT-COLLAB-004)', () => {
+  it('rejects snapshot before the connection has completed replay', async () => {
+    const h = await setup()
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    w.send({ t: 'snap', pv: 2, k: 1, epoch: 0, q: 0, doc: deck('early') })
+    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'snapshot-conflict' })
+  })
+
+  it('rejects snapshot coverage beyond this connection observed watermark', async () => {
+    const h = await setup()
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+    await h.store.appendOp(DOC, 'seed', OPS_FRAME(1, 'seed'))
+    // The room high-water is 1, but this connection did not receive/ack seq 1.
+    w.send({ t: 'snap', pv: 2, k: 1, epoch: 0, q: 1, doc: deck('unseen') })
+    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'snapshot-conflict' })
+  })
+
   it('snapshot advances version atomically; covered ops are not replayed; synced peers skip snapshot', async () => {
     const h = await setup()
     const w = await h.connect({ uid: 'u_w', role: 'writer' })
@@ -593,6 +628,98 @@ describe('PPT relay: permission epoch (PPT-EPOCH-001 / 002 / 003)', () => {
     expect(refused.code).toBe('forbidden-role')
     expect(await h.store.currentSeq(DOC)).toBe(0)
   })
+
+  it('does not close still-authorized peers during pending epoch re-resolution', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((res) => {
+      release = res
+    })
+    const h = await setup({
+      roleProvider: async ({ uid }) => {
+        if (uid === 'u_b') await gate
+        return 'writer'
+      },
+    })
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    const b = await h.connect({ uid: 'u_b', role: 'writer' })
+    await helloReady(a)
+    await helloReady(b)
+
+    h.setEpoch(1)
+    const bump = h.relay.applyEpochBump(DOCNAME)
+    a.send(OPS_FRAME(1, 'during-bump', 1))
+    expect(await a.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    expect((await b.recvUntil((m) => m.ctl === 'op')).at(-1)).toMatchObject({ ctl: 'op', q: 1 })
+
+    release()
+    await bump
+    expect(b.ws.readyState).toBe(WebSocket.OPEN)
+  })
+})
+
+describe('PPT relay: read cache and outbound backpressure', () => {
+  it('caches live doc status across hot presence frames', async () => {
+    let statusReads = 0
+    const h = await setup({
+      limits: { docStatusCacheTtlMs: 60_000, maxFramesPerWindow: 200 },
+      docStatusProvider: async () => {
+        statusReads++
+        return 'live'
+      },
+    })
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    const b = await h.connect({ uid: 'u_b', role: 'reader' })
+    await helloReady(a)
+    await helloReady(b)
+    statusReads = 0
+
+    for (let i = 0; i < 50; i++) a.send({ t: 'p', pv: 2, presence: { i } })
+    const seen = await b.recvUntil((m) => m.ctl === 'presence' && (m.presence as { i?: number } | undefined)?.i === 49)
+    expect(seen.filter((m) => m.ctl === 'presence')).toHaveLength(50)
+    expect(statusReads).toBeLessThanOrEqual(1)
+  })
+
+  it('applies the send high-water policy to live broadcasts', async () => {
+    const relay = new PptRelay({
+      store: new InMemoryPptRelayStore(),
+      epochProvider: async () => 0,
+      limits: { sendHighWaterBytes: 0, sendDrainTimeoutMs: 15 },
+    })
+    const closed: Array<{ code: number; reason: string }> = []
+    const fakeSocket = {
+      readyState: WebSocket.OPEN,
+      bufferedAmount: 1,
+      send: vi.fn(),
+      close: (code: number, reason: string) => {
+        closed.push({ code, reason })
+        fakeSocket.readyState = WebSocket.CLOSING
+      },
+    }
+    const peer = {
+      socket: fakeSocket,
+      uid: 'u_slow',
+      docId: DOC,
+      documentName: DOCNAME,
+      role: 'reader',
+      roleEpoch: 0,
+      spaceMember: false,
+      frameTimes: [],
+      ephemeralFrameTimes: [],
+      caughtUp: true,
+      replayInFlight: false,
+      replayPending: null,
+      liveBuffer: [],
+      lastDelivered: 0,
+      liveBufferBytes: 0,
+      auth: { readAllowed: true, invalidated: false },
+      inboundChain: Promise.resolve(),
+      outboundChain: Promise.resolve(),
+    }
+    await (relay as unknown as { deliver: (conn: unknown, frame: unknown) => Promise<void> }).deliver(peer, { ctl: 'op', q: 1, frame: OPS_FRAME(1, 'live') })
+    expect(closed).toEqual([{ code: 1011, reason: 'send drain timeout' }])
+    expect(fakeSocket.send).not.toHaveBeenCalled()
+    relay.close()
+  })
 })
 
 describe('PPT relay: stale-ticket epoch cutoff fails CLOSED (PPT-EPOCH-001 regression)', () => {
@@ -602,7 +729,7 @@ describe('PPT relay: stale-ticket epoch cutoff fails CLOSED (PPT-EPOCH-001 regre
   // server-side at connect and can never be refreshed by the epoch the client
   // stamps on a frame.
   it('(a) stale writer ticket + downgraded-to-reader: ops stamped with the CURRENT epoch is REFUSED', async () => {
-    const h = await setup()
+    const h = await setup({ limits: { docStatusCacheTtlMs: 0 } })
     // The user was a writer at epoch 0, then downgraded to reader at epoch 1.
     h.setEpoch(1)
     h.setRole('u_a', 'reader')
@@ -1174,7 +1301,7 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
   })
 
   it('P1-2: hello on a soft-deleted doc is refused doc-deleted + closed 4404, not served', async () => {
-    const h = await setup()
+    const h = await setup({ limits: { docStatusCacheTtlMs: 0 } })
     const c = await h.connect({ uid: 'u_r', role: 'reader' })
     await helloReady(c) // healthy while live
     h.setDocStatus('deleted')

@@ -39,7 +39,15 @@ import {
   type RefusedCode,
   type ServerFrame,
 } from './frames.js'
-import { isRetryableStorageError, RetryableStorageError, type PptRelayStore, type RelaySnapshot, type ReplayCursor } from './store.js'
+import {
+  canonicalPayloadHash,
+  isDuplicateFramePayloadError,
+  isRetryableStorageError,
+  RetryableStorageError,
+  type PptRelayStore,
+  type RelaySnapshot,
+  type ReplayCursor,
+} from './store.js'
 import {
   verifyPptRelayTicket,
   InMemoryTicketStore,
@@ -160,6 +168,7 @@ export interface PptRelayDeps {
 interface ConnAuthState {
   readAllowed: boolean
   invalidated: boolean
+  pendingReauth?: boolean
   terminalClose?: { code: number; reason: string; refused?: RefusedCode }
 }
 
@@ -601,7 +610,8 @@ export class PptRelay {
       peer.liveBufferBytes += frameBytes
       return
     }
-    await this.sendFrame(peer, frame)
+    await this.gatedSend(peer, frame)
+    if (frame.ctl === 'op' && peer.socket.readyState === WebSocket.OPEN) peer.lastDelivered = Math.max(peer.lastDelivered, frame.q)
   }
 
   /**
@@ -610,17 +620,22 @@ export class PptRelay {
    * `lastDelivered`), so an op buffered during replay that the replay also
    * streamed is delivered exactly once (P1-4).
    */
-  private flushLiveBuffer(conn: Conn): void {
+  private async flushLiveBuffer(conn: Conn): Promise<void> {
     if (conn.liveBuffer.length === 0) return
     const buffered = conn.liveBuffer
     conn.liveBuffer = []
     conn.liveBufferBytes = 0
     for (const frame of buffered) {
+      if (!this.canPushRead(conn)) {
+        const terminal = conn.auth.terminalClose
+        await this.closeConn(conn, terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
+        return
+      }
       if (frame.ctl === 'op') {
         if (frame.q <= conn.lastDelivered) continue
-        conn.lastDelivered = frame.q
       }
-      void this.sendFrame(conn, frame)
+      await this.gatedSend(conn, frame)
+      if (frame.ctl === 'op' && conn.socket.readyState === WebSocket.OPEN) conn.lastDelivered = frame.q
     }
   }
 
@@ -631,6 +646,11 @@ export class PptRelay {
    * wedged client cannot stall replay forever; on a closed socket it is a no-op.
    */
   private async gatedSend(conn: Conn, frame: ServerFrame): Promise<void> {
+    if (!this.canPushRead(conn)) {
+      const terminal = conn.auth.terminalClose
+      await this.closeConn(conn, terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
+      return
+    }
     const socket = conn.socket
     let waited = 0
     while (
@@ -642,6 +662,11 @@ export class PptRelay {
       waited += SEND_DRAIN_POLL_MS
     }
     if (socket.readyState !== WebSocket.OPEN) return
+    if (!this.canPushRead(conn)) {
+      const terminal = conn.auth.terminalClose
+      await this.closeConn(conn, terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
+      return
+    }
     if (socket.bufferedAmount > this.limits.sendHighWaterBytes) {
       await this.closeConn(conn, CLOSE_UNAVAILABLE, 'send drain timeout')
       return
@@ -796,7 +821,7 @@ export class PptRelay {
     const status = await this.docStatusProvider(conn.docId)
     this.docStatusCache.set(conn.docId, {
       status,
-      expiresAt: now + (status === 'deleted' ? this.limits.docStatusCacheTtlMs : 0),
+      expiresAt: now + this.limits.docStatusCacheTtlMs,
     })
     return status
   }
@@ -889,7 +914,7 @@ export class PptRelay {
     // cursor and that replay flushes.
     if (ok) {
       conn.caughtUp = true
-      this.flushLiveBuffer(conn)
+      await this.flushLiveBuffer(conn)
     }
   }
 
@@ -946,6 +971,11 @@ export class PptRelay {
       // Only send the snapshot to a peer behind it; an already-synced peer is not
       // forced to reapply it (PPT-COLLAB-003).
       if (snapshot && rawSince < snapshot.coveredSeq) {
+        if (!this.canPushRead(conn)) {
+          await cursor.close()
+          release?.()
+          return false
+        }
         await this.gatedSend(conn, { ctl: 'snapshot', snapshotVersion: snapshot.snapshotVersion, doc: snapshot.doc })
         fromSeq = snapshot.coveredSeq
       }
@@ -962,6 +992,11 @@ export class PptRelay {
         if (ops.length === 0) break
         for (const op of ops) {
           if (op.seq <= fromSeq) continue
+          if (!this.canPushRead(conn)) {
+            await cursor.close()
+            release?.()
+            return false
+          }
           await this.gatedSend(conn, { ctl: 'op', q: op.seq, frame: op.frame })
           delivered = op.seq
         }
@@ -977,6 +1012,11 @@ export class PptRelay {
           epoch = await this.epochProvider(conn.documentName)
         } catch {
           /* keep replay usable with the last-known epoch; mutation re-checks */
+        }
+        if (!this.canPushRead(conn)) {
+          await cursor.close()
+          release?.()
+          return false
         }
         await this.gatedSend(conn, {
           ctl: 'ready',
@@ -1216,13 +1256,23 @@ export class PptRelay {
     // authoritatively). A genuinely NEW frame (`known === null`) still hits
     // `guardMutation` below, so a downgraded/stale-epoch connection is refused for
     // any mutation that is not a known-durable duplicate.
-    let known: number | null = null
+    let known: { seq: number; payloadHash: string | null } | null = null
+    const payloadHash = canonicalPayloadHash(frame)
     try {
-      known = await this.store.frameSeq(conn.docId, frameId)
+      if (this.store.frameIdentity) {
+        known = await this.store.frameIdentity(conn.docId, frameId)
+      } else {
+        const seq = await this.store.frameSeq(conn.docId, frameId)
+        known = seq === null ? null : { seq, payloadHash: null }
+      }
     } catch {
       /* fall through: appendOp's ledger PK remains the authoritative dedup */
     }
     if (known !== null) {
+      if (known.payloadHash !== null && known.payloadHash !== payloadHash) {
+        this.refuse(conn, 'protocol-version', { k, frameId, message: 'frameId payload mismatch' })
+        return
+      }
       let snapshotVersion = 0
       try {
         const snap = await this.store.getSnapshot(conn.docId)
@@ -1233,7 +1283,8 @@ export class PptRelay {
       // `k` is echoed back as the ack counter; apply `?? 0` consistently across
       // every ack path so an omitted `k` never lands as `undefined` in the frame
       // (P2-h — parse also refuses a non-integer `k`).
-      void this.sendFrame(conn, { ctl: 'ack', k: frame.k ?? 0, q: known, snapshotVersion })
+      conn.lastDelivered = Math.max(conn.lastDelivered, known.seq)
+      void this.gatedSend(conn, { ctl: 'ack', k: frame.k ?? 0, q: known.seq, snapshotVersion })
       return
     }
     // Not a known duplicate: enforce the mutation gate (size / doc-status / epoch /
@@ -1278,6 +1329,10 @@ export class PptRelay {
       seq = res.seq
       duplicate = res.duplicate
     } catch (err) {
+      if (isDuplicateFramePayloadError(err)) {
+        this.refuse(conn, 'protocol-version', { k, frameId, message: 'frameId payload mismatch' })
+        return
+      }
       // A TRANSIENT lock failure that outlived the store's retries is
       // `storage-retry` (retryable) so the client re-sends; anything else is a
       // permanent `storage-failed` (XIN-1693 P1-5).
@@ -1298,13 +1353,18 @@ export class PptRelay {
       /* keep the ack: the op is durable regardless of the snapshot read */
     }
     // Ack the sender ONLY after the durable write.
-    void this.sendFrame(conn, { ctl: 'ack', k: frame.k ?? 0, q: seq, snapshotVersion })
+    conn.lastDelivered = Math.max(conn.lastDelivered, seq)
+    void this.gatedSend(conn, { ctl: 'ack', k: frame.k ?? 0, q: seq, snapshotVersion })
     // Broadcast to peers only for a first-seen frame (no echo, no double-apply).
     if (!duplicate) this.broadcast(conn, { ctl: 'op', q: seq, frame })
   }
 
   private async handleSnap(conn: Conn, frame: SnapFrame, rawBytes: number): Promise<void> {
     const k = typeof frame.k === 'number' ? frame.k : undefined
+    if (!conn.caughtUp || conn.replayInFlight) {
+      this.refuse(conn, 'snapshot-conflict', { k, message: 'snapshot requires a caught-up connection' })
+      return
+    }
     // The single-blob limit is enforced inside guardMutation (as this frame's
     // size gate) so a legitimately large snapshot is not pre-empted by the small
     // per-op-frame cap.
@@ -1331,8 +1391,10 @@ export class PptRelay {
       this.refuse(conn, 'storage-failed', { k, message: 'snapshot preflight failed' })
       return
     }
-    // A snapshot must cover a real, non-regressing prefix of the op log.
-    if (covered < 0 || covered > currentSeq || (existing && covered < existing.coveredSeq)) {
+    // A snapshot must cover a real, non-regressing prefix the connection has
+    // actually observed/acked; global currentSeq alone is not authority for this
+    // writer, because an uncaught-up socket could otherwise prune ops it never saw.
+    if (covered < 0 || covered > currentSeq || covered > conn.lastDelivered || (existing && covered < existing.coveredSeq)) {
       this.refuse(conn, 'snapshot-conflict', { k, message: 'snapshot covered seq conflicts with the op log' })
       return
     }
@@ -1374,7 +1436,7 @@ export class PptRelay {
     } catch {
       /* keep the ack: the snapshot is durable; prune is best-effort GC */
     }
-    void this.sendFrame(conn, { ctl: 'ack', k: frame.k ?? 0, q: covered, snapshotVersion })
+    void this.gatedSend(conn, { ctl: 'ack', k: frame.k ?? 0, q: covered, snapshotVersion })
   }
 
   /**
@@ -1400,8 +1462,7 @@ export class PptRelay {
     for (const room of this.rooms.values()) {
       for (const conn of room) {
         if (conn.documentName === documentName) {
-          conn.auth.invalidated = true
-          conn.auth.readAllowed = false
+          conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false, pendingReauth: true }
         }
       }
     }
@@ -1463,14 +1524,14 @@ export class PptRelay {
         // Only a downgrade takes effect live; an upgrade needs fresh authority.
         if (roleRank(role) < roleRank(conn.role)) {
           conn.role = role
-          void this.sendFrame(conn, { ctl: 'role-changed', role, epoch: newEpoch })
+          void this.gatedSend(conn, { ctl: 'role-changed', role, epoch: newEpoch })
         }
         // Record that this connection's role now reflects the live epoch, so
         // guardMutation does not re-resolve it again for the same epoch. Only
         // stamp when we actually have the authoritative epoch — otherwise leave
         // roleEpoch stale so the per-frame guard re-resolves later.
         if (epochOk) conn.roleEpoch = newEpoch
-        conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: !epochOk }
+        conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false, pendingReauth: !epochOk }
       }
     }
   }

@@ -15,6 +15,7 @@
  *  - `saveSnapshot` writes the snapshot AND advances the version atomically;
  *    `pruneOpsThrough` runs only after that write is durable.
  */
+import { createHash } from 'node:crypto'
 import type { BentoDoc } from '../bentoDoc.js'
 
 /** A durably-persisted op frame, addressed by its room sequence. */
@@ -35,6 +36,31 @@ export interface AppendOpResult {
   duplicate: boolean
   /** Byte size of the persisted frame JSON (room-budget accounting). */
   frameBytes: number
+}
+
+export interface FrameIdentity {
+  seq: number
+  payloadHash: string | null
+}
+
+export class DuplicateFramePayloadError extends Error {
+  readonly duplicatePayloadMismatch = true as const
+  constructor(frameId: string) {
+    super(`frameId ${frameId} was already used with a different payload`)
+    this.name = 'DuplicateFramePayloadError'
+  }
+}
+
+export function canonicalPayloadHash(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex')
+}
+
+export function isDuplicateFramePayloadError(err: unknown): err is DuplicateFramePayloadError {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { duplicatePayloadMismatch?: unknown }).duplicatePayloadMismatch === true
+  )
 }
 
 export interface RelaySnapshot {
@@ -165,6 +191,8 @@ export interface PptRelayStore {
    * idempotent-resend contract).
    */
   frameSeq(docId: string, frameId: string): Promise<number | null>
+  /** Seq plus payload hash already recorded for `(docId, frameId)`, when available. */
+  frameIdentity?(docId: string, frameId: string): Promise<FrameIdentity | null>
   /** Ops with `seq > sinceSeq`, ascending. Bounded to `limit` rows when given. */
   opsSince(docId: string, sinceSeq: number, limit?: number): Promise<PersistedOp[]>
   /** Highest assigned room sequence for the doc (0 when none). */
@@ -215,9 +243,11 @@ export class InMemoryPptRelayStore implements PptRelayStore {
   async appendOp(docId: string, frameId: string, frame: unknown): Promise<AppendOpResult> {
     const r = this.room(docId)
     const bytes = Buffer.byteLength(JSON.stringify(frame), 'utf8')
+    const payloadHash = canonicalPayloadHash(frame)
     const existing = r.byFrameId.get(frameId)
     if (existing !== undefined) {
       const prev = r.ops.find((o) => o.seq === existing)
+      if (prev && canonicalPayloadHash(prev.frame) !== payloadHash) throw new DuplicateFramePayloadError(frameId)
       return { seq: existing, duplicate: true, frameBytes: prev?.bytes ?? bytes }
     }
     const seq = r.seq + 1
@@ -234,6 +264,14 @@ export class InMemoryPptRelayStore implements PptRelayStore {
     // append-time `ppt_collab_frame` ledger (XIN-1660 D1/D3).
     const seq = this.room(docId).byFrameId.get(frameId)
     return seq ?? null
+  }
+
+  async frameIdentity(docId: string, frameId: string): Promise<FrameIdentity | null> {
+    const r = this.room(docId)
+    const seq = r.byFrameId.get(frameId)
+    if (seq === undefined) return null
+    const prev = r.ops.find((o) => o.seq === seq)
+    return { seq, payloadHash: prev ? canonicalPayloadHash(prev.frame) : null }
   }
 
   async opsSince(docId: string, sinceSeq: number, limit?: number): Promise<PersistedOp[]> {

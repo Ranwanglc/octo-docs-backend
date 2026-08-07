@@ -1,6 +1,7 @@
 import './helpers/pptRelayEnv.js'
 
 import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { createHash } from 'node:crypto'
 
 /**
  * R4-B1 integration coverage for the PRODUCTION store `DbPptRelayStore` (§7.3).
@@ -32,12 +33,17 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 // ── In-memory fake of the four relay tables ─────────────────────────────────
 interface OpRow { seq: number; frameId: string; frameJson: string; frameBytes: number }
 interface SnapRow { version: number; covered: number; docJson: string; sha: string; bytes: number }
+interface FrameRow { seq: number; payloadHash: string | null }
+
+function payloadHash(frameJson: string): string {
+  return createHash('sha256').update(frameJson, 'utf8').digest('hex')
+}
 
 function makeDb() {
   const ops = new Map<string, Map<number, OpRow>>() // docId -> seq -> row
   const seqCounter = new Map<string, number>() // docId -> last_seq
   const snapshot = new Map<string, SnapRow>() // docId -> row
-  const frames = new Map<string, Map<string, number>>() // docId -> frameId -> seq (dedup ledger, written at append)
+  const frames = new Map<string, Map<string, FrameRow>>() // docId -> frameId -> identity (dedup ledger, written at append)
   const snapLocks = new Map<string, Promise<void>>() // docId -> ppt_live_snapshot row-lock queue
   // frames committed but HIDDEN from the non-locking (snapshot) ledger read, to
   // reproduce D1: a resend whose tx opened before the original committed sees no
@@ -49,6 +55,7 @@ function makeDb() {
   // append transaction, before any mutation) throws a lock error and decrements,
   // modelling a lock-wait timeout the store must retry (XIN-1693 P1-5).
   let lockErrorsOnFrameRead = 0
+  let lockErrorsOnOpPageRead = 0
   // Every SQL statement executed (via both `query` and `tx.query`), so a test can
   // assert on the exact statements a store method issues (e.g. prune is a DELETE,
   // never an INSERT … SELECT into the ledger).
@@ -69,9 +76,12 @@ function makeDb() {
   function route(sql: string, params: unknown[], ctx: { lastInsertId: number }): unknown[] {
     const p = params ?? []
     sqlLog.push(sql)
+    if (sql.includes('SET TRANSACTION ISOLATION LEVEL') || sql.includes('START TRANSACTION WITH CONSISTENT SNAPSHOT')) {
+      return []
+    }
     // ── ppt_collab_frame: append-time dedup authority (survives op prune) ──
     if (sql.includes('ppt_collab_frame')) {
-      if (sql.includes('SELECT seq FROM ppt_collab_frame')) {
+      if (sql.includes('SELECT seq') && sql.includes('FROM ppt_collab_frame')) {
         const [docId, frameId] = p as [string, string]
         const forUpdate = sql.includes('FOR UPDATE')
         // Non-locking read = REPEATABLE-READ snapshot: a hidden-but-committed row is
@@ -85,22 +95,24 @@ function makeDb() {
           }
           if (hiddenFromSnapshot.has(`${docId}:${frameId}`)) return []
         }
-        const seq = frames.get(docId)?.get(frameId)
-        return seq !== undefined ? [{ seq }] : []
+        const row = frames.get(docId)?.get(frameId)
+        return row !== undefined ? [{ seq: row.seq, payload_hash: row.payloadHash }] : []
       }
       if (sql.includes('UPDATE ppt_collab_frame')) {
         // Repoint a ledger row (P1-1 b op-dup reconciliation): `SET seq = ? WHERE
         // doc_id = ? AND frame_id = ?`.
         const [seq, docId, frameId] = p as [number, string, string]
-        frames.get(docId)?.set(frameId, seq)
+        const ledger = frames.get(docId)
+        const prev = ledger?.get(frameId)
+        ledger?.set(frameId, { seq, payloadHash: prev?.payloadHash ?? null })
         return []
       }
       if (sql.includes('INSERT INTO ppt_collab_frame')) {
-        const [docId, frameId, seq] = p as [string, string, number]
+        const [docId, frameId, seq, hash] = p as [string, string, number, string]
         let ledger = frames.get(docId)
         if (!ledger) { ledger = new Map(); frames.set(docId, ledger) }
         if (ledger.has(frameId)) throw dupError() // (doc_id, frame_id) PRIMARY KEY
-        ledger.set(frameId, seq)
+        ledger.set(frameId, { seq, payloadHash: hash })
         return []
       }
     }
@@ -137,6 +149,10 @@ function makeDb() {
       return []
     }
     if (sql.includes('SELECT seq, frame_id, frame_json FROM ppt_collab_op')) {
+      if (lockErrorsOnOpPageRead > 0) {
+        lockErrorsOnOpPageRead--
+        throw lockError()
+      }
       const [docId, since, limit] = p as [string, number, number | undefined]
       const room = ops.get(docId)
       if (!room) return []
@@ -197,6 +213,9 @@ function makeDb() {
     /** Inject N transient lock-wait timeouts on the append fast-path read (P1-5). */
     setLockErrorsOnFrameRead: (n: number) => {
       lockErrorsOnFrameRead = n
+    },
+    setLockErrorsOnOpPageRead: (n: number) => {
+      lockErrorsOnOpPageRead = n
     },
     query: vi.fn(async (sql: string, params: unknown[] = []) => route(sql, params, { lastInsertId: 0 })),
     transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
@@ -288,6 +307,17 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
     expect(db.ops.get(D)!.size).toBe(1)
   })
 
+  it('a resent frameId with a different payload is refused instead of re-acked', async () => {
+    const store = new DbPptRelayStore()
+    await store.appendOp(D, 'dup-payload', { v: 1 })
+    expect(db.frames.get(D)?.get('dup-payload')?.payloadHash).toBe(payloadHash('{"v":1}'))
+    await expect(store.appendOp(D, 'dup-payload', { v: 2 })).rejects.toMatchObject({
+      duplicatePayloadMismatch: true,
+    })
+    expect(db.ops.get(D)!.size).toBe(1)
+    expect(await store.currentSeq(D)).toBe(1)
+  })
+
   it('concurrent resend of the SAME frameId: one persists, the other re-acks (no permanent storage-failed)', async () => {
     const store = new DbPptRelayStore()
     const [a, b] = await Promise.all([
@@ -324,13 +354,13 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
     const first = await store.appendOp(D, 'frame-1', { n: 1 })
     await store.appendOp(D, 'frame-2', { n: 2 })
     expect(first.seq).toBe(1)
-    expect(db.frames.get(D)!.get('frame-1')).toBe(1) // ledger written at APPEND time
+    expect(db.frames.get(D)!.get('frame-1')?.seq).toBe(1) // ledger written at APPEND time
     // Snapshot covers + prunes seq 1: its ppt_collab_op row is physically deleted
     // by a plain DELETE — the ledger mapping is NOT copied, it was already there.
     await store.saveSnapshot({ docId: D, coveredSeq: 1, doc: deck() })
     await store.pruneOpsThrough(D, 1)
     expect([...(db.ops.get(D) ?? new Map()).keys()]).toEqual([2]) // seq 1 gone from op table
-    expect(db.frames.get(D)!.get('frame-1')).toBe(1) // ledger mapping outlives the op row
+    expect(db.frames.get(D)!.get('frame-1')?.seq).toBe(1) // ledger mapping outlives the op row
 
     // A re-send of the pruned frame must NOT mint a fresh seq (which would
     // rebroadcast a duplicate of an op the snapshot already subsumes).
@@ -452,7 +482,7 @@ describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-169
     const res = await store.appendOp(D, 'pre', { v: 1 })
     expect(res).toMatchObject({ seq: 1, duplicate: true })
     // The ledger row is reconciled to the op's original seq for future resends.
-    expect(db.frames.get(D)?.get('pre')).toBe(1)
+    expect(db.frames.get(D)?.get('pre')?.seq).toBe(1)
   })
 
   it('P1-5: a transient lock-wait timeout is retried and the append then succeeds', async () => {
@@ -478,6 +508,8 @@ describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-169
     await store.pruneOpsThrough(D, 1)
     db.transaction.mockClear()
     const cursor = await store.openReplay(D, 0, { pageRows: 1, pageBytes: 1_000_000 })
+    expect(db.sqlLog.some((s) => s.includes('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ'))).toBe(true)
+    expect(db.sqlLog.some((s) => s.includes('START TRANSACTION WITH CONSISTENT SNAPSHOT'))).toBe(true)
     expect(cursor.highWater).toBe(3) // durable counter, not MAX(seq) over the pruned table
     expect(cursor.snapshot?.coveredSeq).toBe(1)
     expect((await cursor.nextPage()).map((o) => o.seq)).toEqual([2])
@@ -490,5 +522,23 @@ describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-169
 
     const view = await store.readReplay(D, 0, 1000)
     expect(view.ops.map((o) => o.seq)).toEqual([2, 3])
+  })
+
+  it('P1-D: transient replay page read failures are retried inside nextPage', async () => {
+    const store = new DbPptRelayStore()
+    await store.appendOp(D, 'f1', { n: 1 })
+    db.setLockErrorsOnOpPageRead(2)
+    const cursor = await store.openReplay(D, 0, { pageRows: 10, pageBytes: 1_000_000 })
+    expect((await cursor.nextPage()).map((o) => o.seq)).toEqual([1])
+    await cursor.close()
+  })
+
+  it('P1-D: replay page read retry exhaustion is classified retryable', async () => {
+    const store = new DbPptRelayStore()
+    await store.appendOp(D, 'f1', { n: 1 })
+    db.setLockErrorsOnOpPageRead(99)
+    const cursor = await store.openReplay(D, 0, { pageRows: 10, pageBytes: 1_000_000 })
+    await expect(cursor.nextPage()).rejects.toMatchObject({ retryable: true })
+    await cursor.close()
   })
 })

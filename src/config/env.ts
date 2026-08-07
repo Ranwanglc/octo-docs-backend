@@ -100,8 +100,9 @@ export function parseTrustProxy(raw: string): boolean | number | string {
   return v
 }
 
-/** Dev-only fallback secret; must never reach production (see requireSafeSigningSecret). */
+/** Dev-only fallback secret; must never reach production. */
 const DEV_SIGNING_SECRET = 'dev-only-change-me'
+const MIN_PRODUCTION_SIGNING_SECRET_BYTES = 32
 
 /**
  * Fail-fast guard: in production the attachment signing secret must be a real
@@ -114,6 +115,17 @@ export function requireSafeSigningSecret(secret: string): string {
   if (secret === DEV_SIGNING_SECRET && process.env.NODE_ENV === 'production') {
     throw new Error(
       'ATTACHMENT_SIGNING_SECRET must be overridden in production (refusing to run with the dev default)',
+    )
+  }
+  return secret
+}
+
+export function requireSafeCollabTokenSecret(secret: string): string {
+  if (process.env.NODE_ENV !== 'production') return secret
+  const bytes = Buffer.byteLength(secret, 'utf8')
+  if (secret.trim() === '' || secret === DEV_SIGNING_SECRET || bytes < MIN_PRODUCTION_SIGNING_SECRET_BYTES) {
+    throw new Error(
+      `COLLAB_TOKEN_SECRET must be set to at least ${MIN_PRODUCTION_SIGNING_SECRET_BYTES} bytes in production (refusing to run with a missing, weak, or dev default secret)`,
     )
   }
   return secret
@@ -293,7 +305,7 @@ export const config = {
   },
 
   collabToken: {
-    secret: str('COLLAB_TOKEN_SECRET', 'dev-only-change-me'),
+    secret: requireSafeCollabTokenSecret(str('COLLAB_TOKEN_SECRET', DEV_SIGNING_SECRET)),
     ttlSeconds: num('COLLAB_TOKEN_TTL_SECONDS', 300),
     // Public, browser-reachable collab WS origin surfaced to clients as
     // `collabWsUrl` in the collab-token response (§4.4). Absolute ws://|wss://
