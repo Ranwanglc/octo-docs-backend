@@ -45,6 +45,26 @@ function toOp(row: RawRow): PptCollabOpRow {
   }
 }
 
+/**
+ * Bind value for a `LIMIT ?` placeholder.
+ *
+ * mysql2's prepared-statement path (`conn.execute`) rejects an INTEGER bound to
+ * `LIMIT ?` on real MySQL 8 with `ER_WRONG_ARGUMENTS` ("Incorrect arguments to
+ * mysqld_stmt_execute"): the paged replay read and `opsSince(..., limit)` both
+ * hit it, so durable replay was broken on a real engine (P1-4 / XIN-1740). The
+ * in-memory fake routes `execute` through its own model and never saw it. A
+ * STRING-bound limit is accepted by the same prepared path and returns the exact
+ * same rows an integer would (verified against MySQL 8.0), so bind the page size
+ * as a string. Guarded to a non-negative safe integer so a caller can never
+ * smuggle non-numeric text into the clause.
+ */
+function limitBind(limit: number): string {
+  if (!Number.isSafeInteger(limit) || limit < 0) {
+    throw new RangeError(`LIMIT must be a non-negative safe integer, got ${limit}`)
+  }
+  return String(limit)
+}
+
 export const pptCollabOpRepo = {
   /** Insert one op frame at an already-computed seq (tx-scoped). */
   async insertTx(
@@ -73,7 +93,7 @@ export const pptCollabOpRepo = {
       const rows = await query<RawRow>(
         `SELECT seq, frame_id, frame_json FROM ppt_collab_op
           WHERE doc_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
-        [docId, sinceSeq, limit],
+        [docId, sinceSeq, limitBind(limit)],
       )
       return rows.map(toOp)
     }
@@ -95,7 +115,7 @@ export const pptCollabOpRepo = {
       const rows = await tx.query<RawRow>(
         `SELECT seq, frame_id, frame_json FROM ppt_collab_op
           WHERE doc_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
-        [docId, sinceSeq, limit],
+        [docId, sinceSeq, limitBind(limit)],
       )
       return rows.map(toOp)
     }

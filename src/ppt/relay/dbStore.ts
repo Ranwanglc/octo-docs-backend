@@ -112,11 +112,26 @@ export class DbPptRelayStore implements PptRelayStore {
         // inserted at it (the freshly-allocated seq is burned; seq gaps are legal).
         // The migration also backfills the ledger from `ppt_collab_op`, so this
         // branch is the belt to that migration's suspenders.
+        //
+        // The re-ack MUST be payload-verified, exactly like `resolveDuplicate`'s
+        // ledger paths: read the stored op FRAME (not just its seq) under a locking
+        // read and compare its canonical-ops hash to the incoming frame's. A match
+        // is a genuine idempotent resend — repoint the ledger to the op's original
+        // seq (the fresh ledger row we inserted above already carries the incoming
+        // hash, which equals the stored hash) and re-ack. A MISMATCH is a reused
+        // frameId carrying DIFFERENT ops: throw `DuplicateFramePayloadError`, which
+        // rolls the whole transaction back — undoing the ledger row we just inserted
+        // at the burned seq — so the burned-gap compatibility path can never blindly
+        // re-ack a different payload as a duplicate. A pruned op row (no frame_json)
+        // still fails closed on the null return below.
         if (isDuplicateKeyError(err)) {
-          const orig = await pptCollabOpRepo.getSeqByFrameIdForUpdateTx(tx, docId, frameId)
+          const orig = await pptCollabOpRepo.getFrameByFrameIdForUpdateTx(tx, docId, frameId)
           if (orig !== null) {
-            await pptCollabFrameRepo.updateSeqTx(tx, docId, frameId, orig)
-            return { seq: orig, duplicate: true, frameBytes }
+            if (canonicalPayloadHash(orig.frame) !== payloadHash) {
+              throw new DuplicateFramePayloadError(frameId)
+            }
+            await pptCollabFrameRepo.updateSeqTx(tx, docId, frameId, orig.seq)
+            return { seq: orig.seq, duplicate: true, frameBytes }
           }
         }
         throw err
@@ -343,8 +358,20 @@ export class DbPptRelayStore implements PptRelayStore {
       },
     }
     try {
-      await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')
-      await conn.execute('START TRANSACTION WITH CONSISTENT SNAPSHOT')
+      // Transaction-control statements MUST go through the TEXT protocol
+      // (`conn.query`), not the prepared-statement protocol (`conn.execute`):
+      // `START TRANSACTION WITH CONSISTENT SNAPSHOT` is not in MySQL 8's
+      // prepared-statement grammar and `execute()` rejects it with
+      // `ER_UNSUPPORTED_PS` (1295) on a real engine — a non-transient error that
+      // `withStoreRetry` rethrows, so the relay maps it to a NON-retryable
+      // `storage-failed` and closes the socket, breaking durable replay on every
+      // hello/late-join/reconnect (P1-4). The in-memory fake routed `execute`
+      // straight through its `query` model, so it could never surface this; the
+      // real-MySQL integration suite (XIN-1740) pins it. `SET TRANSACTION
+      // ISOLATION LEVEL` IS accepted on the prepared path, but is issued via
+      // `query()` too so the whole transaction-control preamble is uniform.
+      await conn.query('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')
+      await conn.query('START TRANSACTION WITH CONSISTENT SNAPSHOT')
       const result = await fn(tx)
       await conn.commit()
       return result

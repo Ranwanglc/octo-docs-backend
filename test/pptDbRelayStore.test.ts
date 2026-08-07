@@ -266,6 +266,12 @@ vi.mock('../src/db/pool.js', () => ({
     getConnection: async () => ({
       beginTransaction: async () => {},
       execute: async (sql: string, params: unknown[] = []) => [await db.query(sql, params ?? [])],
+      // The consistent-snapshot replay path issues its transaction-control
+      // statements (and, post-fix, its reads) via the TEXT protocol `conn.query`,
+      // since `START TRANSACTION WITH CONSISTENT SNAPSHOT` is rejected on the
+      // prepared `execute` path by real MySQL 8 (P1-4). Route it through the same
+      // fake so both protocols resolve identically here.
+      query: async (sql: string, params: unknown[] = []) => [await db.query(sql, params ?? [])],
       commit: async () => {},
       rollback: async () => {},
       release: () => {},
@@ -507,6 +513,23 @@ describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-169
     expect(res).toMatchObject({ seq: 1, duplicate: true })
     // The ledger row is reconciled to the op's original seq for future resends.
     expect(db.frames.get(D)?.get('pre')?.seq).toBe(1)
+  })
+
+  it('P1-1 (b) mismatch: a resend of a pre-upgrade op row with DIFFERENT ops is REFUSED, not blindly re-acked (XIN-1739)', async () => {
+    // Same pre-upgrade shape (op row, no ledger), but the resend carries DIFFERENT
+    // ops for the same frameId. Before the fix the op-table duplicate fallback
+    // re-acked after reading only the seq (`getSeqByFrameIdForUpdateTx`), so a
+    // reused frameId with a different payload was blindly acked as a duplicate —
+    // silent divergence. The fix reads the stored FRAME and refuses on a canonical
+    // payload-hash mismatch. (The transaction ROLLBACK that undoes the ledger row
+    // and counter advance is a real-MySQL property covered by the XIN-1740
+    // integration suite; the fake does not model rollback.)
+    db.ops.set(D, new Map([[1, { seq: 1, frameId: 'pre', frameJson: '{"v":1}', frameBytes: 8 }]]))
+    db.seqCounter.set(D, 1)
+    expect(db.frames.get(D)?.get('pre')).toBeUndefined() // no ledger row
+
+    const store = new DbPptRelayStore()
+    await expect(store.appendOp(D, 'pre', { v: 2 })).rejects.toMatchObject({ duplicatePayloadMismatch: true })
   })
 
   it('P1-5: a transient lock-wait timeout is retried and the append then succeeds', async () => {
