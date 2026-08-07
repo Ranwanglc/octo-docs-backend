@@ -227,6 +227,21 @@ export interface PptRelayStore {
   frameSeq(docId: string, frameId: string): Promise<number | null>
   /** Seq plus payload hash already recorded for `(docId, frameId)`, when available. */
   frameIdentity?(docId: string, frameId: string): Promise<FrameIdentity | null>
+  /**
+   * Resolve the re-ack identity of a ledger row whose `payload_hash` is NULL (a
+   * legacy row, or one nulled by the canonical-ops hash-scheme migration) for the
+   * relay's PRE-GATE re-ack path: read the stored op `frame_json` and recompute
+   * its canonical-ops hash so a pure re-ack of an already-durable write can be
+   * payload-verified WITHOUT the mutation gate (writer/current-epoch), exactly like
+   * the non-null fast re-ack (XIN-1750). Returns `{seq, payloadHash}` (the ledger's
+   * seq + the hash recomputed from `frame_json`) when the NULL-hash row's op is
+   * still present, or null when the frame is unseen, is NOT a NULL-hash row, OR its
+   * op row was already pruned (no `frame_json` to verify against) — in which case
+   * the caller falls through to the mutation gate + {@link appendOp}, which gates
+   * or fails closed as appropriate. A pure CURRENT read: it consumes neither budget
+   * nor a rate slot, does not persist, and is not rebroadcast.
+   */
+  resolveNullHashReack?(docId: string, frameId: string): Promise<{ seq: number; payloadHash: string } | null>
   /** Ops with `seq > sinceSeq`, ascending. Bounded to `limit` rows when given. */
   opsSince(docId: string, sinceSeq: number, limit?: number): Promise<PersistedOp[]>
   /** Highest assigned room sequence for the doc (0 when none). */
@@ -253,7 +268,7 @@ export interface PptRelayStore {
 interface RoomState {
   ops: Array<PersistedOp & { bytes: number }>
   seq: number
-  byFrameId: Map<string, { seq: number; payloadHash: string }>
+  byFrameId: Map<string, { seq: number; payloadHash: string | null }>
   snapshot: RelaySnapshot | null
 }
 
@@ -304,6 +319,22 @@ export class InMemoryPptRelayStore implements PptRelayStore {
     const identity = r.byFrameId.get(frameId)
     if (identity === undefined) return null
     return { seq: identity.seq, payloadHash: identity.payloadHash }
+  }
+
+  async resolveNullHashReack(docId: string, frameId: string): Promise<{ seq: number; payloadHash: string } | null> {
+    // Only a NULL-hash ledger row routes through this pre-gate re-ack path; a row
+    // that already carries a canonical-ops hash is resolved on the fast path via
+    // `frameIdentity`. The stored op frame is the verification source: recompute
+    // its canonical-ops hash so the caller can payload-verify the resend without
+    // the mutation gate. A frame whose op row was pruned (or never seen) has no
+    // frame to verify against and returns null → the caller falls through and
+    // `appendOp` fails closed (XIN-1750 / XIN-1736 P2-d).
+    const r = this.room(docId)
+    const identity = r.byFrameId.get(frameId)
+    if (identity === undefined || identity.payloadHash !== null) return null
+    const op = r.ops.find((o) => o.frameId === frameId)
+    if (op === undefined) return null
+    return { seq: identity.seq, payloadHash: canonicalPayloadHash(op.frame) }
   }
 
   async opsSince(docId: string, sinceSeq: number, limit?: number): Promise<PersistedOp[]> {

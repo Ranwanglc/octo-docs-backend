@@ -646,6 +646,27 @@ describe('DbPptRelayStore — RC round-12 (XIN-1736)', () => {
     await expect(store.appendOp(D, 'legacy2', opsFrame(2))).rejects.toMatchObject({ duplicatePayloadMismatch: true })
   })
 
+  it('XIN-1750: resolveNullHashReack recomputes the canonical-ops hash from frame_json for the pre-gate re-ack (no mutation gate, no in-memory fake)', async () => {
+    const store = new DbPptRelayStore()
+    const frame = opsFrame(1)
+    // Migrated state: op row present, ledger row nulled by the canonical-ops hash migration.
+    db.ops.set(D, new Map([[1, { seq: 1, frameId: 'legacy3', frameJson: JSON.stringify(frame), frameBytes: 40 }]]))
+    db.seqCounter.set(D, 1)
+    db.frames.set(D, new Map([['legacy3', { seq: 1, payloadHash: null }]]))
+    // A NULL-hash row is resolved by recomputing the hash from the stored frame_json
+    // — the seq + hash the relay's pre-gate re-ack payload-verifies WITHOUT the gate.
+    expect(await store.resolveNullHashReack(D, 'legacy3')).toEqual({ seq: 1, payloadHash: canonicalPayloadHash(frame) })
+    // A non-null-hash row is NOT resolved here (it takes the fast frameIdentity path).
+    db.frames.set(D, new Map([['legacy3', { seq: 1, payloadHash: canonicalPayloadHash(frame) }]]))
+    expect(await store.resolveNullHashReack(D, 'legacy3')).toBeNull()
+    // A NULL-hash row whose op row was pruned (no frame_json) fails closed -> null,
+    // so the relay caller falls through to the mutation gate + appendOp.
+    db.frames.set(D, new Map([['gone', { seq: 2, payloadHash: null }]]))
+    expect(await store.resolveNullHashReack(D, 'gone')).toBeNull()
+    // An unseen frame -> null.
+    expect(await store.resolveNullHashReack(D, 'never')).toBeNull()
+  })
+
   it('P1-G: a byte-bounded replay advances the cursor past EVERY fetched row (no re-fetch of dropped rows)', async () => {
     const store = new DbPptRelayStore()
     for (const n of [1, 2, 3, 4]) await store.appendOp(D, `g${n}`, opsFrame('y'.repeat(60), { frameId: `g${n}` }))

@@ -9,7 +9,7 @@ import jwt from 'jsonwebtoken'
 import { WebSocket } from 'ws'
 import { config } from '../src/config/env.js'
 import { PptRelay, type RelayLimits } from '../src/ppt/relay/pptRelay.js'
-import { InMemoryPptRelayStore, type PptRelayStore, RetryableStorageError } from '../src/ppt/relay/store.js'
+import { InMemoryPptRelayStore, type PptRelayStore, RetryableStorageError, canonicalPayloadHash } from '../src/ppt/relay/store.js'
 import { isRetryable, STORAGE_RETRY_BACKOFF_MS } from '../src/ppt/relay/frames.js'
 import { issuePptCollabToken, PPT_RELAY_TICKET_AUD } from '../src/auth/pptCollabToken.js'
 import type { ResolvedRole, Role } from '../src/permission/role.js'
@@ -1681,6 +1681,160 @@ describe('PPT relay: round-7 fixes (XIN-1695)', () => {
       expect(isRetryable(code)).toBe(false)
     }
     expect(STORAGE_RETRY_BACKOFF_MS).toBeGreaterThan(0)
+  })
+})
+
+/**
+ * XIN-1750 (round-17): a duplicate resend whose ledger `payload_hash` is NULL —
+ * the state the canonical-ops hash migration
+ * (`2026-08-07-ppt-collab-frame-payload-hash-canonical-ops.sql`) leaves EVERY
+ * pre-deploy frame in — must still re-ack its already-durable seq BEFORE the
+ * mutation gate, exactly like the non-null fast re-ack. Otherwise a writer whose
+ * permission epoch advanced (a common membership change) or who was downgraded,
+ * resending a committed pre-deploy frame after a lost ack, is refused
+ * `stale-epoch` / `forbidden-role` for a write that already committed and is left
+ * PERMANENTLY unsynced — the "randomly loses edits after deploy" symptom.
+ *
+ * The store double here models the MIGRATED DB state the in-memory fake's own
+ * ledger (always a non-null hash) can never reach: a committed op whose ledger row
+ * had its `payload_hash` nulled, verified against the stored `frame_json`. These
+ * tests FAIL on head 0f1c982 (which routes the NULL-hash row straight to
+ * guardMutation) and pass on the fix.
+ */
+class MigratedNullHashStore extends InMemoryPptRelayStore {
+  private readonly nulled = new Set<string>()
+  private readonly pruned = new Set<string>()
+  /** Model the migration: NULL the ledger row's payload_hash for a committed frame. */
+  nullifyHash(docId: string, frameId: string): void {
+    this.nulled.add(`${docId}:${frameId}`)
+  }
+  /** Model a post-snapshot GC: the op frame_json is gone, so a NULL-hash resend cannot be verified. */
+  prunedOp(docId: string, frameId: string): void {
+    this.pruned.add(`${docId}:${frameId}`)
+  }
+  override async frameIdentity(docId: string, frameId: string): Promise<{ seq: number; payloadHash: string | null } | null> {
+    const id = await super.frameIdentity(docId, frameId)
+    if (id !== null && this.nulled.has(`${docId}:${frameId}`)) return { seq: id.seq, payloadHash: null }
+    return id
+  }
+  override async resolveNullHashReack(docId: string, frameId: string): Promise<{ seq: number; payloadHash: string } | null> {
+    const key = `${docId}:${frameId}`
+    if (!this.nulled.has(key)) return null
+    const seq = await this.frameSeq(docId, frameId)
+    if (seq === null || this.pruned.has(key)) return null // pruned op -> fail closed
+    const op = (await this.opsSince(docId, 0)).find((o) => o.frameId === frameId)
+    if (op === undefined) return null
+    return { seq, payloadHash: canonicalPayloadHash(op.frame) }
+  }
+}
+
+describe('PPT relay: NULL-hash pre-gate re-ack (XIN-1750, round-17)', () => {
+  it('a NULL-hash duplicate resend re-acks its durable seq BEFORE the mutation gate (downgraded + epoch-advanced socket)', async () => {
+    const store = new MigratedNullHashStore()
+    const h = await setup({ store })
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    const b = await h.connect({ uid: 'u_b', role: 'writer' })
+    await helloReady(a)
+    await helloReady(b)
+
+    // A (writer) commits a frame durably at epoch 0; B sees the broadcast.
+    a.send(OPS_FRAME(1, 'legacy-frame', 0))
+    expect((await a.recv()).q).toBe(1)
+    await b.recvUntil((m) => m.ctl === 'op' && m.q === 1)
+
+    // The canonical-ops hash migration NULLs the committed frame's ledger hash (the
+    // op row is still present). Admin then downgrades A to reader AND advances the
+    // epoch — the exact transitional window the migration comment warns about.
+    store.nullifyHash(DOC, 'legacy-frame')
+    h.setRole('u_a', 'reader')
+    h.setEpoch(1)
+    await h.relay.applyEpochBump(DOCNAME)
+    await a.recvUntil((m) => m.ctl === 'role-changed')
+
+    // A's ack was lost, so A resends the SAME frame (still stamped pre-downgrade
+    // epoch 0). On head 0f1c982 the NULL-hash row fell through to guardMutation and
+    // was refused stale-epoch/forbidden-role for an ALREADY-DURABLE write. The fix
+    // verifies against frame_json and re-acks the original seq.
+    a.send(OPS_FRAME(1, 'legacy-frame', 0))
+    const reack = await a.recv()
+    expect(reack.ctl).toBe('ack')
+    expect(reack.q).toBe(1)
+    // No new seq minted and no rebroadcast to the peer.
+    expect(await store.currentSeq(DOC)).toBe(1)
+    await expect(b.recv(200)).rejects.toThrow()
+  })
+
+  it('a NULL-hash resend whose canonical ops DIFFER is NOT re-acked through the pre-gate (no payload smuggling)', async () => {
+    const store = new MigratedNullHashStore()
+    const h = await setup({ store })
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    await helloReady(a)
+
+    a.send(OPS_FRAME(1, 'shared-frame', 0))
+    expect((await a.recv()).q).toBe(1)
+    store.nullifyHash(DOC, 'shared-frame')
+
+    h.setRole('u_a', 'reader')
+    h.setEpoch(1)
+    await h.relay.applyEpochBump(DOCNAME)
+    await a.recvUntil((m) => m.ctl === 'role-changed')
+
+    // Reuse the frameId with DIFFERENT ops. The pre-gate must NOT re-ack on frameId
+    // alone: the canonical-ops hash mismatch routes it to the mutation gate, where
+    // the downgraded/stale-epoch socket is correctly refused. A different payload can
+    // never ride the pure-re-ack exemption through the gate.
+    a.send({ t: 'ops', pv: 2, k: 1, frameId: 'shared-frame', epoch: 0, ops: [{ kind: 'set', key: 's1e1', prop: 'x', value: 999 }] })
+    const refused = await a.recv()
+    expect(refused.ctl).toBe('refused')
+    expect(['stale-epoch', 'forbidden-role']).toContain(refused.code)
+    expect(refused.retryable).toBe(false)
+    // Nothing new persisted.
+    expect(await store.currentSeq(DOC)).toBe(1)
+  })
+
+  it('a NULL-hash resend whose op row was PRUNED fails closed (no frame_json to verify) and does not smuggle a re-ack', async () => {
+    const store = new MigratedNullHashStore()
+    const h = await setup({ store })
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    await helloReady(a)
+
+    a.send(OPS_FRAME(1, 'pruned-frame', 0))
+    expect((await a.recv()).q).toBe(1)
+    // Migration nulled the hash; a later snapshot pruned the op frame_json.
+    store.nullifyHash(DOC, 'pruned-frame')
+    store.prunedOp(DOC, 'pruned-frame')
+
+    h.setRole('u_a', 'reader')
+    h.setEpoch(1)
+    await h.relay.applyEpochBump(DOCNAME)
+    await a.recvUntil((m) => m.ctl === 'role-changed')
+
+    // With no frame_json to verify against, the pre-gate cannot confirm identity, so
+    // the resend falls through to the mutation gate and the downgraded/stale-epoch
+    // socket is refused (fail closed) — it is not blindly re-acked on frameId alone.
+    a.send(OPS_FRAME(1, 'pruned-frame', 0))
+    const refused = await a.recv()
+    expect(refused.ctl).toBe('refused')
+    expect(['stale-epoch', 'forbidden-role']).toContain(refused.code)
+  })
+
+  it('a still-authorized writer resending a NULL-hash frame at the current epoch also re-acks (no regression to the non-null path)', async () => {
+    const store = new MigratedNullHashStore()
+    const h = await setup({ store })
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    await helloReady(a)
+
+    a.send(OPS_FRAME(1, 'live-frame', 0))
+    expect((await a.recv()).q).toBe(1)
+    store.nullifyHash(DOC, 'live-frame')
+
+    // Same authority, same epoch: the pre-gate re-ack still short-circuits (identical
+    // to the non-null fast path) rather than re-persisting or minting a new seq.
+    a.send(OPS_FRAME(1, 'live-frame', 0))
+    const reack = await a.recv()
+    expect(reack.ctl).toBe('ack')
+    expect(reack.q).toBe(1)
+    expect(await store.currentSeq(DOC)).toBe(1)
   })
 })
 

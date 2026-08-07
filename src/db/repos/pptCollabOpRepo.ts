@@ -170,6 +170,26 @@ export const pptCollabOpRepo = {
   },
 
   /**
+   * Non-locking, non-transactional twin of {@link getFrameByFrameIdForUpdateTx}:
+   * the stored op frame (seq + parsed `frame_json`) for `(doc_id, frame_id)`, or
+   * null when no op row exists (unseen, or pruned). A CURRENT read used by the
+   * relay's PRE-GATE re-ack path to verify a duplicate whose ledger row has a NULL
+   * `payload_hash` (legacy / migration-nulled) WITHOUT opening an append
+   * transaction or taking a row lock — a pure re-ack reads, it does not mutate
+   * (XIN-1750). A pruned frame has no `frame_json` and returns null, so the caller
+   * falls through to the mutation path, which fails closed.
+   */
+  async getFrameByFrameId(docId: string, frameId: string): Promise<{ seq: number; frame: unknown } | null> {
+    const rows = await query<RawRow>(
+      `SELECT seq, frame_id, frame_json FROM ppt_collab_op WHERE doc_id = ? AND frame_id = ?`,
+      [docId, frameId],
+    )
+    if (!rows[0]) return null
+    const op = toOp(rows[0])
+    return { seq: op.seq, frame: op.frame }
+  },
+
+  /**
    * Highest seq still PRESENT in this table (0 when none). This is NOT the
    * room's authoritative high-water — a prune drops rows so this can regress;
    * {@link ../repos/pptRelaySeqRepo.currentSeq} is the monotonic high-water. Kept

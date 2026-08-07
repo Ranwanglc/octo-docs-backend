@@ -1704,6 +1704,37 @@ export class PptRelay {
     return this.roomBytes.get(docId) ?? 0
   }
 
+  /**
+   * Emit the positive `ack` for a pure re-ack of an already-durable DUPLICATE
+   * frame (its original ack was lost) at its stored `seq`. Reads the current
+   * snapshot version for the ack envelope (a read failure keeps the re-ack — the
+   * frame is durable regardless), and echoes `k` with `?? 0` so an omitted counter
+   * never lands as `undefined` in the frame (P2-h; parse also refuses a
+   * non-integer `k`).
+   *
+   * MUST NOT advance the observation high-water (XIN-1739 P0-2): a re-ack
+   * acknowledges a frame this connection ALREADY WROTE durably — it is NOT evidence
+   * the connection OBSERVED the op prefix below that seq. A fresh authored write
+   * does advance it, because a caught-up author receives every lower real op in
+   * room order before its own ack; a re-ack has no such guarantee (it can arrive on
+   * a fresh reconnect that resends a pending frame whose seq was allocated after
+   * peers' ops it never received). Advancing on a re-ack would let `replay()` clamp
+   * away — and `handleSnap` authorize the prune of — ops the connection never saw.
+   * Consumes neither budget nor a rate slot and is not rebroadcast: it only echoes
+   * the already-committed seq. Shared by BOTH pre-gate re-ack paths (non-null-hash
+   * fast path and the NULL-hash `frame_json`-verified path, XIN-1750).
+   */
+  private async reackDuplicate(conn: Conn, frame: OpsFrame, seq: number): Promise<void> {
+    let snapshotVersion = 0
+    try {
+      const snap = await this.store.getSnapshot(conn.docId)
+      snapshotVersion = snap?.snapshotVersion ?? 0
+    } catch {
+      /* keep the re-ack: the frame is already durable regardless of this read */
+    }
+    void this.gatedSend(conn, { ctl: 'ack', k: frame.k ?? 0, q: seq, snapshotVersion })
+  }
+
   private async handleOps(conn: Conn, frame: OpsFrame, rawBytes: number): Promise<void> {
     const k = typeof frame.k === 'number' ? frame.k : undefined
     const frameId = typeof frame.frameId === 'string' ? frame.frameId : undefined
@@ -1774,37 +1805,41 @@ export class PptRelay {
         this.refuse(conn, 'protocol-version', { k, frameId, message: 'frameId payload mismatch' })
         return
       }
-      let snapshotVersion = 0
-      try {
-        const snap = await this.store.getSnapshot(conn.docId)
-        snapshotVersion = snap?.snapshotVersion ?? 0
-      } catch {
-        /* keep the re-ack: the frame is already durable regardless of this read */
-      }
-      // `k` is echoed back as the ack counter; apply `?? 0` consistently across
-      // every ack path so an omitted `k` never lands as `undefined` in the frame
-      // (P2-h — parse also refuses a non-integer `k`).
-      //
-      // Do NOT advance the observation high-water here (XIN-1739 P0-2). A re-ack is
-      // an acknowledgement of a frame this connection ALREADY WROTE durably — it is
-      // NOT evidence the connection OBSERVED the op prefix below that seq. A fresh
-      // authored write (below) does advance it, because a caught-up author receives
-      // every lower real op in room order before its own ack; a re-ack has no such
-      // guarantee (it can arrive on a fresh reconnect that resends a pending frame
-      // whose seq was allocated after peers' ops it never received). Advancing on a
-      // re-ack let `replay()` clamp away — and `handleSnap` authorize the prune of —
-      // ops the connection never saw.
-      void this.gatedSend(conn, { ctl: 'ack', k: frame.k ?? 0, q: known.seq, snapshotVersion })
+      await this.reackDuplicate(conn, frame, known.seq)
       return
     }
-    // A ledger row with a NULL payload_hash (legacy / hash-scheme transition)
-    // cannot be verified here without the op frame_json, so it is NOT fast-re-acked
-    // and NOT blindly refused: it falls through to the mutation gate + appendOp,
-    // whose `resolveDuplicate` verifies against the stored frame_json (re-ack) or
-    // fails closed if the op row was pruned (XIN-1736 P1-A / P2-d).
-    // Not a known duplicate: enforce the mutation gate (size / doc-status / epoch /
-    // role). Only genuinely new mutations reach here, so a downgraded or
-    // stale-epoch connection is refused for any write it has not already committed.
+    // A ledger row with a NULL payload_hash (a legacy row, or one nulled by the
+    // canonical-ops hash-scheme migration) cannot be verified from the ledger
+    // alone — but it is still a pure re-ack of an already-durable write, EXACTLY
+    // like the non-null path above, so it must NOT be forced through the mutation
+    // gate. `resolveNullHashReack` recomputes the canonical-ops hash from the
+    // stored op `frame_json`; on an exact match we re-ack the original seq HERE,
+    // BEFORE guardMutation, so a downgraded / epoch-advanced connection resending a
+    // committed pre-deploy frame after a lost ack is acknowledged instead of
+    // refused `stale-epoch` / `forbidden-role` and left permanently unsynced
+    // (XIN-1750). A MISMATCH (a reused frameId carrying DIFFERENT ops) or a PRUNED
+    // op row (no frame_json to verify against) does NOT re-ack: it falls through to
+    // the mutation gate + appendOp, which correctly gates a genuine new write and
+    // fails closed on a pruned frame — so a downgraded socket can never smuggle a
+    // DIFFERENT payload through this pre-gate path on frameId alone. The identity /
+    // read gate above already bound every frame; this exempts ONLY the pure
+    // re-ack-of-own-durable-write from the writer/epoch checks.
+    if (known !== null && known.payloadHash === null && this.store.resolveNullHashReack) {
+      let resolved: { seq: number; payloadHash: string } | null = null
+      try {
+        resolved = await this.store.resolveNullHashReack(conn.docId, frameId)
+      } catch {
+        /* fall through: appendOp's resolveDuplicate remains the authoritative dedup */
+      }
+      if (resolved !== null && resolved.payloadHash === payloadHash) {
+        await this.reackDuplicate(conn, frame, resolved.seq)
+        return
+      }
+    }
+    // Not a known duplicate (or a NULL-hash row we could not verify as one): enforce
+    // the mutation gate (size / doc-status / epoch / role). Only genuinely new
+    // mutations reach here, so a downgraded or stale-epoch connection is refused for
+    // any write it has not already committed.
     const guardCode = await this.guardMutation(conn, typeof frame.epoch === 'number' ? frame.epoch : -1, rawBytes, this.limits.maxFrameBytes)
     if (guardCode) {
       this.refuse(conn, guardCode, { k, frameId })

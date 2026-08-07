@@ -187,6 +187,24 @@ export class DbPptRelayStore implements PptRelayStore {
     return pptCollabFrameRepo.getByFrameId(docId, frameId)
   }
 
+  async resolveNullHashReack(docId: string, frameId: string): Promise<{ seq: number; payloadHash: string } | null> {
+    // Pre-gate re-ack for a NULL-payload_hash ledger row (legacy / nulled by the
+    // canonical-ops hash migration): the ledger alone cannot verify the resend, so
+    // recompute the canonical-ops hash from the stored op `frame_json` — the same
+    // verification `resolveDuplicate` runs inside `appendOp`, but WITHOUT the
+    // mutation gate, so a pure re-ack of an already-durable write is not refused
+    // stale-epoch/forbidden-role for a downgraded/epoch-advanced connection
+    // (XIN-1750). A non-locking CURRENT read: the pre-gate path neither persists
+    // nor rebroadcasts. Only NULL-hash rows resolve here (a non-null row is the
+    // fast path via `frameIdentity`); an unseen frame or a PRUNED op row (no
+    // frame_json) returns null and falls through to `appendOp`, which fails closed.
+    const identity = await pptCollabFrameRepo.getByFrameId(docId, frameId)
+    if (identity === null || identity.payloadHash !== null) return null
+    const op = await pptCollabOpRepo.getFrameByFrameId(docId, frameId)
+    if (op === null) return null
+    return { seq: identity.seq, payloadHash: canonicalPayloadHash(op.frame) }
+  }
+
   async opsSince(docId: string, sinceSeq: number, limit?: number): Promise<PersistedOp[]> {
     const ops = await pptCollabOpRepo.since(docId, sinceSeq, limit)
     return ops.map((o) => ({ seq: o.seq, frameId: o.frameId, frame: o.frame, frameBytes: o.frameBytes }))
