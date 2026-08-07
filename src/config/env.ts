@@ -766,7 +766,8 @@ export const config = {
       // Bento default relay limits (§7.3). Starting values ported from Bento's
       // upstream sync worker; load-test before production. Enforced as hard
       // refusals: `too-large` (permanent), `rate-limited` (retryable),
-      // `room-full` (permanent).
+      // `storage-retry` (retryable — transient storage failure), `room-full`
+      // (permanent).
       maxFrameBytes: numMin('PPT_RELAY_MAX_FRAME_BYTES', 1_900_000, 1),
       maxOpsPerFrame: numMin('PPT_RELAY_MAX_OPS_PER_FRAME', 512, 1),
       maxFramesPerWindow: numMin('PPT_RELAY_MAX_FRAMES_PER_WINDOW', 200, 1),

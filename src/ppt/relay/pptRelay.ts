@@ -13,10 +13,12 @@
  *    count, size), persisted DURABLY, ack'd to the sender ONLY after the durable
  *    write, and only THEN broadcast to peers (sender never echoes its own op);
  *  - `(docId, frameId)` is unique — a resent frame re-acks its original seq and
- *    is not rebroadcast;
+ *    is not rebroadcast, and this re-ack precedes the epoch/role gate so a resend
+ *    after a lost ack still acknowledges an already-durable write;
  *  - a `snap` advances the snapshot version atomically, then prunes covered ops;
- *  - refusals classify retry: ONLY `rate-limited` is retryable; every permanent
- *    refusal is surfaced (the client shows unsynced state, never a silent drop);
+ *  - refusals classify retry: the retryable set is `rate-limited` + `storage-retry`
+ *    (both carry a bounded `retryInMs` backoff hint); every other refusal is
+ *    permanent and surfaced (the client shows unsynced state, never a silent drop);
  *  - permission epoch is the live cutoff: stale-epoch mutations are refused, and
  *    a downgrade to `none` / a deleted doc closes the socket (4403 / 4404).
  */
@@ -31,6 +33,7 @@ import {
   parseClientFrame,
   opsAreValid,
   isRetryable,
+  STORAGE_RETRY_BACKOFF_MS,
   type OpsFrame,
   type SnapFrame,
   type RefusedCode,
@@ -553,11 +556,17 @@ export class PptRelay {
     opts: { k?: number; frameId?: string; message?: string; retryInMs?: number } = {},
   ): void {
     const retryable = isRetryable(code)
+    // Both retryable codes carry a bounded backoff hint. `rate-limited` supplies
+    // its window-derived delay via opts; `storage-retry` defaults to a small fixed
+    // backoff (STORAGE_RETRY_BACKOFF_MS) when a caller does not pass one, so the
+    // client always has a concrete delay instead of an unbounded busy-retry.
+    const retryInMs =
+      opts.retryInMs !== undefined ? opts.retryInMs : code === 'storage-retry' ? STORAGE_RETRY_BACKOFF_MS : undefined
     send(conn.socket, {
       ctl: 'refused',
       code,
       retryable,
-      ...(retryable && opts.retryInMs !== undefined ? { retryInMs: opts.retryInMs } : {}),
+      ...(retryable && retryInMs !== undefined ? { retryInMs } : {}),
       ...(opts.k !== undefined ? { k: opts.k } : {}),
       ...(opts.frameId !== undefined ? { frameId: opts.frameId } : {}),
       ...(opts.message !== undefined ? { message: opts.message } : {}),
@@ -1001,18 +1010,21 @@ export class PptRelay {
       this.refuse(conn, 'too-large', { k, frameId, message: 'op count exceeds per-frame limit' })
       return
     }
-    const guardCode = await this.guardMutation(conn, typeof frame.epoch === 'number' ? frame.epoch : -1, rawBytes, this.limits.maxFrameBytes)
-    if (guardCode) {
-      this.refuse(conn, guardCode, { k, frameId })
-      return
-    }
-    // D3: a KNOWN-DUPLICATE resend (its original ack was lost) must bypass the
-    // room-full / rate gates and re-ack its stored seq — never be permanently
-    // refused `room-full` / `rate-limited`, which would break the idempotent-resend
-    // contract the durable dedup was built for. The lookup is a CURRENT read of the
-    // dedup ledger; it runs BEFORE the byte/rate accounting so a duplicate consumes
-    // neither budget nor a rate slot and is not rebroadcast. A lookup failure falls
-    // through to the normal path (appendOp still dedups authoritatively).
+    // D3 / idempotent-resend: a KNOWN-DUPLICATE resend (its original ack was lost)
+    // must re-ack its stored seq and MUST NOT be refused — never `room-full` /
+    // `rate-limited`, and never `stale-epoch` / `forbidden-role` / `doc-deleted`
+    // either. A pure re-ack of an already-durable frame is NOT a new mutation, so
+    // it runs BEFORE `guardMutation` (the epoch/role/status/size gate) and BEFORE
+    // the byte/rate accounting: a duplicate must acknowledge the durable original
+    // even from a connection that was since downgraded or whose epoch advanced,
+    // otherwise a resend after a lost ack leaves the client showing unsynced state
+    // for a write that actually committed. The lookup is a CURRENT read of the
+    // dedup ledger; it consumes neither budget nor a rate slot, does not persist,
+    // and is not rebroadcast — it only echoes the already-committed seq. A lookup
+    // failure falls through to the normal path (appendOp still dedups
+    // authoritatively). A genuinely NEW frame (`known === null`) still hits
+    // `guardMutation` below, so a downgraded/stale-epoch connection is refused for
+    // any mutation that is not a known-durable duplicate.
     let known: number | null = null
     try {
       known = await this.store.frameSeq(conn.docId, frameId)
@@ -1031,6 +1043,14 @@ export class PptRelay {
       // every ack path so an omitted `k` never lands as `undefined` in the frame
       // (P2-h — parse also refuses a non-integer `k`).
       send(conn.socket, { ctl: 'ack', k: frame.k ?? 0, q: known, snapshotVersion })
+      return
+    }
+    // Not a known duplicate: enforce the mutation gate (size / doc-status / epoch /
+    // role). Only genuinely new mutations reach here, so a downgraded or
+    // stale-epoch connection is refused for any write it has not already committed.
+    const guardCode = await this.guardMutation(conn, typeof frame.epoch === 'number' ? frame.epoch : -1, rawBytes, this.limits.maxFrameBytes)
+    if (guardCode) {
+      this.refuse(conn, guardCode, { k, frameId })
       return
     }
     // Room-full: a room whose durable frame bytes would exceed the cap refuses

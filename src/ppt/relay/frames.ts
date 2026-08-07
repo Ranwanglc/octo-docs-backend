@@ -23,9 +23,14 @@ export const CLIENT_FRAME_TYPES = ['hello', 'ops', 'need', 'p', 'bye', 'snap'] a
 export type ClientFrameType = (typeof CLIENT_FRAME_TYPES)[number]
 
 /**
- * Refused-frame codes (§7.3). Retry classification is fixed: ONLY `rate-limited`
- * is transient/retryable; every other code is a permanent refusal the client
- * must surface as unsynced (never silently drop). See {@link isRetryable}.
+ * Refused-frame codes (§7.3). Retry classification: the transient/retryable set is
+ * `rate-limited` + `storage-retry` (a transient storage failure — lock-wait
+ * timeout / deadlock that outlived the store's retries, or an unconfirmed
+ * room-budget seed read; added in XIN-1693 P1-5). Every OTHER code is a permanent
+ * refusal the client must surface as unsynced (never silently drop). Both
+ * retryable codes carry a bounded `retryInMs` backoff hint: `rate-limited` supplies
+ * the window-derived delay, `storage-retry` a small fixed backoff
+ * ({@link STORAGE_RETRY_BACKOFF_MS}). See {@link isRetryable}.
  */
 export const REFUSED_CODES = [
   'too-large',
@@ -55,6 +60,15 @@ export type RefusedCode = (typeof REFUSED_CODES)[number]
 export function isRetryable(code: RefusedCode): boolean {
   return code === 'rate-limited' || code === 'storage-retry'
 }
+
+/**
+ * Bounded backoff hint (ms) attached to every `storage-retry` refusal. A transient
+ * storage failure clears on the order of a lock-wait / deadlock retry, so the
+ * client is handed a small concrete delay rather than an unbounded busy-retry —
+ * mirroring how `rate-limited` always carries a `retryInMs`. The client may apply
+ * its own jitter/backoff on top; this is the floor the relay guarantees.
+ */
+export const STORAGE_RETRY_BACKOFF_MS = 250
 
 /** `frame_id` is persisted into a VARCHAR(64) column (dedup key). */
 export const MAX_FRAME_ID_LEN = 64

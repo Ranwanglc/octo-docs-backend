@@ -6,8 +6,8 @@ import { createServer, type Server as HttpServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { WebSocket } from 'ws'
 import { PptRelay, type RelayLimits } from '../src/ppt/relay/pptRelay.js'
-import { InMemoryPptRelayStore, type PptRelayStore } from '../src/ppt/relay/store.js'
-import { isRetryable } from '../src/ppt/relay/frames.js'
+import { InMemoryPptRelayStore, type PptRelayStore, RetryableStorageError } from '../src/ppt/relay/store.js'
+import { isRetryable, STORAGE_RETRY_BACKOFF_MS } from '../src/ppt/relay/frames.js'
 import { issuePptCollabToken } from '../src/auth/pptCollabToken.js'
 import type { ResolvedRole, Role } from '../src/permission/role.js'
 import type { BentoDoc } from '../src/ppt/bentoDoc.js'
@@ -332,7 +332,7 @@ describe('PPT relay: protocol version (PPT-WS-004)', () => {
 })
 
 describe('PPT relay: refused retry classification (PPT-WS-006)', () => {
-  it('classifies every refused code; only rate-limited is retryable with retryInMs', async () => {
+  it('classifies every refused code; rate-limited is retryable with retryInMs', async () => {
     const h = await setup({ limits: { maxOpsPerFrame: 2, maxFramesPerWindow: 3, maxRoomFrameBytes: 100_000_000 } })
     const w = await h.connect({ uid: 'u_w', role: 'writer' })
     const rdr = await h.connect({ uid: 'u_r', role: 'reader' })
@@ -361,7 +361,9 @@ describe('PPT relay: refused retry classification (PPT-WS-006)', () => {
     w.send({ t: 'snap', pv: 2, k: 4, epoch: 0, q: 99, doc: deck() })
     expect(await w.recv()).toMatchObject({ code: 'snapshot-conflict', retryable: false })
 
-    // rate-limited (4th persisted frame within the window of 3) — the ONLY retryable code
+    // rate-limited (4th persisted frame within the window of 3) — retryable with a
+    // window-derived retryInMs (storage-retry is the other retryable code, covered
+    // by its own P1-5 test below)
     w.send(OPS_FRAME(10, 'ok1'))
     await w.recv()
     w.send(OPS_FRAME(11, 'ok2'))
@@ -1262,5 +1264,106 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
     expect(replay.filter((m) => m.ctl === 'op').map((m) => m.q)).toEqual([1])
     // No duplicate op arrives after `ready`.
     await expect(joiner.recv(150)).rejects.toThrow()
+  })
+})
+
+/**
+ * XIN-1695 RC round-7 blockers: the known-duplicate re-ack now precedes the
+ * mutation gate (Jerry-Xin blocker 1 — idempotent-resend must acknowledge an
+ * already-durable frame even from a downgraded/stale-epoch connection), and the
+ * retry contract is stated consistently as `rate-limited` + `storage-retry`, with
+ * `storage-retry` carrying a bounded `retryInMs` backoff hint (blocker 2).
+ */
+describe('PPT relay: round-7 fixes (XIN-1695)', () => {
+  it('Blocker 1: a downgraded connection resending a KNOWN frameId re-acks its stored seq without rebroadcast', async () => {
+    const h = await setup()
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    const b = await h.connect({ uid: 'u_b', role: 'writer' })
+    await helloReady(a)
+    await helloReady(b)
+
+    // A (writer) commits a frame durably at epoch 0; B sees the broadcast.
+    a.send(OPS_FRAME(1, 'known-frame', 0))
+    expect((await a.recv()).q).toBe(1)
+    expect(await b.recvUntil((m) => m.ctl === 'op' && m.q === 1)).toBeDefined()
+
+    // Admin downgrades A to reader; the epoch advances to 1.
+    h.setRole('u_a', 'reader')
+    h.setEpoch(1)
+    await h.relay.applyEpochBump(DOCNAME)
+    const rc = await a.recvUntil((m) => m.ctl === 'role-changed')
+    expect(rc[rc.length - 1]).toMatchObject({ role: 'reader', epoch: 1 })
+
+    // A's original ack was "lost", so A resends the SAME frame (still stamped with
+    // the pre-downgrade epoch 0). Before the fix guardMutation refused it
+    // stale-epoch/forbidden-role and the durable write was never acknowledged.
+    // Now the known-duplicate re-ack precedes the gate: the stored seq is re-acked.
+    a.send(OPS_FRAME(1, 'known-frame', 0))
+    const reack = await a.recv()
+    expect(reack.ctl).toBe('ack')
+    expect(reack.q).toBe(1)
+    // No new seq minted and no rebroadcast to the peer.
+    expect(await h.store.currentSeq(DOC)).toBe(1)
+    await expect(b.recv(200)).rejects.toThrow()
+  })
+
+  it('Blocker 1: a downgraded connection sending a NEW frameId is still refused (forbidden-role / stale-epoch)', async () => {
+    const h = await setup()
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    const b = await h.connect({ uid: 'u_b', role: 'writer' })
+    await helloReady(a)
+    await helloReady(b)
+
+    a.send(OPS_FRAME(1, 'durable', 0))
+    expect((await a.recv()).q).toBe(1)
+    await b.recvUntil((m) => m.ctl === 'op' && m.q === 1)
+
+    h.setRole('u_a', 'reader')
+    h.setEpoch(1)
+    await h.relay.applyEpochBump(DOCNAME)
+    await a.recvUntil((m) => m.ctl === 'role-changed')
+
+    // A NEW frame stamped with the CURRENT epoch is refused forbidden-role (the
+    // downgraded role, not a known duplicate — the guard still binds).
+    a.send(OPS_FRAME(2, 'new-current', 1))
+    expect(await a.recv()).toMatchObject({ code: 'forbidden-role', retryable: false })
+    // A NEW frame stamped with the OLD epoch is refused stale-epoch.
+    a.send(OPS_FRAME(3, 'new-stale', 0))
+    expect(await a.recv()).toMatchObject({ code: 'stale-epoch', retryable: false })
+
+    // Nothing new persisted; the peer never saw a broadcast for either refusal.
+    expect(await h.store.currentSeq(DOC)).toBe(1)
+    await expect(b.recv(200)).rejects.toThrow()
+  })
+
+  it('Blocker 2: storage-retry is retryable and carries a bounded retryInMs backoff hint', async () => {
+    // A store whose appendOp throws a transient (retryable) storage error: the
+    // relay maps it to `storage-retry` and now attaches STORAGE_RETRY_BACKOFF_MS.
+    class TransientAppendStore extends InMemoryPptRelayStore {
+      override async appendOp(docId: string, frameId: string, frame: unknown): ReturnType<InMemoryPptRelayStore['appendOp']> {
+        void docId
+        void frameId
+        void frame
+        throw new RetryableStorageError('lock wait timeout')
+      }
+    }
+    const h = await setup({ store: new TransientAppendStore() })
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+
+    w.send(OPS_FRAME(1, 'transient'))
+    const refused = await w.recv()
+    expect(refused).toMatchObject({ ctl: 'refused', code: 'storage-retry', retryable: true })
+    expect(refused.retryInMs).toBe(STORAGE_RETRY_BACKOFF_MS)
+  })
+
+  it('Blocker 2: the retryable set is exactly rate-limited + storage-retry', () => {
+    expect(isRetryable('rate-limited')).toBe(true)
+    expect(isRetryable('storage-retry')).toBe(true)
+    // Every other refusal code is permanent.
+    for (const code of ['too-large', 'storage-failed', 'room-full', 'forbidden-role', 'stale-epoch', 'protocol-version', 'snapshot-conflict', 'doc-deleted'] as const) {
+      expect(isRetryable(code)).toBe(false)
+    }
+    expect(STORAGE_RETRY_BACKOFF_MS).toBeGreaterThan(0)
   })
 })

@@ -108,9 +108,12 @@ export interface PptRelayStore {
   appendOp(docId: string, frameId: string, frame: unknown): Promise<AppendOpResult>
   /**
    * Seq already recorded for `(docId, frameId)`, or null if unseen. A CURRENT
-   * read of the dedup ledger used by the relay BEFORE its room-full/rate gates so
-   * a known-duplicate resend (whose original ack was lost) re-acks its stored seq
-   * instead of being permanently refused `room-full`/`rate-limited` (XIN-1660 D3).
+   * read of the dedup ledger used by the relay BEFORE its mutation gate
+   * (epoch/role/status) and its room-full/rate gates so a known-duplicate resend
+   * (whose original ack was lost) re-acks its stored seq — even from a connection
+   * since downgraded or whose epoch advanced — instead of being refused
+   * `forbidden-role`/`stale-epoch`/`room-full`/`rate-limited` (XIN-1660 D3,
+   * idempotent-resend contract).
    */
   frameSeq(docId: string, frameId: string): Promise<number | null>
   /** Ops with `seq > sinceSeq`, ascending. Bounded to `limit` rows when given. */
