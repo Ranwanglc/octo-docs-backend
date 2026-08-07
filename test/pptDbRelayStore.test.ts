@@ -137,12 +137,13 @@ function makeDb() {
       return []
     }
     if (sql.includes('SELECT seq, frame_id, frame_json FROM ppt_collab_op')) {
-      const [docId, since] = p as [string, number]
+      const [docId, since, limit] = p as [string, number, number | undefined]
       const room = ops.get(docId)
       if (!room) return []
       return [...room.values()]
         .filter((r) => r.seq > since)
         .sort((a, b) => a.seq - b.seq)
+        .slice(0, limit ?? Number.POSITIVE_INFINITY)
         .map((r) => ({ seq: r.seq, frame_id: r.frameId, frame_json: r.frameJson }))
     }
     if (sql.includes('SELECT COALESCE(MAX(seq), 0) AS max_seq FROM ppt_collab_op')) {
@@ -231,6 +232,15 @@ function makeDb() {
 
 let db: ReturnType<typeof makeDb>
 vi.mock('../src/db/pool.js', () => ({
+  getPool: () => ({
+    getConnection: async () => ({
+      beginTransaction: async () => {},
+      execute: async (sql: string, params: unknown[] = []) => [await db.query(sql, params ?? [])],
+      commit: async () => {},
+      rollback: async () => {},
+      release: () => {},
+    }),
+  }),
   query: (sql: string, params?: unknown[]) => db.query(sql, params ?? []),
   transaction: (fn: (tx: unknown) => Promise<unknown>) => db.transaction(fn),
 }))
@@ -459,19 +469,26 @@ describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-169
     await expect(store.appendOp(D, 'f1', { v: 1 })).rejects.toMatchObject({ retryable: true })
   })
 
-  it('P1-4: readReplay returns {highWater, snapshot, ops} from ONE transaction (atomic replay view)', async () => {
+  it('P1-4/P1-B: openReplay streams pages from ONE transaction without materializing the tail', async () => {
     const store = new DbPptRelayStore()
     await store.appendOp(D, 'f1', { n: 1 })
     await store.appendOp(D, 'f2', { n: 2 })
+    await store.appendOp(D, 'f3', { n: 3 })
     await store.saveSnapshot({ docId: D, coveredSeq: 1, doc: deck() })
     await store.pruneOpsThrough(D, 1)
     db.transaction.mockClear()
+    const cursor = await store.openReplay(D, 0, { pageRows: 1, pageBytes: 1_000_000 })
+    expect(cursor.highWater).toBe(3) // durable counter, not MAX(seq) over the pruned table
+    expect(cursor.snapshot?.coveredSeq).toBe(1)
+    expect((await cursor.nextPage()).map((o) => o.seq)).toEqual([2])
+    expect((await cursor.nextPage()).map((o) => o.seq)).toEqual([3])
+    expect(await cursor.nextPage()).toEqual([])
+    await cursor.close()
+    // openReplay holds its own repeatable-read transaction/cursor; legacy
+    // readReplay remains for old tests but the relay no longer uses it.
+    expect(db.transaction).toHaveBeenCalledTimes(0)
+
     const view = await store.readReplay(D, 0, 1000)
-    expect(view.highWater).toBe(2) // durable counter, not MAX(seq) over the pruned table
-    expect(view.snapshot?.coveredSeq).toBe(1)
-    expect(view.ops.map((o) => o.seq)).toEqual([2]) // op 1 pruned; only the tail remains
-    // The whole view is read in a SINGLE transaction, so a concurrent snap+prune
-    // cannot slip between the snapshot read and the op reads (P1-4).
-    expect(db.transaction).toHaveBeenCalledTimes(1)
+    expect(view.ops.map((o) => o.seq)).toEqual([2, 3])
   })
 })

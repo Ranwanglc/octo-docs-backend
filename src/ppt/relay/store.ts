@@ -25,6 +25,8 @@ export interface PersistedOp {
   frameId: string
   /** The original `ops` frame, stored verbatim (plaintext JSON, §7.3). */
   frame: unknown
+  /** Persisted JSON byte size, used to bound replay pages by bytes. */
+  frameBytes?: number
 }
 
 export interface AppendOpResult {
@@ -67,13 +69,28 @@ export interface SaveSnapshotResult {
  * `snap`+prune between separate autocommit reads could leave a reader with
  * neither the snapshot nor the pruned ops (XIN-1693 P1-4).
  */
-export interface ReplayView {
+export interface ReplayCursor {
   /** Authoritative room high-water (`ppt_collab_seq.last_seq`), 0 when none. */
   highWater: number
   /** Latest durable snapshot, or null when none exists yet. */
   snapshot: RelaySnapshot | null
-  /** Un-pruned ops with `seq > sinceSeq`, ascending. */
+  /** First op cursor requested by the caller. */
+  fromSeq: number
+  /** Next bounded page of un-pruned ops, ascending. Empty means EOF. */
+  nextPage(): Promise<PersistedOp[]>
+  /** Release any transaction / connection held by the cursor. Idempotent. */
+  close(): Promise<void>
+}
+
+export interface ReplayView {
+  highWater: number
+  snapshot: RelaySnapshot | null
   ops: PersistedOp[]
+}
+
+export interface ReplayLimits {
+  pageRows: number
+  pageBytes: number
 }
 
 /**
@@ -88,6 +105,38 @@ export class RetryableStorageError extends Error {
     super(message, options)
     this.name = 'RetryableStorageError'
   }
+}
+
+function isTransientLockError(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false
+  const e = err as { code?: string; errno?: number }
+  return (
+    e.code === 'ER_LOCK_WAIT_TIMEOUT' ||
+    e.code === 'ER_LOCK_DEADLOCK' ||
+    e.errno === 1205 ||
+    e.errno === 1213
+  )
+}
+
+const STORE_RETRY_ATTEMPTS = 3
+const STORE_RETRY_BACKOFF_MS = 25
+
+/**
+ * Retry a whole store operation on transient MySQL lock failures. Exhaustion
+ * remains retryable to the relay/client; non-transient errors pass through.
+ */
+export async function withStoreRetry<T>(operation: string, fn: () => Promise<T>): Promise<T> {
+  let lastErr: unknown
+  for (let attempt = 1; attempt <= STORE_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await fn()
+    } catch (err) {
+      if (!isTransientLockError(err)) throw err
+      lastErr = err
+      if (attempt < STORE_RETRY_ATTEMPTS) await new Promise((r) => setTimeout(r, STORE_RETRY_BACKOFF_MS * attempt))
+    }
+  }
+  throw new RetryableStorageError(`${operation} lock contention exceeded retries`, { cause: lastErr })
 }
 
 /** True when `err` is a transient storage failure the relay should retry. */
@@ -132,14 +181,11 @@ export interface PptRelayStore {
   /** Delete persisted ops with `seq <= coveredSeq`; returns the bytes reclaimed. */
   pruneOpsThrough(docId: string, coveredSeq: number): Promise<number>
   /**
-   * OPTIONAL atomic replay view: read the high-water, snapshot, and op tail from a
-   * single consistent point-in-time (§7.3 / XIN-1693 P1-4). A store that provides
-   * it lets the relay avoid the separate-autocommit-reads seam where a concurrent
-   * `snap`+prune could leave a reader with neither the snapshot nor the pruned
-   * ops. When absent, the relay composes `currentSeq`/`getSnapshot`/`opsSince`.
-   * `pageSize` bounds each internal fetch batch (memory).
+   * OPTIONAL streaming replay cursor: reads high-water + snapshot and each op
+   * page from one consistent point-in-time (§7.3 / XIN-1693 P1-4). `limits`
+   * bounds each page by row count and by approximate persisted JSON bytes.
    */
-  readReplay?(docId: string, sinceSeq: number, pageSize: number): Promise<ReplayView>
+  openReplay?(docId: string, sinceSeq: number, limits: ReplayLimits): Promise<ReplayCursor>
 }
 
 interface RoomState {
@@ -194,7 +240,7 @@ export class InMemoryPptRelayStore implements PptRelayStore {
     const r = this.room(docId)
     const tail = r.ops.filter((o) => o.seq > sinceSeq)
     const bounded = limit !== undefined && limit >= 0 ? tail.slice(0, limit) : tail
-    return bounded.map((o) => ({ seq: o.seq, frameId: o.frameId, frame: o.frame }))
+    return bounded.map((o) => ({ seq: o.seq, frameId: o.frameId, frame: o.frame, frameBytes: o.bytes }))
   }
 
   async currentSeq(docId: string): Promise<number> {
@@ -248,6 +294,34 @@ export class InMemoryPptRelayStore implements PptRelayStore {
    * `currentSeq`/`getSnapshot`/`opsSince` (the test doubles) still sees its
    * override honored here.
    */
+  async openReplay(docId: string, sinceSeq: number, limits: ReplayLimits): Promise<ReplayCursor> {
+    const view = await this.readReplay(docId, sinceSeq)
+    let cursor = sinceSeq
+    let closed = false
+    return {
+      highWater: view.highWater,
+      snapshot: view.snapshot,
+      fromSeq: sinceSeq,
+      nextPage: async () => {
+        if (closed) return []
+        const rows = view.ops.filter((o) => o.seq > cursor).slice(0, limits.pageRows)
+        const page: PersistedOp[] = []
+        let bytes = 0
+        for (const row of rows) {
+          const frameBytes = row.frameBytes ?? Buffer.byteLength(JSON.stringify(row.frame), 'utf8')
+          if (page.length > 0 && bytes + frameBytes > limits.pageBytes) break
+          page.push(row)
+          bytes += frameBytes
+        }
+        if (page.length > 0) cursor = page[page.length - 1]!.seq
+        return page
+      },
+      close: async () => {
+        closed = true
+      },
+    }
+  }
+
   async readReplay(docId: string, sinceSeq: number): Promise<ReplayView> {
     const highWater = await this.currentSeq(docId)
     const snapshot = await this.getSnapshot(docId)

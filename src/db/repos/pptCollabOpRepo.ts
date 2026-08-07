@@ -25,12 +25,14 @@ export interface PptCollabOpRow {
   seq: number
   frameId: string
   frame: unknown
+  frameBytes?: number
 }
 
 interface RawRow {
   seq: number
   frame_id: string
   frame_json: string
+  frame_bytes?: number
 }
 
 function toOp(row: RawRow): PptCollabOpRow {
@@ -39,6 +41,7 @@ function toOp(row: RawRow): PptCollabOpRow {
     seq: Number(row.seq),
     frameId: row.frame_id,
     frame: typeof raw === 'string' ? (JSON.parse(raw) as unknown) : (raw as unknown),
+    ...(row.frame_bytes !== undefined ? { frameBytes: Number(row.frame_bytes) } : {}),
   }
 }
 

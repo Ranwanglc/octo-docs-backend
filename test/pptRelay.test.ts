@@ -1265,6 +1265,21 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
     // No duplicate op arrives after `ready`.
     await expect(joiner.recv(150)).rejects.toThrow()
   })
+
+  it('P1-C: live-buffer overflow closes 4410 instead of silently dropping frames', async () => {
+    const h = await setup({ limits: { maxLiveBufferFrames: 1, maxLiveBufferBytes: 1_000_000 } })
+    const joiner = await h.connect({ uid: 'u_j', role: 'writer' })
+    const writer = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(writer)
+
+    writer.send(OPS_FRAME(1, 'overflow-1'))
+    expect((await writer.recv()).q).toBe(1)
+    writer.send(OPS_FRAME(2, 'overflow-2'))
+    expect((await writer.recv()).q).toBe(2)
+
+    expect((await joiner.closed).code).toBe(4410)
+    expect(h.relay.roomSize(DOC)).toBe(1)
+  })
 })
 
 /**

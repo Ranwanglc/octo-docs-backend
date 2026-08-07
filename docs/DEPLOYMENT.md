@@ -13,17 +13,14 @@ The service is a single process that exposes **two** listeners:
 | Hocuspocus collaborative WS | `1234` (`HOCUSPOCUS_PORT`) | real-time Yjs sync |
 | REST metadata API | `3000` (`HTTP_PORT`) | docs CRUD, collab-token, invites, attachments |
 
-> The two listeners are colocated in one process (`src/index.ts`). The REST API's
-> request/response endpoints are stateless and horizontally scalable, but the PPT
-> collaboration relay attached to that server (on the `/api/v1/ppt/collab` WS
-> upgrade path) keeps a **process-local** room registry (live sockets, per-room
-> sequence and byte-budget state). A horizontally-scaled deployment must therefore
-> route a given deck's relay upgrades to a **consistent node (docId affinity)** —
-> the same class of constraint the Hocuspocus nodes have (stateful,
-> documentName-affinity routed). The stateless REST endpoints can still be split
-> off later; the relay cannot be freely load-balanced across nodes without such
-> affinity (or a shared/broadcast transport). This guide assumes the colocated
-> process the image ships today.
+> **PPT relay topology for this round is single-replica.** The two listeners are
+> colocated in one process (`src/index.ts`), and the Bento PPT collaboration relay
+> attached to the REST server on `/api/v1/ppt/collab` keeps a process-local room
+> registry (live sockets, replay state, per-room sequence and byte-budget state).
+> Do not run multiple REST/PPT-relay replicas for the same environment in this
+> round. Horizontal REST scaling can be revisited only after the relay has an
+> explicit shared transport or affinity design; until then, deploy exactly one
+> backend replica for PPT collaboration.
 
 ---
 
@@ -119,7 +116,7 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `CORS_ALLOWED_ORIGINS` | **yes when the FE is a different origin** | Comma-separated allowlist of front-end origins permitted to call the REST API and (with the local-hmac driver pointed at this backend origin) the presigned attachment PUT/GET. The browser preflights cross-origin requests with `OPTIONS` and blocks any response whose `Access-Control-Allow-Origin` does not match, so the FE origin **must** be listed or image upload/download fails (XIN-717). Exact origins (`http://192.168.214.189:3010`) or the single value `*` (reflect any origin). Empty (default) allows no cross-origin request. |
 | `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` | no (`60000` / `300`) | Per-IP throttle window and cap on the REST route chains (human `/api/v1/docs` + bot `/v1/bot/docs`); `/healthz` is never throttled. Keyed on the real client IP, so `TRUST_PROXY` must be correct for the deployment. |
 | `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` | recommended | authoritative store connection |
-| `MYSQL_CONNECTION_LIMIT` | no (`10`) | pool size |
+| `MYSQL_CONNECTION_LIMIT` | no (`10`) | pool size. PPT replay cursors reserve up to `PPT_RELAY_MAX_IN_FLIGHT_REPLAYS` connections while they stream pages; keep this high enough for ordinary REST traffic plus replay headroom. |
 | `REDIS_HOST` / `REDIS_PORT` | recommended | broadcast bus / cache / registry |
 | `REDIS_PREFIX` | no (`octo-docs`) | multi-product key isolation prefix |
 | `COLLAB_TOKEN_SECRET` | **yes in prod** | signing secret for the short-lived collab JWT. Use an asymmetric key / KMS-managed secret; the HS256 default `dev-only-change-me` is dev only. |
@@ -133,8 +130,13 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `PPT_RELAY_MAX_SINGLE_BLOB_BYTES` | no (`8388608`) | per-snapshot blob cap; larger than the op-frame cap so a legitimate snapshot is not pre-empted by it (`too-large`, permanent). Also the WS `maxPayload`. |
 | `PPT_RELAY_MAX_ROOM_FRAME_BYTES` | no (`100663296`) | per-room durable frame-byte budget (`room-full`, permanent). Seeded from durable state on first join, so a restart does not reset it. |
 | `PPT_RELAY_MAX_EPHEMERAL_FRAME_BYTES` | no (`65536`) | byte cap for the ephemeral frames (`hello`/`need`/`p`/`bye`), which carry only a small resume cursor or presence payload — far tighter than the op/blob caps (`too-large`, permanent). |
-| `PPT_RELAY_REPLAY_PAGE_SIZE` | no (`1000`) | max op rows read per replay fetch batch, so a large op backlog streams in bounded chunks (also the batch size of the single-transaction replay view) rather than being read unbounded into memory. |
+| `PPT_RELAY_MAX_LIVE_BUFFER_FRAMES` / `PPT_RELAY_MAX_LIVE_BUFFER_BYTES` | no (`4096` / `8388608`) | live frames buffered while a connection is replaying. Overflow closes the socket with `4410 resync required`; no overflowing frame is sent and no silent drop occurs. |
+| `PPT_RELAY_MAX_IN_FLIGHT_REPLAYS` | no (`max(1,min(2,floor(MYSQL_CONNECTION_LIMIT/4)))`) | process-wide replay cursor semaphore. Must be strictly lower than `MYSQL_CONNECTION_LIMIT`, so replay transactions cannot consume the full MySQL pool. |
+| `PPT_RELAY_REPLAY_PAGE_SIZE` / `PPT_RELAY_REPLAY_PAGE_BYTES` | no (`1000` / `4194304`) | max op rows and persisted JSON bytes read per replay page. The relay sends one page and waits for outbound progress before fetching the next page. |
 | `PPT_RELAY_SEND_HIGH_WATER_BYTES` | no (`4194304`) | socket `bufferedAmount` (bytes) above which replay pauses before sending its next frame, so one slow/greedy consumer cannot make the relay accumulate an unbounded send backlog. |
+| `PPT_RELAY_SEND_DRAIN_TIMEOUT_MS` | no (`5000`) | max wait for a congested socket to drain before the relay closes it instead of enqueueing more frames. |
+| `PPT_RELAY_AUTH_REFRESH_MS` | no (`5000`) | jittered per-connection read-auth refresh interval for live relay sockets. |
+| `PPT_RELAY_DOC_STATUS_CACHE_TTL_MS` | no (`2000`) | short doc-status cache TTL used to bound repeated status provider calls; local status-changing REST paths must invalidate by publishing the existing epoch/status bump. |
 | `OCTO_IDENTITY_MODE` | no (`http`) | `http` (cross-service introspection) or `middleware` |
 | `OCTO_SERVER_BASE_URL` | when `http` | octo-server base for token→uid lookups |
 | `OCTO_SERVER_TOKEN` | no (default empty) — **set it if you want approver names on access cards** | Backend service token for octo-server, used by the server-side calls the backend makes on its own behalf (no user session available): (a) the add-member uid existence check (anti ghost-member) in `members.ts`, and (b) resolving the **approver's display name** for the access-decision result card (`decisionDisplay.ts`). For (a), leaving it empty is fine — that check falls back to the caller's own session token. For (b) there is no caller token (the card-action callback is a signed webhook), so with this unset `GET /v1/users/:uid` answers 401, the name is omitted, and the card renders octo-server's generic reviewer label instead of the real approver's name (the lookup miss is logged). Collaborator name/avatar display elsewhere is unaffected (the frontend fetches those directly with the logged-in user's token). |

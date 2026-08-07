@@ -27,17 +27,19 @@
  *    concurrent append there into `ER_LOCK_WAIT_TIMEOUT` (XIN-1660 D2). It returns
  *    the bytes reclaimed so the relay's room-budget counter stays in step.
  */
-import { transaction } from '../../db/pool.js'
+import { getPool, transaction, type Tx } from '../../db/pool.js'
 import { pptCollabFrameRepo } from '../../db/repos/pptCollabFrameRepo.js'
 import { pptCollabOpRepo } from '../../db/repos/pptCollabOpRepo.js'
 import { pptLiveSnapshotRepo } from '../../db/repos/pptLiveSnapshotRepo.js'
 import { pptRelaySeqRepo } from '../../db/repos/pptRelaySeqRepo.js'
 import {
-  RetryableStorageError,
+  withStoreRetry,
   type AppendOpResult,
   type PersistedOp,
   type PptRelayStore,
   type RelaySnapshot,
+  type ReplayCursor,
+  type ReplayLimits,
   type ReplayView,
   type SaveSnapshotInput,
   type SaveSnapshotResult,
@@ -52,47 +54,11 @@ function isDuplicateKeyError(err: unknown): boolean {
   )
 }
 
-/**
- * A TRANSIENT MySQL lock failure — lock-wait timeout (`ER_LOCK_WAIT_TIMEOUT`,
- * errno 1205) or deadlock victim (`ER_LOCK_DEADLOCK`, errno 1213). Both roll the
- * whole transaction back and are safe to retry; before this fix `isRetryable`
- * only treated `rate-limited` as transient, so these surfaced to the client as a
- * PERMANENT `storage-failed` — a committed edit "randomly lost" under contention
- * (XIN-1693 P1-5).
- */
-function isTransientLockError(err: unknown): boolean {
-  if (typeof err !== 'object' || err === null) return false
-  const e = err as { code?: string; errno?: number }
-  return (
-    e.code === 'ER_LOCK_WAIT_TIMEOUT' ||
-    e.code === 'ER_LOCK_DEADLOCK' ||
-    e.errno === 1205 ||
-    e.errno === 1213
-  )
-}
-
-/** Max attempts for a lock-retryable append transaction before giving up. */
-const APPEND_MAX_ATTEMPTS = 3
-
 export class DbPptRelayStore implements PptRelayStore {
   async appendOp(docId: string, frameId: string, frame: unknown): Promise<AppendOpResult> {
     const frameJson = JSON.stringify(frame)
     const frameBytes = Buffer.byteLength(frameJson, 'utf8')
-    // Retry the WHOLE transaction on a transient lock failure (1205/1213): both
-    // roll everything back, so a fresh attempt re-reads the ledger and either
-    // re-acks a now-committed resend or allocates cleanly. After the attempts are
-    // exhausted the failure is surfaced as a RETRYABLE storage error, never a
-    // permanent `storage-failed` (XIN-1693 P1-5).
-    let lastErr: unknown
-    for (let attempt = 1; attempt <= APPEND_MAX_ATTEMPTS; attempt++) {
-      try {
-        return await this.appendOpOnce(docId, frameId, frameJson, frameBytes)
-      } catch (err) {
-        if (!isTransientLockError(err)) throw err
-        lastErr = err
-      }
-    }
-    throw new RetryableStorageError('append lock contention exceeded retries', { cause: lastErr })
+    return withStoreRetry('append', () => this.appendOpOnce(docId, frameId, frameJson, frameBytes))
   }
 
   private appendOpOnce(
@@ -156,7 +122,7 @@ export class DbPptRelayStore implements PptRelayStore {
 
   async opsSince(docId: string, sinceSeq: number, limit?: number): Promise<PersistedOp[]> {
     const ops = await pptCollabOpRepo.since(docId, sinceSeq, limit)
-    return ops.map((o) => ({ seq: o.seq, frameId: o.frameId, frame: o.frame }))
+    return ops.map((o) => ({ seq: o.seq, frameId: o.frameId, frame: o.frame, frameBytes: o.frameBytes }))
   }
 
   async currentSeq(docId: string): Promise<number> {
@@ -176,7 +142,7 @@ export class DbPptRelayStore implements PptRelayStore {
   }
 
   async saveSnapshot(input: SaveSnapshotInput): Promise<SaveSnapshotResult> {
-    return transaction(async (tx) => {
+    return withStoreRetry('saveSnapshot', () => transaction(async (tx) => {
       const { snapshotVersion, coveredSeq } = await pptLiveSnapshotRepo.upsertAdvanceTx(
         tx,
         input.docId,
@@ -186,19 +152,79 @@ export class DbPptRelayStore implements PptRelayStore {
       // Surface the authoritative POST-WRITE coveredSeq (GREATEST(existing,
       // incoming)) so the relay prunes with it, never the client's raw `q` (P0-1).
       return { snapshotVersion, coveredSeq }
-    })
+    }))
   }
 
   /**
-   * Atomic replay view (P1-4): read the high-water, snapshot, and op tail in ONE
+   * Streaming replay cursor (P1-B/P1-4): read the high-water, snapshot, and op
+   * pages in ONE
    * transaction so a concurrent `snap`+prune cannot slip between them and leave a
    * reader with neither the snapshot nor the ops it pruned. Under the default
    * REPEATABLE READ isolation every SELECT in the transaction sees the same
    * point-in-time, so the paged op reads stay consistent with the snapshot read.
-   * The whole view is read into memory and the transaction closes BEFORE the relay
-   * streams it to the (possibly slow) client, so no pooled connection is held
-   * across client I/O; `pageSize` bounds each fetch round-trip.
+   * The relay consumes one page, sends it, drops it, then asks for the next page.
+   * A process-level replay semaphore keeps these read transactions below the pool
+   * reservation while slow clients apply backpressure.
    */
+  async openReplay(docId: string, sinceSeq: number, limits: ReplayLimits): Promise<ReplayCursor> {
+    return withStoreRetry('openReplay', async () => {
+      const conn = await getPool().getConnection()
+      let closed = false
+      const tx: Tx = {
+        async query<T>(sql: string, params: unknown[] = []): Promise<T[]> {
+          const [rows] = await conn.execute(sql, params as never[])
+          return rows as T[]
+        },
+      }
+      try {
+        await conn.beginTransaction()
+        const highWater = await pptRelaySeqRepo.currentSeqTx(tx, docId)
+        const snap = await pptLiveSnapshotRepo.getTx(tx, docId)
+        const snapshot: RelaySnapshot | null = snap
+          ? { snapshotVersion: snap.snapshotVersion, coveredSeq: snap.coveredSeq, doc: snap.doc }
+          : null
+        let cursor = sinceSeq
+        const close = async (): Promise<void> => {
+          if (closed) return
+          closed = true
+          try {
+            await conn.commit()
+          } finally {
+            conn.release()
+          }
+        }
+        return {
+          highWater,
+          snapshot,
+          fromSeq: sinceSeq,
+          nextPage: async () => {
+            if (closed) return []
+            const rows = await pptCollabOpRepo.sinceTx(tx, docId, cursor, limits.pageRows)
+            const page: PersistedOp[] = []
+            let bytes = 0
+            for (const row of rows) {
+              const frameBytes = row.frameBytes ?? Buffer.byteLength(JSON.stringify(row.frame), 'utf8')
+              if (page.length > 0 && bytes + frameBytes > limits.pageBytes) break
+              page.push({ seq: row.seq, frameId: row.frameId, frame: row.frame, frameBytes })
+              bytes += frameBytes
+            }
+            if (page.length > 0) cursor = page[page.length - 1]!.seq
+            return page
+          },
+          close,
+        }
+      } catch (err) {
+        try {
+          await conn.rollback()
+        } catch {
+          /* ignore rollback failure */
+        }
+        conn.release()
+        throw err
+      }
+    })
+  }
+
   async readReplay(docId: string, sinceSeq: number, pageSize: number): Promise<ReplayView> {
     return transaction(async (tx) => {
       const highWater = await pptRelaySeqRepo.currentSeqTx(tx, docId)
@@ -207,12 +233,11 @@ export class DbPptRelayStore implements PptRelayStore {
         ? { snapshotVersion: snap.snapshotVersion, coveredSeq: snap.coveredSeq, doc: snap.doc }
         : null
       const ops: PersistedOp[] = []
-      const limit = pageSize > 0 ? pageSize : undefined
       let cursor = sinceSeq
       for (;;) {
-        const page = await pptCollabOpRepo.sinceTx(tx, docId, cursor, limit)
-        for (const row of page) ops.push({ seq: row.seq, frameId: row.frameId, frame: row.frame })
-        if (limit === undefined || page.length < limit) break
+        const page = await pptCollabOpRepo.sinceTx(tx, docId, cursor, pageSize)
+        for (const row of page) ops.push({ seq: row.seq, frameId: row.frameId, frame: row.frame, frameBytes: row.frameBytes })
+        if (page.length < pageSize) break
         cursor = page[page.length - 1]!.seq
       }
       return { highWater, snapshot, ops }
@@ -225,6 +250,6 @@ export class DbPptRelayStore implements PptRelayStore {
     // `DELETE`. Dropping the old `INSERT IGNORE … SELECT` also drops the shared
     // next-key locks it took over the gap above `coveredSeq`, which used to block a
     // concurrent append there into `ER_LOCK_WAIT_TIMEOUT` (XIN-1660 D2).
-    return transaction((tx) => pptCollabOpRepo.pruneThroughTx(tx, docId, coveredSeq))
+    return withStoreRetry('pruneOpsThrough', () => transaction((tx) => pptCollabOpRepo.pruneThroughTx(tx, docId, coveredSeq)))
   }
 }

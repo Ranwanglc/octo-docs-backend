@@ -27,6 +27,18 @@ function numMin(name: string, fallback: number, min: number): number {
   return Math.max(min, n)
 }
 
+function pptRelayReplaySlots(): number {
+  const mysqlLimit = numMin('MYSQL_CONNECTION_LIMIT', 10, 1)
+  const fallback = Math.max(1, Math.min(2, Math.floor(mysqlLimit / 4)))
+  const slots = numMin('PPT_RELAY_MAX_IN_FLIGHT_REPLAYS', fallback, 1)
+  if (slots >= mysqlLimit) {
+    throw new Error(
+      `PPT_RELAY_MAX_IN_FLIGHT_REPLAYS (${slots}) must be lower than MYSQL_CONNECTION_LIMIT (${mysqlLimit})`,
+    )
+  }
+  return slots
+}
+
 function bool(name: string, fallback: boolean): boolean {
   const v = process.env[name]
   if (v === undefined || v === '') return fallback
@@ -779,15 +791,21 @@ export const config = {
       // op/blob caps. Previously only `ops`/`snap` were byte-capped, leaving these
       // frames an unbounded ingress a client could flood (XIN-1660 hardening).
       maxEphemeralFrameBytes: numMin('PPT_RELAY_MAX_EPHEMERAL_FRAME_BYTES', 64 * 1024, 1),
-      // Page size for replay: `opsSince` reads at most this many op rows per batch
-      // so a huge backlog streams in bounded chunks rather than being read
-      // unbounded into memory on a single replay (XIN-1660 hardening).
+      maxLiveBufferFrames: numMin('PPT_RELAY_MAX_LIVE_BUFFER_FRAMES', 4096, 1),
+      maxLiveBufferBytes: numMin('PPT_RELAY_MAX_LIVE_BUFFER_BYTES', 8 * 1024 * 1024, 1),
+      // Page bounds for replay: each `openReplay` cursor reads at most this many
+      // op rows and bytes per page, sends that page, then fetches the next.
       replayPageSize: numMin('PPT_RELAY_REPLAY_PAGE_SIZE', 1000, 1),
+      replayPageBytes: numMin('PPT_RELAY_REPLAY_PAGE_BYTES', 4 * 1024 * 1024, 1),
+      maxInFlightReplays: pptRelayReplaySlots(),
       // Socket send-buffer high-water (bytes): replay pauses before sending its
       // next frame while `socket.bufferedAmount` is above this, so one slow/greedy
       // consumer cannot make the relay accumulate an unbounded send backlog
       // (XIN-1693 P1-3). Default 4 MiB — a few large ops/a snapshot in flight.
       sendHighWaterBytes: numMin('PPT_RELAY_SEND_HIGH_WATER_BYTES', 4 * 1024 * 1024, 1),
+      sendDrainTimeoutMs: numMin('PPT_RELAY_SEND_DRAIN_TIMEOUT_MS', 5000, 1),
+      authRefreshMs: numMin('PPT_RELAY_AUTH_REFRESH_MS', 5000, 1),
+      docStatusCacheTtlMs: numMin('PPT_RELAY_DOC_STATUS_CACHE_TTL_MS', 2000, 1),
     },
   },
 } as const

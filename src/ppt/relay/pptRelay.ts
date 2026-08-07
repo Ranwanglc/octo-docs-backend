@@ -39,7 +39,7 @@ import {
   type RefusedCode,
   type ServerFrame,
 } from './frames.js'
-import { isRetryableStorageError, RetryableStorageError, type PptRelayStore, type RelaySnapshot, type ReplayView } from './store.js'
+import { isRetryableStorageError, RetryableStorageError, type PptRelayStore, type RelaySnapshot, type ReplayCursor } from './store.js'
 import {
   verifyPptRelayTicket,
   InMemoryTicketStore,
@@ -51,6 +51,7 @@ import {
 export const CLOSE_UNAUTHORIZED = 4401
 export const CLOSE_FORBIDDEN = 4403
 export const CLOSE_NOT_FOUND = 4404
+export const CLOSE_RESYNC_REQUIRED = 4410
 /** WS internal-error close (RFC 6455 1011): a store failure we cannot recover. */
 export const CLOSE_UNAVAILABLE = 1011
 
@@ -65,12 +66,26 @@ export interface RelayLimits {
   maxEphemeralFrameBytes: number
   /** Max op rows read per replay batch (bounds replay memory). */
   replayPageSize: number
+  /** Approximate max persisted op JSON bytes per replay page. */
+  replayPageBytes: number
+  /** Process-wide cap for replay cursors holding store resources. */
+  maxInFlightReplays: number
+  /** Max live frames buffered while replay catches up. */
+  maxLiveBufferFrames: number
+  /** Max live frame bytes buffered while replay catches up. */
+  maxLiveBufferBytes: number
   /**
    * Socket `bufferedAmount` (bytes) above which replay pauses before sending the
    * next frame, so one slow/greedy consumer cannot make the relay buffer an
    * unbounded backlog in kernel/userspace send queues (XIN-1693 P1-3).
    */
   sendHighWaterBytes: number
+  /** Max time (ms) to wait for send buffer drain before closing the peer. */
+  sendDrainTimeoutMs: number
+  /** Periodic per-connection read-auth refresh interval. */
+  authRefreshMs: number
+  /** Short TTL for doc-status read-path cache. */
+  docStatusCacheTtlMs: number
 }
 
 function defaultLimits(): RelayLimits {
@@ -84,18 +99,20 @@ function defaultLimits(): RelayLimits {
     maxRoomFrameBytes: r.maxRoomFrameBytes,
     maxEphemeralFrameBytes: r.maxEphemeralFrameBytes,
     replayPageSize: r.replayPageSize,
+    replayPageBytes: r.replayPageBytes,
+    maxInFlightReplays: r.maxInFlightReplays,
+    maxLiveBufferFrames: r.maxLiveBufferFrames,
+    maxLiveBufferBytes: r.maxLiveBufferBytes,
     sendHighWaterBytes: r.sendHighWaterBytes,
+    sendDrainTimeoutMs: r.sendDrainTimeoutMs,
+    authRefreshMs: r.authRefreshMs,
+    docStatusCacheTtlMs: r.docStatusCacheTtlMs,
   }
 }
 
 /** Max client frames buffered during the pre-auth handshake window before they
  * are dropped (a flood before auth cannot grow memory unbounded, XIN-1693). */
 const MAX_PREAUTH_FRAMES = 16
-/** Max live frames buffered per connection until its replay reaches a stable
- * boundary; beyond this the client must resync via reconnect (XIN-1693 P1-4). */
-const MAX_LIVE_BUFFER_FRAMES = 4096
-/** Max time (ms) replay waits for a congested socket to drain before proceeding. */
-const MAX_SEND_DRAIN_MS = 5000
 /** Poll interval (ms) while waiting for the socket send buffer to drain. */
 const SEND_DRAIN_POLL_MS = 5
 
@@ -138,6 +155,12 @@ export interface PptRelayDeps {
   docStatusProvider?: (docId: string) => Promise<'live' | 'deleted'>
   protocolVersion?: number
   limits?: Partial<RelayLimits>
+}
+
+interface ConnAuthState {
+  readAllowed: boolean
+  invalidated: boolean
+  terminalClose?: { code: number; reason: string; refused?: RefusedCode }
 }
 
 interface Conn {
@@ -184,6 +207,16 @@ interface Conn {
   liveBuffer: ServerFrame[]
   /** Highest op seq already delivered to this connection (dedup on buffer flush). */
   lastDelivered: number
+  /** Approximate bytes held in liveBuffer. */
+  liveBufferBytes: number
+  /** Cached read authority used by no-I/O push delivery. */
+  auth: ConnAuthState
+  /** Per-connection inbound ordering chain. */
+  inboundChain: Promise<void>
+  /** Per-connection outbound ordering chain. */
+  outboundChain: Promise<void>
+  /** Periodic read-auth refresh timer. */
+  authTimer?: NodeJS.Timeout
 }
 
 function send(socket: WebSocket, frame: ServerFrame): void {
@@ -191,6 +224,27 @@ function send(socket: WebSocket, frame: ServerFrame): void {
     socket.send(JSON.stringify(frame))
   } catch {
     /* peer closed mid-broadcast; the close handler prunes it */
+  }
+}
+
+class Semaphore {
+  private active = 0
+  private readonly waiters: Array<() => void> = []
+
+  constructor(private readonly max: number) {}
+
+  async acquire(): Promise<() => void> {
+    if (this.active >= this.max) {
+      await new Promise<void>((resolve) => this.waiters.push(resolve))
+    }
+    this.active++
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.active--
+      this.waiters.shift()?.()
+    }
   }
 }
 
@@ -233,6 +287,8 @@ export class PptRelay {
    * lose an increment (the non-blocking `ensureRoomBudget` race).
    */
   private readonly roomChains = new Map<string, Promise<void>>()
+  private readonly replaySemaphore: Semaphore
+  private readonly docStatusCache = new Map<string, { status: 'live' | 'deleted'; expiresAt: number }>()
 
   constructor(deps: PptRelayDeps) {
     this.store = deps.store
@@ -243,6 +299,7 @@ export class PptRelay {
     this.docStatusProvider = deps.docStatusProvider
     this.pv = deps.protocolVersion ?? config.ppt.relay.protocolVersion
     this.limits = { ...defaultLimits(), ...(deps.limits ?? {}) }
+    this.replaySemaphore = new Semaphore(this.limits.maxInFlightReplays)
     // noServer: the relay owns no listener of its own — it is attached to B's
     // existing HTTP server (no second service).
     //
@@ -306,7 +363,7 @@ export class PptRelay {
     const onData = (data: unknown): void => {
       const raw = typeof data === 'string' ? data : String(data)
       if (conn) {
-        void this.onMessage(conn, raw)
+        conn.inboundChain = conn.inboundChain.then(() => this.onMessage(conn!, raw), () => this.onMessage(conn!, raw))
         return
       }
       if (preauth.length < MAX_PREAUTH_FRAMES) preauth.push(raw)
@@ -429,12 +486,19 @@ export class PptRelay {
       replayPending: null,
       liveBuffer: [],
       lastDelivered: 0,
+      liveBufferBytes: 0,
+      auth: { readAllowed: roleAtLeast(role, 'reader'), invalidated: false },
+      inboundChain: Promise.resolve(),
+      outboundChain: Promise.resolve(),
     }
     this.addToRoom(conn)
+    this.armAuthRefresh(conn)
     // Drain frames buffered before auth completed, in receipt order. No `await`
     // runs between assigning `conn` and this loop, so no `onData` callback can
     // interleave and reorder ahead of the queued frames.
-    for (const raw of preauth) void this.onMessage(conn, raw)
+    for (const raw of preauth) {
+      conn.inboundChain = conn.inboundChain.then(() => this.onMessage(conn!, raw), () => this.onMessage(conn!, raw))
+    }
   }
 
   private addToRoom(conn: Conn): void {
@@ -447,6 +511,8 @@ export class PptRelay {
   }
 
   private removeFromRoom(conn: Conn): void {
+    if (conn.authTimer) clearTimeout(conn.authTimer)
+    conn.authTimer = undefined
     const room = this.rooms.get(conn.docId)
     if (!room) return
     room.delete(conn)
@@ -464,8 +530,35 @@ export class PptRelay {
     if (!room) return
     for (const peer of room) {
       if (peer === conn) continue // sender never echoes its own op
-      this.deliver(peer, frame)
+      void this.deliver(peer, frame)
     }
+  }
+
+  private enqueueOutbound(conn: Conn, task: () => Promise<void> | void): Promise<void> {
+    const run = conn.outboundChain.then(async () => {
+      if (conn.socket.readyState !== WebSocket.OPEN) return
+      await task()
+    }, async () => {
+      if (conn.socket.readyState !== WebSocket.OPEN) return
+      await task()
+    })
+    conn.outboundChain = run.catch(() => {})
+    return run
+  }
+
+  private sendFrame(conn: Conn, frame: ServerFrame): Promise<void> {
+    return this.enqueueOutbound(conn, () => send(conn.socket, frame))
+  }
+
+  private closeConn(conn: Conn, code: number, reason: string): Promise<void> {
+    return this.enqueueOutbound(conn, () => {
+      conn.socket.close(code, reason)
+      this.removeFromRoom(conn)
+    })
+  }
+
+  private canPushRead(conn: Conn): boolean {
+    return conn.auth.readAllowed && !conn.auth.invalidated && conn.socket.readyState === WebSocket.OPEN
   }
 
   /**
@@ -477,12 +570,38 @@ export class PptRelay {
    * buffer is bounded; a peer that never catches up drops overflow and must resync
    * via reconnect rather than grow memory unbounded.
    */
-  private deliver(peer: Conn, frame: ServerFrame): void {
-    if (!peer.caughtUp || peer.replayInFlight) {
-      if (peer.liveBuffer.length < MAX_LIVE_BUFFER_FRAMES) peer.liveBuffer.push(frame)
+  private async deliver(peer: Conn, frame: ServerFrame): Promise<void> {
+    if (!this.canPushRead(peer)) {
+      const terminal = peer.auth.terminalClose
+      await this.closeConn(peer, terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
       return
     }
-    send(peer.socket, frame)
+    if (!peer.caughtUp || peer.replayInFlight) {
+      const frameBytes = Buffer.byteLength(JSON.stringify(frame), 'utf8')
+      if (
+        peer.liveBuffer.length >= this.limits.maxLiveBufferFrames ||
+        peer.liveBufferBytes + frameBytes > this.limits.maxLiveBufferBytes
+      ) {
+        const frameCount = peer.liveBuffer.length
+        const bytes = peer.liveBufferBytes
+        peer.liveBuffer = []
+        peer.liveBufferBytes = 0
+        // eslint-disable-next-line no-console
+        console.warn('[ppt-relay] live buffer overflow; closing for resync', {
+          docId: peer.docId,
+          uid: peer.uid,
+          frameCount,
+          bytes,
+          reason: 'live-buffer-overflow',
+        })
+        await this.closeConn(peer, CLOSE_RESYNC_REQUIRED, 'resync required')
+        return
+      }
+      peer.liveBuffer.push(frame)
+      peer.liveBufferBytes += frameBytes
+      return
+    }
+    await this.sendFrame(peer, frame)
   }
 
   /**
@@ -495,19 +614,20 @@ export class PptRelay {
     if (conn.liveBuffer.length === 0) return
     const buffered = conn.liveBuffer
     conn.liveBuffer = []
+    conn.liveBufferBytes = 0
     for (const frame of buffered) {
       if (frame.ctl === 'op') {
         if (frame.q <= conn.lastDelivered) continue
         conn.lastDelivered = frame.q
       }
-      send(conn.socket, frame)
+      void this.sendFrame(conn, frame)
     }
   }
 
   /**
    * Send a replay frame, PAUSING first while the socket's send buffer is over the
    * high-water mark so a slow/greedy consumer cannot make the relay accumulate an
-   * unbounded backlog (XIN-1693 P1-3). Bounded by {@link MAX_SEND_DRAIN_MS} so a
+   * unbounded backlog (XIN-1693 P1-3). Bounded by the drain timeout so a
    * wedged client cannot stall replay forever; on a closed socket it is a no-op.
    */
   private async gatedSend(conn: Conn, frame: ServerFrame): Promise<void> {
@@ -516,13 +636,17 @@ export class PptRelay {
     while (
       socket.readyState === WebSocket.OPEN &&
       socket.bufferedAmount > this.limits.sendHighWaterBytes &&
-      waited < MAX_SEND_DRAIN_MS
+      waited < this.limits.sendDrainTimeoutMs
     ) {
       await delay(SEND_DRAIN_POLL_MS)
       waited += SEND_DRAIN_POLL_MS
     }
     if (socket.readyState !== WebSocket.OPEN) return
-    send(socket, frame)
+    if (socket.bufferedAmount > this.limits.sendHighWaterBytes) {
+      await this.closeConn(conn, CLOSE_UNAVAILABLE, 'send drain timeout')
+      return
+    }
+    await this.sendFrame(conn, frame)
   }
 
   /**
@@ -562,7 +686,7 @@ export class PptRelay {
     // client always has a concrete delay instead of an unbounded busy-retry.
     const retryInMs =
       opts.retryInMs !== undefined ? opts.retryInMs : code === 'storage-retry' ? STORAGE_RETRY_BACKOFF_MS : undefined
-    send(conn.socket, {
+    void this.sendFrame(conn, {
       ctl: 'refused',
       code,
       retryable,
@@ -614,19 +738,19 @@ export class PptRelay {
     switch (frame.t) {
       case 'hello':
         if (this.enforceEphemeralLimits(conn, rawBytes)) return
-        if (!(await this.authorizeRead(conn))) return
+        if (!(await this.refreshReadAuth(conn, 'hello'))) return
         this.requestReplay(conn, typeof frame.since === 'number' ? frame.since : 0, /* ready */ true)
         return
       case 'need':
         if (this.enforceEphemeralLimits(conn, rawBytes)) return
-        if (!(await this.authorizeRead(conn))) return
+        if (!(await this.refreshReadAuth(conn, 'need'))) return
         this.requestReplay(conn, typeof frame.since === 'number' ? frame.since : 0, /* ready */ false)
         return
       case 'p':
         if (this.enforceEphemeralLimits(conn, rawBytes)) return
         // A revoked/soft-deleted/downgraded-to-none reader must not broadcast
         // presence either — gate `p` with the same read-path authz (P1-2).
-        if (!(await this.authorizeRead(conn))) return
+        if (!(await this.refreshReadAuth(conn, 'presence'))) return
         this.broadcast(conn, { ctl: 'presence', uid: conn.uid, ...(conn.name ? { name: conn.name } : {}), presence: (frame as { presence?: unknown }).presence })
         return
       case 'bye':
@@ -637,7 +761,7 @@ export class PptRelay {
           return
         }
         this.broadcast(conn, { ctl: 'presence', uid: conn.uid, ...(conn.name ? { name: conn.name } : {}), presence: undefined })
-        conn.socket.close(1000, 'bye')
+        void this.closeConn(conn, 1000, 'bye')
         return
       case 'ops':
         // Serialize per room so the assigned seq order is also the broadcast
@@ -664,19 +788,41 @@ export class PptRelay {
    * share-membership fail-closed check). Returns false when the connection was
    * refused/closed (the caller must not proceed).
    */
-  private async authorizeRead(conn: Conn): Promise<boolean> {
+  private async readDocStatus(conn: Conn): Promise<'live' | 'deleted'> {
+    if (!this.docStatusProvider) return 'live'
+    const cached = this.docStatusCache.get(conn.docId)
+    const now = Date.now()
+    if (cached && cached.expiresAt > now) return cached.status
+    const status = await this.docStatusProvider(conn.docId)
+    this.docStatusCache.set(conn.docId, {
+      status,
+      expiresAt: now + (status === 'deleted' ? this.limits.docStatusCacheTtlMs : 0),
+    })
+    return status
+  }
+
+  private armAuthRefresh(conn: Conn): void {
+    const jitter = Math.floor(Math.random() * Math.max(1, this.limits.authRefreshMs / 5))
+    conn.authTimer = setTimeout(() => {
+      void this.refreshReadAuth(conn, 'timer').finally(() => {
+        if (this.rooms.get(conn.docId)?.has(conn) && conn.socket.readyState === WebSocket.OPEN) this.armAuthRefresh(conn)
+      })
+    }, this.limits.authRefreshMs + jitter)
+  }
+
+  private async refreshReadAuth(conn: Conn, _reason: string): Promise<boolean> {
     if (conn.socket.readyState !== WebSocket.OPEN) return false
     if (this.docStatusProvider) {
       let deleted: boolean
       try {
-        deleted = (await this.docStatusProvider(conn.docId)) === 'deleted'
+        deleted = (await this.readDocStatus(conn)) === 'deleted'
       } catch {
         deleted = true // fail closed
       }
       if (deleted) {
+        conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_NOT_FOUND, reason: 'document deleted', refused: 'doc-deleted' } }
         this.refuse(conn, 'doc-deleted', { message: 'document deleted' })
-        conn.socket.close(CLOSE_NOT_FOUND, 'document deleted')
-        this.removeFromRoom(conn)
+        await this.closeConn(conn, CLOSE_NOT_FOUND, 'document deleted')
         return false
       }
     }
@@ -685,9 +831,9 @@ export class PptRelay {
       live = await this.epochProvider(conn.documentName)
     } catch {
       // Unconfirmable epoch on the read path: fail closed rather than serve state.
+      conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_NOT_FOUND, reason: 'document unavailable', refused: 'doc-deleted' } }
       this.refuse(conn, 'doc-deleted', { message: 'document unavailable' })
-      conn.socket.close(CLOSE_NOT_FOUND, 'document unavailable')
-      this.removeFromRoom(conn)
+      await this.closeConn(conn, CLOSE_NOT_FOUND, 'document unavailable')
       return false
     }
     if (conn.roleEpoch !== live) {
@@ -695,11 +841,12 @@ export class PptRelay {
       if (closed) return false
     }
     if (!roleAtLeast(conn.role, 'reader')) {
+      conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_FORBIDDEN, reason: 'access revoked', refused: 'forbidden-role' } }
       this.refuse(conn, 'forbidden-role', { message: 'access revoked' })
-      conn.socket.close(CLOSE_FORBIDDEN, 'access revoked')
-      this.removeFromRoom(conn)
+      await this.closeConn(conn, CLOSE_FORBIDDEN, 'access revoked')
       return false
     }
+    conn.auth = { readAllowed: true, invalidated: false }
     return true
   }
 
@@ -763,25 +910,35 @@ export class PptRelay {
    * back in `ready.q` and make the client skip every op below it (XIN-1693 P2-e).
    *
    * The high-water, snapshot, and op tail are read as ONE consistent view
-   * ({@link PptRelayStore.readReplay}) so a concurrent `snap`+prune cannot slip
+   * ({@link PptRelayStore.openReplay}) so a concurrent `snap`+prune cannot slip
    * between them and leave a reader with neither the snapshot nor the pruned ops
    * (XIN-1693 P1-4). A store failure surfaces a `storage-failed` refusal + close,
    * never a silent hang (XIN-1655 C4). Replay sends are backpressure-gated (P1-3).
    */
   private async replay(conn: Conn, rawSince: number, ready = true): Promise<boolean> {
-    let view: ReplayView
+    if (!(await this.refreshReadAuth(conn, 'replay-start'))) return false
+    let release: (() => void) | null = null
+    let cursor: ReplayCursor | null = null
     try {
-      view = this.store.readReplay
-        ? await this.store.readReplay(conn.docId, rawSince, this.limits.replayPageSize)
-        : await this.composeReplayView(conn.docId, rawSince)
-    } catch {
-      this.refuse(conn, 'storage-failed', { message: 'replay failed' })
-      conn.socket.close(CLOSE_UNAVAILABLE, 'replay failed')
+      release = await this.replaySemaphore.acquire()
+      cursor = this.store.openReplay
+        ? await this.store.openReplay(conn.docId, rawSince, {
+          pageRows: this.limits.replayPageSize,
+          pageBytes: this.limits.replayPageBytes,
+        })
+        : await this.composeReplayCursor(conn.docId, rawSince)
+    } catch (err) {
+      const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
+      this.refuse(conn, code, { message: 'replay failed' })
+      if (code === 'storage-failed') await this.closeConn(conn, CLOSE_UNAVAILABLE, 'replay failed')
+      release?.()
       return false
     }
-    const { highWater, snapshot, ops } = view
+    const { highWater, snapshot } = cursor
     if (rawSince > highWater) {
       this.refuse(conn, 'protocol-version', { message: 'resume cursor exceeds room high-water' })
+      await cursor.close()
+      release?.()
       return false
     }
     try {
@@ -795,10 +952,19 @@ export class PptRelay {
       // Highest op seq ACTUALLY delivered, so `ready.q` reports what the client is
       // truly synced through, not the counter high-water (XIN-1655 C6).
       let delivered = fromSeq
-      for (const op of ops) {
-        if (op.seq <= fromSeq) continue
-        await this.gatedSend(conn, { ctl: 'op', q: op.seq, frame: op.frame })
-        delivered = op.seq
+      for (;;) {
+        if (!(await this.refreshReadAuth(conn, 'replay-page'))) {
+          await cursor.close()
+          release?.()
+          return false
+        }
+        const ops = await cursor.nextPage()
+        if (ops.length === 0) break
+        for (const op of ops) {
+          if (op.seq <= fromSeq) continue
+          await this.gatedSend(conn, { ctl: 'op', q: op.seq, frame: op.frame })
+          delivered = op.seq
+        }
       }
       conn.lastDelivered = Math.max(conn.lastDelivered, delivered)
       if (ready) {
@@ -820,33 +986,57 @@ export class PptRelay {
           role: conn.role,
         })
       }
+      await cursor.close()
+      release?.()
       return true
-    } catch {
-      this.refuse(conn, 'storage-failed', { message: 'replay failed' })
-      conn.socket.close(CLOSE_UNAVAILABLE, 'replay failed')
+    } catch (err) {
+      try {
+        await cursor.close()
+      } catch {
+        /* ignore close failure */
+      }
+      release?.()
+      const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
+      this.refuse(conn, code, { message: 'replay failed' })
+      if (code === 'storage-failed') await this.closeConn(conn, CLOSE_UNAVAILABLE, 'replay failed')
       return false
     }
   }
 
   /**
    * Fallback replay view for a store that does not implement the atomic
-   * {@link PptRelayStore.readReplay} seam: compose the individual reads (paged) as
+   * {@link PptRelayStore.openReplay} seam: compose the individual reads (paged) as
    * the pre-P1-4 code did. Production ({@link DbPptRelayStore}) and the in-memory
-   * store both provide `readReplay`, so this only serves bespoke test doubles.
+   * store both provide `openReplay`, so this only serves bespoke test doubles.
    */
-  private async composeReplayView(docId: string, sinceSeq: number): Promise<ReplayView> {
+  private async composeReplayCursor(docId: string, sinceSeq: number): Promise<ReplayCursor> {
     const highWater = await this.store.currentSeq(docId)
     const snapshot = await this.store.getSnapshot(docId)
-    const ops: ReplayView['ops'] = []
     const pageSize = this.limits.replayPageSize
     let cursor = sinceSeq
-    for (;;) {
-      const page = await this.store.opsSince(docId, cursor, pageSize)
-      for (const op of page) ops.push(op)
-      if (page.length < pageSize) break
-      cursor = page[page.length - 1]!.seq
+    let closed = false
+    return {
+      highWater,
+      snapshot,
+      fromSeq: sinceSeq,
+      nextPage: async () => {
+        if (closed) return []
+        const rows = await this.store.opsSince(docId, cursor, pageSize)
+        const page = []
+        let bytes = 0
+        for (const row of rows) {
+          const frameBytes = row.frameBytes ?? Buffer.byteLength(JSON.stringify(row.frame), 'utf8')
+          if (page.length > 0 && bytes + frameBytes > this.limits.replayPageBytes) break
+          page.push(row)
+          bytes += frameBytes
+        }
+        if (page.length > 0) cursor = page[page.length - 1]!.seq
+        return page
+      },
+      close: async () => {
+        closed = true
+      },
     }
-    return { highWater, snapshot, ops }
   }
 
   /**
@@ -859,7 +1049,7 @@ export class PptRelay {
     if (rawBytes > maxBytes) return 'too-large'
     if (this.docStatusProvider) {
       try {
-        if ((await this.docStatusProvider(conn.docId)) === 'deleted') return 'doc-deleted'
+        if ((await this.readDocStatus(conn)) === 'deleted') return 'doc-deleted'
       } catch {
         return 'doc-deleted'
       }
@@ -945,12 +1135,13 @@ export class PptRelay {
     })
     if (outcome.kind === 'close-membership') {
       conn.role = 'none'
-      conn.socket.close(CLOSE_FORBIDDEN, 'membership recheck required')
-      this.removeFromRoom(conn)
+      conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_FORBIDDEN, reason: 'membership recheck required' } }
+      void this.closeConn(conn, CLOSE_FORBIDDEN, 'membership recheck required')
       return true
     }
     if (roleRank(outcome.role) < roleRank(conn.role)) conn.role = outcome.role
     conn.roleEpoch = live
+    conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
     return false
   }
 
@@ -1042,7 +1233,7 @@ export class PptRelay {
       // `k` is echoed back as the ack counter; apply `?? 0` consistently across
       // every ack path so an omitted `k` never lands as `undefined` in the frame
       // (P2-h — parse also refuses a non-integer `k`).
-      send(conn.socket, { ctl: 'ack', k: frame.k ?? 0, q: known, snapshotVersion })
+      void this.sendFrame(conn, { ctl: 'ack', k: frame.k ?? 0, q: known, snapshotVersion })
       return
     }
     // Not a known duplicate: enforce the mutation gate (size / doc-status / epoch /
@@ -1107,7 +1298,7 @@ export class PptRelay {
       /* keep the ack: the op is durable regardless of the snapshot read */
     }
     // Ack the sender ONLY after the durable write.
-    send(conn.socket, { ctl: 'ack', k: frame.k ?? 0, q: seq, snapshotVersion })
+    void this.sendFrame(conn, { ctl: 'ack', k: frame.k ?? 0, q: seq, snapshotVersion })
     // Broadcast to peers only for a first-seen frame (no echo, no double-apply).
     if (!duplicate) this.broadcast(conn, { ctl: 'op', q: seq, frame })
   }
@@ -1183,7 +1374,7 @@ export class PptRelay {
     } catch {
       /* keep the ack: the snapshot is durable; prune is best-effort GC */
     }
-    send(conn.socket, { ctl: 'ack', k: frame.k ?? 0, q: covered, snapshotVersion })
+    void this.sendFrame(conn, { ctl: 'ack', k: frame.k ?? 0, q: covered, snapshotVersion })
   }
 
   /**
@@ -1205,6 +1396,15 @@ export class PptRelay {
    * still runs).
    */
   async applyEpochBump(documentName: string): Promise<void> {
+    this.docStatusCache.clear()
+    for (const room of this.rooms.values()) {
+      for (const conn of room) {
+        if (conn.documentName === documentName) {
+          conn.auth.invalidated = true
+          conn.auth.readAllowed = false
+        }
+      }
+    }
     // Deletion takes precedence: a doc that is now gone closes 4404, not 4403.
     // (This also covers the case where deletion is the only reason for the bump.)
     if (this.docStatusProvider) {
@@ -1250,26 +1450,27 @@ export class PptRelay {
           // The frozen space-membership claim became load-bearing and cannot be
           // re-verified on a live socket — fail closed (P1-6). The client re-mints
           // a ticket carrying fresh membership.
-          conn.socket.close(CLOSE_FORBIDDEN, 'membership recheck required')
-          this.removeFromRoom(conn)
+          conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_FORBIDDEN, reason: 'membership recheck required' } }
+          void this.closeConn(conn, CLOSE_FORBIDDEN, 'membership recheck required')
           continue
         }
         const role = outcome.role
         if (role === 'none') {
-          conn.socket.close(CLOSE_FORBIDDEN, 'access revoked')
-          this.removeFromRoom(conn)
+          conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_FORBIDDEN, reason: 'access revoked' } }
+          void this.closeConn(conn, CLOSE_FORBIDDEN, 'access revoked')
           continue
         }
         // Only a downgrade takes effect live; an upgrade needs fresh authority.
         if (roleRank(role) < roleRank(conn.role)) {
           conn.role = role
-          send(conn.socket, { ctl: 'role-changed', role, epoch: newEpoch })
+          void this.sendFrame(conn, { ctl: 'role-changed', role, epoch: newEpoch })
         }
         // Record that this connection's role now reflects the live epoch, so
         // guardMutation does not re-resolve it again for the same epoch. Only
         // stamp when we actually have the authoritative epoch — otherwise leave
         // roleEpoch stale so the per-frame guard re-resolves later.
         if (epochOk) conn.roleEpoch = newEpoch
+        conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: !epochOk }
       }
     }
   }
@@ -1279,8 +1480,8 @@ export class PptRelay {
     const room = this.rooms.get(docId)
     if (!room) return
     for (const conn of [...room]) {
-      conn.socket.close(CLOSE_NOT_FOUND, 'document deleted')
-      this.removeFromRoom(conn)
+      conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_NOT_FOUND, reason: 'document deleted' } }
+      void this.closeConn(conn, CLOSE_NOT_FOUND, 'document deleted')
     }
   }
 
@@ -1291,7 +1492,7 @@ export class PptRelay {
 
   close(): void {
     for (const room of this.rooms.values()) {
-      for (const conn of [...room]) conn.socket.close(1001, 'relay shutting down')
+      for (const conn of [...room]) void this.closeConn(conn, 1001, 'relay shutting down')
     }
     this.rooms.clear()
     this.wss.close()
