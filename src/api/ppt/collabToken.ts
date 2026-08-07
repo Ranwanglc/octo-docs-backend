@@ -26,7 +26,6 @@ import { PptApiError, sendPptData } from './envelope.js'
 import { pptAuthMiddleware, pptSpaceContextMiddleware } from './auth.js'
 import { pptLiveSnapshotRepo } from '../../db/repos/pptLiveSnapshotRepo.js'
 import { parseDocumentName, isDocTypeConsistentWithName } from '../../permission/documentName.js'
-import { SHARE_SCOPE_ANYONE } from '../../permission/shareScope.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { issuePptCollabToken } from '../../auth/pptCollabToken.js'
 import type { Role } from '../../permission/role.js'
@@ -45,8 +44,11 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
   const docId = docIdRaw.trim()
 
   // Shared load + role resolution (throws NOT_FOUND / CONFLICT /
-  // UNSUPPORTED_DOCUMENT_TYPE); `role` may be 'none'.
-  const { meta, role } = await loadPptDocForRead(uid, spaceId, docId, { token })
+  // UNSUPPORTED_DOCUMENT_TYPE); `role` may be 'none'. `spaceMember` is the SAME
+  // membership decision the effective role was resolved with (XIN-1739): the
+  // relay ticket signs THIS value so a later live downgrade recheck agrees with
+  // issuance, and a direct writer/admin resolved no membership IO.
+  const { meta, role, spaceMember } = await loadPptDocForRead(uid, spaceId, docId, { token })
 
   // A corrupt document_name / type pairing must not mint a relay credential:
   // treat a malformed or cross-type name as forbidden (never leak more than the
@@ -86,19 +88,12 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
     /* best-effort: presence falls back to client-supplied name */
   }
 
-  // Space-membership claim (§4.4). Only meaningful — and only worth the extra
-  // lookup — for an `anyone_in_space` deck, where a space member with no
-  // doc_member row is a share-derived writer; a restricted deck's share-derived
-  // role is always 'none', so membership is irrelevant and costs zero IO. The
-  // relay carries this to re-resolve the same effective role on downgrade checks.
-  let spaceMember = false
-  if (meta.share_scope === SHARE_SCOPE_ANYONE) {
-    try {
-      spaceMember = await getOctoIdentity().isSpaceMember(uid, meta.space_id, token ?? '')
-    } catch {
-      spaceMember = false // fail-closed: a lookup error never widens access
-    }
-  }
+  // Space-membership claim (§4.4) is resolved ONCE, together with the effective
+  // role, in `loadPptDocForRead` above (XIN-1739 spaceMember single resolution).
+  // The relay carries this exact boolean to re-resolve the same effective role on
+  // downgrade checks — signing a value that DISAGREED with the role decision (the
+  // old two-lookup path) could mint `role: writer` with `space_member: false` and
+  // wrongly revoke a live share writer.
 
   const result = issuePptCollabToken({
     uid,

@@ -16,7 +16,7 @@
  */
 import { docMetaRepo, type DocMeta } from '../../db/repos/docMetaRepo.js'
 import { resolveRole } from '../../permission/resolveRole.js'
-import { resolveEffectiveRole } from '../../permission/resolveEffectiveRole.js'
+import { resolveEffectiveRoleWithMembership } from '../../permission/resolveEffectiveRole.js'
 import type { ResolvedRole } from '../../permission/role.js'
 import { HTML_PPT_DOC_TYPE } from '../../db/docType.js'
 import { PptApiError } from './envelope.js'
@@ -25,6 +25,16 @@ export interface PptDocGuard {
   meta: DocMeta
   /** The caller's effective role (incl. `'none'`); the handler enforces the floor. */
   role: ResolvedRole
+  /**
+   * The space-membership decision the effective role was resolved with, resolved
+   * in the SAME call as `role` (never a second, possibly-disagreeing lookup).
+   * `false` when membership is not load-bearing (restricted deck, or a direct
+   * writer/admin whose access does not depend on an `anyone_in_space` share) —
+   * so a direct writer/admin needs no membership IO. The PPT collab-token signs
+   * THIS exact boolean into the ticket claim so a live downgrade recheck agrees
+   * with issuance (XIN-1739 spaceMember single resolution).
+   */
+  spaceMember: boolean
 }
 
 export interface PptDocGuardCaller {
@@ -70,6 +80,9 @@ export async function loadPptDocForRead(
   const direct = await resolveRole(uid, docId)
   // #64 share-scope layering: effectiveRole = max(direct, share-derived). Zero
   // extra IO for the default restricted doc or a caller already at writer/admin.
-  const role = await resolveEffectiveRole(uid, direct, meta, { token: caller.token })
-  return { meta, role }
+  // Resolve the effective role AND the membership it depended on in ONE call so a
+  // later consumer (the collab-token claim) signs the SAME `spaceMember` the role
+  // decision used (XIN-1739 spaceMember single resolution).
+  const { role, spaceMember } = await resolveEffectiveRoleWithMembership(uid, direct, meta, { token: caller.token })
+  return { meta, role, spaceMember }
 }

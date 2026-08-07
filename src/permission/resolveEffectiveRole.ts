@@ -47,17 +47,61 @@ export interface ShareCaller {
   token?: string
 }
 
+/**
+ * The effective role PLUS the single space-membership decision it was resolved
+ * with. The relay's ticket carries `space_member` so it can re-resolve the SAME
+ * effective role later (folding in an `anyone_in_space` share grant) without the
+ * caller's octo session token. Returning both from ONE call is what makes the
+ * ticket internally self-consistent: the membership boolean that DECIDED the role
+ * is the exact boolean signed into the claim, so a live downgrade recheck cannot
+ * disagree with issuance (XIN-1739 spaceMember single resolution).
+ */
+export interface EffectiveRoleWithMembership {
+  role: ResolvedRole
+  /** The single membership decision used for BOTH the role and the token claim. */
+  spaceMember: boolean
+}
+
+/**
+ * Resolve the effective role AND the space-membership it depended on in ONE
+ * operation, so the two can never diverge across separate lookups.
+ *
+ * Membership is load-bearing ONLY for an `anyone_in_space` deck where the direct
+ * role is below what the share path can ever grant (`writer`). Otherwise the
+ * share grant contributes nothing, so membership costs ZERO IO and is reported as
+ * `false` (not load-bearing) — including for a direct writer/admin, who therefore
+ * needs no membership call. When membership IS load-bearing it is resolved once;
+ * a lookup failure fails CLOSED to `false`, and because that single `false` feeds
+ * BOTH the effective role and the returned claim, role and claim fail closed
+ * together (never `role: writer` with `space_member: false`).
+ */
+export async function resolveEffectiveRoleWithMembership(
+  uid: string,
+  direct: ResolvedRole,
+  meta: ShareResolvable,
+  caller: ShareCaller = {},
+): Promise<EffectiveRoleWithMembership> {
+  if (meta.share_scope !== SHARE_SCOPE_ANYONE || roleAtLeast(direct, 'writer')) {
+    return { role: direct, spaceMember: false }
+  }
+  let member: boolean
+  try {
+    member = caller.isBot
+      ? true
+      : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
+  } catch {
+    // Fail-closed: a lookup error never widens access, and the SAME false drives
+    // both the role and the claim so they stay consistent.
+    member = false
+  }
+  return { role: effectiveRole(direct, member, meta.share_scope, meta.share_role), spaceMember: member }
+}
+
 export async function resolveEffectiveRole(
   uid: string,
   direct: ResolvedRole,
   meta: ShareResolvable,
   caller: ShareCaller = {},
 ): Promise<ResolvedRole> {
-  if (meta.share_scope !== SHARE_SCOPE_ANYONE || roleAtLeast(direct, 'writer')) {
-    return direct
-  }
-  const member = caller.isBot
-    ? true
-    : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
-  return effectiveRole(direct, member, meta.share_scope, meta.share_role)
+  return (await resolveEffectiveRoleWithMembership(uid, direct, meta, caller)).role
 }
