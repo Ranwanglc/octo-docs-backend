@@ -60,11 +60,16 @@ BEGIN
   END;
 
   -- Batch the rewrite so a large ledger is not nulled in one lock-heavy UPDATE.
+  -- ORDER BY the primary key so the batched UPDATE ... LIMIT touches a
+  -- deterministic set of rows each iteration. Safe under ROW-based binlog either
+  -- way, but an unordered UPDATE ... LIMIT is flagged as non-deterministic under
+  -- statement-based/mixed replication (XIN-1739 P2).
   retire_loop: LOOP
     START TRANSACTION;
     UPDATE ppt_collab_frame
        SET payload_hash = NULL
      WHERE payload_hash IS NOT NULL
+     ORDER BY doc_id, frame_id
      LIMIT 2000;
     SET v_rows = ROW_COUNT();
     COMMIT;

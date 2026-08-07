@@ -164,7 +164,14 @@ function makeDb() {
         lockErrorsOnOpPageRead--
         throw lockError()
       }
-      const [docId, since, limit] = p as [string, number, number | undefined]
+      const [docId, since] = p as [string, number]
+      // XIN-1748 P1-2: the page size is now INLINED into the SQL (`LIMIT <n>`), not
+      // bound via `?`, matching this repo's settled remedy for the mysql2
+      // prepared-LIMIT bug. Parse it out of the statement text so the fake still
+      // pages correctly — and so this fake would surface a `LIMIT ?` regression
+      // (an un-inlined limit no longer reaches it as a param) rather than mask it.
+      const limitMatch = /LIMIT\s+(\d+)\b/i.exec(sql)
+      const limit = limitMatch ? Number(limitMatch[1]) : undefined
       const room = ops.get(docId)
       if (!room) return []
       return [...room.values()]

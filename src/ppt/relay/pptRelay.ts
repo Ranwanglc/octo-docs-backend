@@ -138,14 +138,6 @@ const MAX_PREAUTH_FRAMES = 16
 /** Poll interval (ms) while waiting for the socket send buffer to drain. */
 const SEND_DRAIN_POLL_MS = 5
 
-/**
- * Upper bound on the number of diagnostic seq holes tracked per connection, and
- * on the size of a single jump that gets enumerated into holes. Holes below the
- * observed high-water are legal and never load-bearing, so this only caps the
- * memory/CPU a huge legal gap could otherwise cost (XIN-1739 P1-1).
- */
-const MAX_TRACKED_HOLES = 4096
-
 /** Await `ms`, resolving via a timer. */
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -237,7 +229,20 @@ interface Conn {
    * window the old code left when it set `caughtUp = true` BEFORE the flush
    * completed (the `10,12,11` defect).
    */
-  flushingLiveBuffer: boolean
+  /**
+   * Depth of in-progress catch-up buffer drains (XIN-1739 P1-1/P1-2). A COUNTER,
+   * not a boolean: three call sites drain (the replay cutover, a `handleReauth`
+   * success, an `applyEpochBump` that cleared pendingReauth) and two are
+   * fire-and-forget, so a second drain can start while the first is mid-loop. As a
+   * boolean the second drain's `finally` cleared the flag while the first was still
+   * awaiting a `gatedSend`, reopening the reorder window `deliver` closes (a live
+   * broadcast slipping between buffered frames — the `10,12,11` defect). As a depth
+   * counter the state reads BUSY until EVERY concurrent drain has returned, so
+   * `deliver`/`requestReplay`/`handleSnap` keep treating the connection as
+   * not-caught-up for the whole overlap. Incremented on drain entry, decremented in
+   * `finally`; `> 0` means a drain is in flight.
+   */
+  flushDepth: number
   /**
    * A coalesced pending replay request (latest wins) captured while one was in
    * flight. At most one replay runs and at most one is queued per connection, so a
@@ -257,14 +262,6 @@ interface Conn {
    * forever (P1-1).
    */
   observedHighWater: number
-  /**
-   * Seqs BELOW {@link observedHighWater} skipped when a higher seq was observed —
-   * legal holes, kept only for diagnostics/assertions and BOUNDED (dropped at/below
-   * the latest snapshot coverage, and never enumerated past a cap on a large jump).
-   * Load-bearing consumers rely on `observedHighWater`, never on filling every
-   * integer (P1-1).
-   */
-  observedHoles: Set<number>
   /** Approximate bytes held in liveBuffer. */
   liveBufferBytes: number
   /** Cached read authority used by no-I/O push delivery. */
@@ -602,11 +599,10 @@ export class PptRelay {
       ephemeralFrameTimes: [],
       caughtUp: false,
       replayInFlight: false,
-      flushingLiveBuffer: false,
+      flushDepth: 0,
       replayPending: null,
       liveBuffer: [],
       observedHighWater: 0,
-      observedHoles: new Set(),
       liveBufferBytes: 0,
       auth: { readAllowed: roleAtLeast(role, 'reader'), invalidated: false },
       inboundChain: Promise.resolve(),
@@ -719,22 +715,18 @@ export class PptRelay {
 
   /**
    * Advance this connection's observed HIGH-WATER (XIN-1739 P1-1). A seq at or
-   * below the high-water is already accounted for (clear any hole it filled and
-   * return). A higher seq advances the high-water and records the skipped seqs as
-   * legal holes for diagnostics — bounded so a large jump never enumerates
-   * millions of integers (holes are never load-bearing; every consumer keys off
-   * `observedHighWater`, and gaps below it are legal per the wire contract).
+   * below the high-water is already accounted for; a higher seq advances it. This
+   * is a high-water, NOT a contiguous prefix: the wire contract allows legal seq
+   * gaps (a burned op-dup-reconciliation seq, a rolled-back append), and because
+   * observations arrive in room order, seeing seq N means every real op below N was
+   * already delivered to (or is a legal hole for) this connection. The replay
+   * clamp and the snapshot-coverage gate both key off this value. It is advanced
+   * only by genuine OBSERVATIONS — a peer op delivered, a replay op, delivered
+   * snapshot coverage, or a fresh authored write's ack — never by a duplicate
+   * re-ack (see the re-ack path in {@link handleOps}, XIN-1739 P0-2).
    */
   private markObservedSeq(conn: Conn, seq: number): void {
-    if (seq <= conn.observedHighWater) {
-      conn.observedHoles.delete(seq)
-      return
-    }
-    const gap = seq - conn.observedHighWater - 1
-    if (gap > 0 && gap <= MAX_TRACKED_HOLES && conn.observedHoles.size <= MAX_TRACKED_HOLES) {
-      for (let n = conn.observedHighWater + 1; n < seq; n++) conn.observedHoles.add(n)
-    }
-    conn.observedHighWater = seq
+    if (seq > conn.observedHighWater) conn.observedHighWater = seq
   }
 
   /**
@@ -756,7 +748,7 @@ export class PptRelay {
       await this.closeConn(peer, terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
       return
     }
-    if (!peer.caughtUp || peer.replayInFlight || peer.flushingLiveBuffer) {
+    if (!peer.caughtUp || peer.replayInFlight || peer.flushDepth > 0) {
       await this.bufferLiveFrame(peer, frame)
       return
     }
@@ -796,10 +788,10 @@ export class PptRelay {
    * streamed is delivered exactly once (P1-4).
    *
    * Drains in BATCHES until the buffer is empty (XIN-1739 P1-2): while flushing,
-   * `deliver` keeps buffering new broadcasts (the `flushingLiveBuffer` gate), so a
+   * `deliver` keeps buffering new broadcasts (the `flushDepth` gate), so a
    * batch can grow the buffer; each new batch is drained in receipt order until
    * none remain. Because the outbound chain is the sole socket-order owner, order
-   * is preserved within and across batches. The caller sets `flushingLiveBuffer`
+   * is preserved within and across batches. The caller raises `flushDepth`
    * around this call and only marks `caughtUp` once it returns with an empty buffer.
    */
   private async flushLiveBuffer(conn: Conn): Promise<void> {
@@ -821,18 +813,22 @@ export class PptRelay {
   }
 
   /**
-   * Drain the live buffer under the `flushingLiveBuffer` gate, so a broadcast that
-   * arrives mid-drain is buffered (not delivered ahead of it) and no concurrent
-   * replay starts (XIN-1739 P1-2). Used by the non-replay flush paths (an epoch
-   * bump that cleared `pendingReauth`, or a successful in-place `reauth`) where the
-   * connection is already `caughtUp`; the replay cutover does its own inline drain.
+   * Drain the live buffer under the flush gate, so a broadcast that arrives
+   * mid-drain is buffered (not delivered ahead of it) and no concurrent replay
+   * starts (XIN-1739 P1-2). Used by the non-replay flush paths (an epoch bump that
+   * cleared `pendingReauth`, or a successful in-place `reauth`) where the connection
+   * is already `caughtUp`; the replay cutover does its own inline drain. The gate is
+   * a DEPTH COUNTER (P1-1): incrementing on entry and decrementing in `finally`
+   * keeps the connection BUSY for the whole overlap even if two drains run at once,
+   * so a fast inner drain finding an already-swapped-out buffer cannot clear the
+   * gate out from under a slower one still awaiting a `gatedSend`.
    */
   private async drainLiveBuffer(conn: Conn): Promise<void> {
-    conn.flushingLiveBuffer = true
+    conn.flushDepth++
     try {
       await this.flushLiveBuffer(conn)
     } finally {
-      conn.flushingLiveBuffer = false
+      conn.flushDepth--
     }
   }
 
@@ -1141,6 +1137,29 @@ export class PptRelay {
       return this.failReauth(conn, 'ticket store unavailable')
     }
     if (!fresh) return this.failReauth(conn, 'reauth ticket already used')
+    // Doc-status gate (XIN-1739 P2): unlike identityGate/guardMutation/refreshReadAuth,
+    // reauth previously consulted only the epoch provider. Archiving/soft-deleting a
+    // deck bumps NO epoch (see index.ts docStatusProvider), so a reauth on an
+    // archived/soft-deleted deck would otherwise succeed and clear a `terminalClose`
+    // 4404 — resurrecting a socket the deletion guard had condemned. Re-check
+    // doc-status here and fail closed 4404 before adopting any fresh authority.
+    if (this.docStatusProvider) {
+      let deleted: boolean
+      try {
+        deleted = (await this.readDocStatus(conn)) === 'deleted'
+      } catch {
+        deleted = true // fail closed
+      }
+      if (deleted) {
+        if (conn.reauthGraceTimer) {
+          clearTimeout(conn.reauthGraceTimer)
+          conn.reauthGraceTimer = undefined
+        }
+        conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_NOT_FOUND, reason: 'document deleted', refused: 'doc-deleted' } }
+        await this.closeConn(conn, CLOSE_NOT_FOUND, 'document deleted')
+        return
+      }
+    }
     // Re-resolve the LIVE role from the fresh authority exactly as connect does:
     // trust the ticket's role at the current epoch, else re-resolve with the fresh
     // `space_member` claim; fail closed to `none` if re-resolution is impossible.
@@ -1225,7 +1244,19 @@ export class PptRelay {
       await this.closeConn(conn, CLOSE_FORBIDDEN, 'access revoked')
       return false
     }
-    conn.auth = { readAllowed: true, invalidated: false }
+    // A pending re-auth flag is STICKY (XIN-1739 P0-1): a periodic timer refresh
+    // or a `hello`/`need`/`p` must NOT silently clear a socket's awaiting-reauth
+    // state just because its cached role/epoch still validate — the FROZEN
+    // membership claim that put it into pendingReauth is exactly what this path
+    // cannot re-verify (a share expiry bumps no epoch, so the downgrade re-resolve
+    // is skipped and the stale claim would otherwise sail through). Only a fresh
+    // ticket via {@link handleReauth} (or a full epoch re-resolution in
+    // {@link applyEpochBump}) may clear it. Preserving it keeps canPushRead and the
+    // mutation gates failing closed until then, so the grace-timer deadline is real
+    // rather than a no-op the refresh already defused.
+    conn.auth = conn.auth.pendingReauth === true
+      ? { readAllowed: true, invalidated: false, pendingReauth: true }
+      : { readAllowed: true, invalidated: false }
     return true
   }
 
@@ -1237,11 +1268,11 @@ export class PptRelay {
    * one (latest cursor wins) rather than stacking.
    */
   private requestReplay(conn: Conn, since: number, ready: boolean): void {
-    // A drain (`flushingLiveBuffer`) counts as busy just like an in-flight replay:
+    // A drain (`flushDepth > 0`) counts as busy just like an in-flight replay:
     // starting a fresh replay mid-drain could interleave replay ops with the
     // buffered live frames and reorder them (XIN-1739 P1-2). Coalesce to the
     // latest cursor and let the current cutover finish first.
-    if (conn.replayInFlight || conn.flushingLiveBuffer) {
+    if (conn.replayInFlight || conn.flushDepth > 0) {
       conn.replayPending = { since, ready }
       return
     }
@@ -1271,17 +1302,19 @@ export class PptRelay {
     // cursor and that replay flushes.
     if (!ok) return
     // Cutover (XIN-1739 P1-2): drain the live buffer to EMPTY before marking the
-    // connection caught up. While `flushingLiveBuffer` is set, `deliver` buffers new
-    // broadcasts and `requestReplay` coalesces, so live delivery can never bypass
-    // the buffer mid-drain and reorder ops (the `10,12,11` defect). `flushLiveBuffer`
-    // returns only when the buffer is empty, and `caughtUp` is set synchronously
-    // right after — no await between — so no broadcast can slip in unbuffered.
-    conn.flushingLiveBuffer = true
+    // connection caught up. While a drain is in flight (`flushDepth > 0`), `deliver`
+    // buffers new broadcasts and `requestReplay` coalesces, so live delivery can
+    // never bypass the buffer mid-drain and reorder ops (the `10,12,11` defect).
+    // `flushLiveBuffer` returns only when the buffer is empty, and `caughtUp` is set
+    // synchronously right after — no await between — so no broadcast can slip in
+    // unbuffered. The gate is a depth counter, not a boolean, so a concurrent drain
+    // (P1-1) keeps the connection busy for the whole overlap.
+    conn.flushDepth++
     try {
       await this.flushLiveBuffer(conn)
       conn.caughtUp = true
     } finally {
-      conn.flushingLiveBuffer = false
+      conn.flushDepth--
     }
     // A replay requested DURING the drain was coalesced (flushing counted as busy);
     // run it now so the freshly caught-up socket does not sit on a stale cursor.
@@ -1374,10 +1407,9 @@ export class PptRelay {
           fromSeq = snapshot.coveredSeq
           readySeq = snapshot.coveredSeq
           // A snapshot covers all real ops through its coveredSeq; gaps in that
-          // interval are legal no-op holes. Advance the high-water and drop holes
-          // at/below coverage so the holes set stays bounded (XIN-1739 P1-1).
+          // interval are legal no-op holes. Advance the high-water to coverage
+          // (XIN-1739 P1-1).
           conn.observedHighWater = Math.max(conn.observedHighWater, snapshot.coveredSeq)
-          for (const seq of [...conn.observedHoles]) if (seq <= snapshot.coveredSeq) conn.observedHoles.delete(seq)
           delivered = Math.max(delivered, conn.observedHighWater)
         }
         // Highest op seq ACTUALLY delivered, so `ready.q` reports what the client is
@@ -1488,6 +1520,12 @@ export class PptRelay {
    * (possibly downgraded-to-reader) connection is still re-acked (round-7 / D3).
    */
   private async identityGate(conn: Conn): Promise<RefusedCode | null> {
+    // A socket awaiting in-place re-verification can NEITHER read NOR write until
+    // a fresh ticket clears pendingReauth (XIN-1739 P0-1b). `canPushRead` already
+    // blocks the push/read path; block the mutation/re-ack path here too so an
+    // expired share-derived writer cannot harvest a re-ack (or drive a store read)
+    // during the grace window. Gating is otherwise inverted relative to risk.
+    if (conn.auth.pendingReauth === true) return 'forbidden-role'
     if (this.docStatusProvider) {
       try {
         if ((await this.readDocStatus(conn)) === 'deleted') return 'doc-deleted'
@@ -1517,6 +1555,11 @@ export class PptRelay {
    */
   private async guardMutation(conn: Conn, frameEpoch: number, rawBytes: number, maxBytes: number): Promise<RefusedCode | null> {
     if (rawBytes > maxBytes) return 'too-large'
+    // Awaiting re-verification: no write is authorized until a fresh ticket clears
+    // pendingReauth (XIN-1739 P0-1b). Checked before the epoch/role gate so a
+    // share-derived writer whose membership claim expired cannot persist during the
+    // grace window even if its cached role/epoch still nominally validate.
+    if (conn.auth.pendingReauth === true) return 'forbidden-role'
     if (this.docStatusProvider) {
       try {
         if ((await this.readDocStatus(conn)) === 'deleted') return 'doc-deleted'
@@ -1611,7 +1654,12 @@ export class PptRelay {
     }
     if (roleRank(outcome.role) < roleRank(conn.role)) conn.role = outcome.role
     conn.roleEpoch = live
-    conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
+    // Preserve a sticky pendingReauth here too (XIN-1739 P0-1): a downgrade-only
+    // re-resolve validates the role, not the frozen membership claim, so it must
+    // not clear a socket that is still awaiting a fresh ticket.
+    conn.auth = conn.auth.pendingReauth === true
+      ? { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false, pendingReauth: true }
+      : { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
     return false
   }
 
@@ -1665,6 +1713,14 @@ export class PptRelay {
     }
     if (!opsAreValid(frame.ops)) {
       this.refuse(conn, 'protocol-version', { k, frameId, message: 'ops must be an array of whitelisted op kinds' })
+      return
+    }
+    // Reject an EMPTY ops frame (XIN-1739 P2): `opsAreValid([])` is vacuously true
+    // and `k` is optional, so an empty frame would otherwise be durably sequenced
+    // and acked as `k:0` — burning a seq and a ledger row for a no-op. A frame that
+    // carries no ops is not a mutation; refuse it as a protocol error.
+    if (frame.ops.length === 0) {
+      this.refuse(conn, 'protocol-version', { k, frameId, message: 'ops frame must contain at least one op' })
       return
     }
     if (frame.ops.length > this.limits.maxOpsPerFrame) {
@@ -1728,7 +1784,16 @@ export class PptRelay {
       // `k` is echoed back as the ack counter; apply `?? 0` consistently across
       // every ack path so an omitted `k` never lands as `undefined` in the frame
       // (P2-h — parse also refuses a non-integer `k`).
-      this.markObservedSeq(conn, known.seq)
+      //
+      // Do NOT advance the observation high-water here (XIN-1739 P0-2). A re-ack is
+      // an acknowledgement of a frame this connection ALREADY WROTE durably — it is
+      // NOT evidence the connection OBSERVED the op prefix below that seq. A fresh
+      // authored write (below) does advance it, because a caught-up author receives
+      // every lower real op in room order before its own ack; a re-ack has no such
+      // guarantee (it can arrive on a fresh reconnect that resends a pending frame
+      // whose seq was allocated after peers' ops it never received). Advancing on a
+      // re-ack let `replay()` clamp away — and `handleSnap` authorize the prune of —
+      // ops the connection never saw.
       void this.gatedSend(conn, { ctl: 'ack', k: frame.k ?? 0, q: known.seq, snapshotVersion })
       return
     }
@@ -1811,7 +1876,7 @@ export class PptRelay {
 
   private async handleSnap(conn: Conn, frame: SnapFrame, rawBytes: number): Promise<void> {
     const k = typeof frame.k === 'number' ? frame.k : undefined
-    if (!conn.caughtUp || conn.replayInFlight || conn.flushingLiveBuffer) {
+    if (!conn.caughtUp || conn.replayInFlight || conn.flushDepth > 0) {
       this.refuse(conn, 'snapshot-conflict', { k, message: 'snapshot requires a caught-up connection' })
       return
     }

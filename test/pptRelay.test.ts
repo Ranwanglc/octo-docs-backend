@@ -1445,15 +1445,24 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
     expect((await c.closed).code).toBe(4403)
   })
 
-  it('fails a share-membership socket closed after the reauth grace when no fresh ticket arrives (membership removal cannot read indefinitely)', async () => {
-    // XIN-1739 P1-3: the ticket TTL no longer hard-disconnects a share-derived
+  it('fails a share-membership socket closed after the reauth grace — for BOTH read and write — when no fresh ticket arrives, at production timing (authRefreshMs < reauthGraceMs)', async () => {
+    // XIN-1739 P0-1: the ticket TTL no longer hard-disconnects a share-derived
     // socket (the old connect/replay/close loop). It enters pending-reauth and
     // fails closed only if no in-place `reauth` arrives within the grace window —
-    // the SAME security bound (cannot read indefinitely without fresh membership),
-    // enforced by a bounded re-verify window rather than an immediate disconnect.
+    // the SAME security bound (cannot read OR write indefinitely without fresh
+    // membership), enforced by a bounded re-verify window.
+    //
+    // Pinned at PRODUCTION timing: authRefreshMs (100) < reauthGraceMs (1600), so
+    // the periodic read-auth refresh fires 1-2× INSIDE every grace window (the real
+    // default ordering, 5000 < 10000). On head 5fb58629 that refresh silently
+    // cleared `pendingReauth` (its unconditional `conn.auth = { readAllowed:true }`),
+    // so the grace timer fired into a no-op, the socket kept writer authority, and a
+    // write was acked — this test times out / gets an ack instead of a refusal+close.
+    // The old compressed timings (grace 200 < refresh 5000) inverted the ratio so the
+    // refresh never fired in the window and masked the bug.
     const h = await setup({
       roleProvider: async ({ spaceMember }) => (spaceMember ? 'writer' : 'none'),
-      limits: { reauthGraceMs: 200 },
+      limits: { reauthGraceMs: 1600, authRefreshMs: 100 },
     })
     const ticket = jwt.sign({
       uid: 'u_share_ttl',
@@ -1470,6 +1479,17 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
     })
     const c = await h.connect({ uid: 'u_share_ttl', role: 'writer', ticket })
     await helloReady(c)
+    // Wait past the 1s ticket expiry (well inside the 1600ms grace). Several 100ms
+    // read-auth refreshes fire in this interval; on the fixed head they PRESERVE the
+    // now-sticky pending-reauth state instead of clearing it.
+    await sleep(1200)
+    // A write during the grace window is fail-closed (neither read nor write). On
+    // 5fb58629 the refresh had cleared pendingReauth, so this frame was persisted and
+    // acked; the sticky flag + the identity/mutation gate refuse it instead.
+    c.send(OPS_FRAME(1, 'pending-reauth-write', 0))
+    const w = await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')
+    expect(w[w.length - 1]).toMatchObject({ ctl: 'refused', code: 'forbidden-role' })
+    // And the socket fails closed when the grace elapses with no fresh ticket.
     expect((await c.closed).code).toBe(4403)
   })
 
@@ -1856,10 +1876,10 @@ describe('PPT relay: ordering-model redesign (XIN-1739)', () => {
   it('P1-2: a broadcast that arrives mid-flush is buffered and ordered AFTER the buffered ops (no 10,12,11)', async () => {
     // Deterministic cutover race, driven against a fake socket whose drain we gate.
     // The connection is mid-cutover: replay succeeded, buffer holds ops 10 and 11,
-    // and `flushingLiveBuffer` is set. While the flush awaits the drain of op 10, a
-    // live broadcast (op 12) arrives. The pre-fix head set `caughtUp = true` before
-    // the flush finished and did not gate on flushing, so op 12 bypassed the buffer
-    // and enqueued between 10 and 11 → 10,12,11. The flushingLiveBuffer gate buffers
+    // and a drain is in progress (`flushDepth > 0`). While the flush awaits the drain
+    // of op 10, a live broadcast (op 12) arrives. The pre-fix head set `caughtUp = true`
+    // before the flush finished and did not gate on flushing, so op 12 bypassed the
+    // buffer and enqueued between 10 and 11 → 10,12,11. The flush-depth gate buffers
     // it and the drain-until-empty loop emits it last → 10,11,12.
     const relay = new PptRelay({
       store: new InMemoryPptRelayStore(),
@@ -1888,11 +1908,10 @@ describe('PPT relay: ordering-model redesign (XIN-1739)', () => {
       ephemeralFrameTimes: [],
       caughtUp: true, // pre-fix set this true before the flush completed (the bug)
       replayInFlight: false,
-      flushingLiveBuffer: true, // the cutover drain is in progress
+      flushDepth: 1, // the cutover drain is in progress
       replayPending: null,
       liveBuffer: [op(10), op(11)],
       observedHighWater: 9,
-      observedHoles: new Set<number>(),
       liveBufferBytes: 0,
       auth: { readAllowed: true, invalidated: false },
       inboundChain: Promise.resolve(),
@@ -1982,5 +2001,116 @@ describe('PPT relay: ordering-model redesign (XIN-1739)', () => {
     expect(c.ws.readyState).toBe(WebSocket.OPEN)
     c.send({ t: 'reauth', pv: 2, ticket }) // replay of the same jti => rejected
     expect((await c.closed).code).toBe(4403)
+  })
+})
+
+/**
+ * XIN-1748 round-16 blockers: the re-ack watermark regression (P0-2) and the
+ * non-reentrant flush gate (P1-1). Each test FAILS on head 5fb58629 and PASSES on
+ * the fix.
+ */
+describe('PPT relay: round-16 fixes (XIN-1748)', () => {
+  it('P0-2: a re-ack of the connection own durable frame does NOT advance the observation high-water — the un-clamped tail still replays', async () => {
+    const h = await setup()
+    const c = await h.connect({ uid: 'u_reack', role: 'writer' })
+    await helloReady(c) // caught up on an EMPTY room → observedHighWater stays 0
+    // Peers durably commit ops 1..3 this socket never observed (seeded straight into
+    // the store, so no broadcast reaches c) — the optimistic-write-then-drop shape.
+    await h.store.appendOp(DOC, 'f1', OPS_FRAME(1, 'f1'))
+    await h.store.appendOp(DOC, 'f2', OPS_FRAME(2, 'f2'))
+    await h.store.appendOp(DOC, 'f3', OPS_FRAME(3, 'f3'))
+    // c resends a frame already durable (same frameId + payload) — a known duplicate
+    // that re-acks seq 3. On 5fb58629 the re-ack advanced c.observedHighWater to 3.
+    c.send(OPS_FRAME(1, 'f3'))
+    const reack = await c.recvUntil((m) => m.ctl === 'ack')
+    expect(reack[reack.length - 1]).toMatchObject({ ctl: 'ack', q: 3 })
+    // c resyncs from 0: the un-observed tail 1..3 MUST replay. On 5fb58629 the re-ack
+    // clamp (effectiveSince = max(0, 3) = 3) skipped every op → empty replay → the
+    // ops were lost permanently.
+    c.send({ t: 'hello', pv: 2, since: 0 })
+    const replay = await c.recvUntil((m) => m.ctl === 'ready')
+    const ops = replay.filter((m) => m.ctl === 'op').map((m) => m.q)
+    expect(ops).toEqual([1, 2, 3])
+  })
+
+  it('P0-2: a snapshot covering a seq the connection only RE-ACKED (never observed) is refused', async () => {
+    const h = await setup()
+    const c = await h.connect({ uid: 'u_reack2', role: 'writer' })
+    await helloReady(c) // caught up empty → observedHighWater 0
+    await h.store.appendOp(DOC, 'g1', OPS_FRAME(1, 'g1'))
+    await h.store.appendOp(DOC, 'g2', OPS_FRAME(2, 'g2'))
+    await h.store.appendOp(DOC, 'g3', OPS_FRAME(3, 'g3'))
+    c.send(OPS_FRAME(1, 'g3'))
+    expect((await c.recvUntil((m) => m.ctl === 'ack')).at(-1)).toMatchObject({ ctl: 'ack', q: 3 })
+    // c is caught up but has observed NOTHING; a snapshot covering the re-acked seq 3
+    // would prune ops 1..3 it never saw. On 5fb58629 the re-ack had advanced
+    // observedHighWater to 3, so the snap was ACCEPTED and the whole op log pruned.
+    c.send({ t: 'snap', pv: 2, k: 7, epoch: 0, q: 3, doc: deck() })
+    const out = await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')
+    expect(out[out.length - 1]).toMatchObject({ ctl: 'refused', code: 'snapshot-conflict' })
+  })
+
+  it('P1-1: two overlapping cutover drains cannot interleave a live broadcast between buffered frames', async () => {
+    // Deterministic double-drain race against a fake socket whose send we gate — the
+    // shape of `applyEpochBump` concurrent with a `reauth`, or two quick epoch bumps.
+    const relay = new PptRelay({
+      store: new InMemoryPptRelayStore(),
+      epochProvider: async () => 0,
+      limits: { sendHighWaterBytes: 0, sendDrainTimeoutMs: 500 },
+    })
+    const sent: unknown[] = []
+    const fakeSocket = {
+      readyState: WebSocket.OPEN,
+      bufferedAmount: 1, // above the (0) high-water → the first send awaits the drain
+      send: vi.fn((raw: string) => {
+        sent.push(JSON.parse(raw))
+      }),
+      close: vi.fn(),
+    }
+    const op = (q: number) => ({ ctl: 'op' as const, q, frame: OPS_FRAME(q, `l${q}`) })
+    const peer = {
+      socket: fakeSocket,
+      uid: 'u_dd',
+      docId: DOC,
+      documentName: DOCNAME,
+      role: 'reader',
+      roleEpoch: 0,
+      spaceMember: false,
+      frameTimes: [],
+      ephemeralFrameTimes: [],
+      caughtUp: true,
+      replayInFlight: false,
+      // Both field names so this one test runs on head 5fb58629 (boolean
+      // `flushingLiveBuffer`) AND on the fix head (depth counter `flushDepth`).
+      flushingLiveBuffer: false,
+      flushDepth: 0,
+      replayPending: null,
+      liveBuffer: [op(10), op(11)],
+      observedHighWater: 9,
+      observedHoles: new Set<number>(), // present so the test fails on the ORDERING assertion under head 5fb58629's markObservedSeq, not an incidental crash
+      liveBufferBytes: 0,
+      auth: { readAllowed: true, invalidated: false },
+      inboundChain: Promise.resolve(),
+      inboundDepth: 0,
+      outboundChain: Promise.resolve(),
+    }
+    const asAny = relay as unknown as {
+      drainLiveBuffer: (c: unknown) => Promise<void>
+      deliver: (c: unknown, f: unknown) => Promise<void>
+    }
+    // Drain #1 swaps out [10,11] and awaits the gated send of op 10; drain #2 finds an
+    // empty buffer and returns at once. As a boolean, #2's `finally` cleared the flag
+    // while #1 was still awaiting, so op 12 delivered mid-drain bypassed the buffer and
+    // landed between 10 and 11 (10,12,11). As a depth counter the gate stays busy until
+    // BOTH return, so op 12 is buffered and drained last → 10,11,12.
+    const drain1 = asAny.drainLiveBuffer(peer)
+    const drain2 = asAny.drainLiveBuffer(peer)
+    await sleep(20)
+    const deliverP = asAny.deliver(peer, op(12)) // arrives mid-drain → must be buffered
+    await sleep(20)
+    fakeSocket.bufferedAmount = 0 // release the drain
+    await Promise.all([drain1, drain2, deliverP])
+    expect(sent.map((m) => (m as { q?: number }).q)).toEqual([10, 11, 12])
+    relay.close()
   })
 })

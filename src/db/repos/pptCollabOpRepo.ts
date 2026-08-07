@@ -46,23 +46,26 @@ function toOp(row: RawRow): PptCollabOpRow {
 }
 
 /**
- * Bind value for a `LIMIT ?` placeholder.
+ * Validate a LIMIT for INLINING into the SQL text (never bound via `?`).
  *
  * mysql2's prepared-statement path (`conn.execute`) rejects an INTEGER bound to
  * `LIMIT ?` on real MySQL 8 with `ER_WRONG_ARGUMENTS` ("Incorrect arguments to
- * mysqld_stmt_execute"): the paged replay read and `opsSince(..., limit)` both
- * hit it, so durable replay was broken on a real engine (P1-4 / XIN-1740). The
- * in-memory fake routes `execute` through its own model and never saw it. A
- * STRING-bound limit is accepted by the same prepared path and returns the exact
- * same rows an integer would (verified against MySQL 8.0), so bind the page size
- * as a string. Guarded to a non-negative safe integer so a caller can never
- * smuggle non-numeric text into the clause.
+ * mysqld_stmt_execute"): the paged replay read and `opsSince(..., limit)` both hit
+ * it, so durable replay was broken on a real engine (P1-4 / XIN-1740). The
+ * in-memory fake routes `execute` through its own model and never saw it. This
+ * codebase already settled on the fix for the identical bug — INLINE a validated
+ * integer (`LIMIT ${keep}` / `LIMIT ${lim}` in {@link ../repos/docVersionRepo},
+ * asserted by `test/paginationBind.test.ts`), never bind LIMIT via `?`. Adopt the
+ * same convention here so the two paths cannot diverge on driver behaviour.
+ * Guarded to a non-negative safe integer so a caller can never smuggle non-numeric
+ * text into the clause; the returned number is interpolated directly and is absent
+ * from the params array.
  */
-function limitBind(limit: number): string {
+function limitClause(limit: number): number {
   if (!Number.isSafeInteger(limit) || limit < 0) {
     throw new RangeError(`LIMIT must be a non-negative safe integer, got ${limit}`)
   }
-  return String(limit)
+  return limit
 }
 
 export const pptCollabOpRepo = {
@@ -92,8 +95,8 @@ export const pptCollabOpRepo = {
     if (limit !== undefined && limit >= 0) {
       const rows = await query<RawRow>(
         `SELECT seq, frame_id, frame_json FROM ppt_collab_op
-          WHERE doc_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
-        [docId, sinceSeq, limitBind(limit)],
+          WHERE doc_id = ? AND seq > ? ORDER BY seq ASC LIMIT ${limitClause(limit)}`,
+        [docId, sinceSeq],
       )
       return rows.map(toOp)
     }
@@ -114,8 +117,8 @@ export const pptCollabOpRepo = {
     if (limit !== undefined && limit >= 0) {
       const rows = await tx.query<RawRow>(
         `SELECT seq, frame_id, frame_json FROM ppt_collab_op
-          WHERE doc_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
-        [docId, sinceSeq, limitBind(limit)],
+          WHERE doc_id = ? AND seq > ? ORDER BY seq ASC LIMIT ${limitClause(limit)}`,
+        [docId, sinceSeq],
       )
       return rows.map(toOp)
     }
