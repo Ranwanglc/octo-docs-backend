@@ -7,6 +7,7 @@ import type { AddressInfo } from 'node:net'
 import { WebSocket } from 'ws'
 import { PptRelay, type RelayLimits } from '../src/ppt/relay/pptRelay.js'
 import { InMemoryPptRelayStore, type PptRelayStore } from '../src/ppt/relay/store.js'
+import { isRetryable } from '../src/ppt/relay/frames.js'
 import { issuePptCollabToken } from '../src/auth/pptCollabToken.js'
 import type { ResolvedRole, Role } from '../src/permission/role.js'
 import type { BentoDoc } from '../src/ppt/bentoDoc.js'
@@ -99,6 +100,8 @@ async function setup(
     store?: PptRelayStore
     limits?: Partial<RelayLimits>
     roleProvider?: (ctx: { uid: string; docId: string; documentName: string; spaceMember: boolean }) => Promise<ResolvedRole>
+    epochProvider?: (documentName: string) => Promise<number>
+    docStatusProvider?: (docId: string) => Promise<'live' | 'deleted'>
   } = {},
 ): Promise<Harness> {
   const store = opts.store ?? new InMemoryPptRelayStore()
@@ -108,9 +111,9 @@ async function setup(
 
   const relay = new PptRelay({
     store,
-    epochProvider: async () => liveEpoch,
+    epochProvider: opts.epochProvider ?? (async () => liveEpoch),
     roleProvider: opts.roleProvider ?? (async ({ uid }) => roleMap.get(uid) ?? 'writer'),
-    docStatusProvider: async () => docStatus,
+    docStatusProvider: opts.docStatusProvider ?? (async () => docStatus),
     limits: opts.limits,
   })
   const server: HttpServer = createServer()
@@ -1086,17 +1089,59 @@ describe('PPT relay: round-4 fixes (XIN-1660)', () => {
     expect(ready.q).toBe(5)
   })
 
-  it('hardening: a bogus (too-large) resume cursor is clamped, not endorsed back in ready.q', async () => {
+  it('P2-e: a resume cursor above the room high-water is refused (protocol error), not clamped', async () => {
     const store = new InMemoryPptRelayStore()
     for (const f of ['f1', 'f2', 'f3']) await store.appendOp(DOC, f, OPS_FRAME(1, f))
     const h = await setup({ store })
     const c = await h.connect({ uid: 'u1', role: 'writer' })
-    // Client claims to be synced through seq 99999 (bogus). ready.q must report the
-    // REAL high-water (3), never the unvalidated cursor — else the client would skip
-    // every future op below 99999.
-    const { ready, replay } = await helloReady(c, 99999)
-    expect(replay.filter((m) => m.ctl === 'op')).toHaveLength(0)
+    // Client claims to be synced through seq 99999 (above the real high-water 3).
+    // Such a cursor cannot arise legitimately (the counter never regresses), so it
+    // is refused as a protocol error rather than clamped and endorsed back in
+    // ready.q (which would make the client skip every op below it).
+    c.send({ t: 'hello', pv: 2, since: 99999 })
+    expect(await c.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version', retryable: false })
+
+    // A subsequent hello with a valid cursor still replays normally (the refusal
+    // did not wedge the connection).
+    const { ready, replay } = await helloReady(c, 0)
+    expect(replay.filter((m) => m.ctl === 'op').map((m) => m.q)).toEqual([1, 2, 3])
     expect(ready.q).toBe(3)
+  })
+
+  it('P0-1: a snap with a fractional / non-integer q is refused (protocol error), not silently rounded', async () => {
+    const store = new InMemoryPptRelayStore()
+    const h = await setup({ store })
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+    // Commit op seq 1, then op seq 2.
+    w.send(OPS_FRAME(1, 'op1'))
+    expect((await w.recv()).q).toBe(1)
+    w.send(OPS_FRAME(2, 'op2'))
+    expect((await w.recv()).q).toBe(2)
+
+    // A snapshot with a FRACTIONAL covered seq (q=1.5). Before the fix this passed
+    // the number guards and MySQL rounded it to 2, pruning op 2 while the doc only
+    // covered op 1 — silently destroying a co-editor's committed op. It must be
+    // refused as a protocol error up front.
+    w.send({ t: 'snap', pv: 2, k: 9, epoch: 0, q: 1.5, doc: deck() })
+    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version', retryable: false })
+
+    // Op 2 survives: a fresh joiner still replays it (never pruned by the bad snap).
+    const joiner = await h.connect({ uid: 'u_j', role: 'writer' })
+    const { replay } = await helloReady(joiner, 0)
+    expect(replay.filter((m) => m.ctl === 'op').map((m) => m.q)).toContain(2)
+  })
+
+  it('P0-1/P2-h: an over-length frameId and a non-integer k are refused at parse (protocol error)', async () => {
+    const h = await setup()
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+    // frameId longer than the VARCHAR(64) dedup column.
+    w.send({ ...OPS_FRAME(1, 'x'.repeat(65)) })
+    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version', retryable: false })
+    // Non-integer frame counter k.
+    w.send({ t: 'ops', pv: 2, k: 1.5, frameId: 'kfrac', epoch: 0, ops: [{ kind: 'set', key: 's1e1', prop: 'x', value: 1 }] })
+    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version', retryable: false })
   })
 
   it('hardening: an upgrade on a non-relay path is rejected (socket destroyed)', async () => {
@@ -1109,5 +1154,113 @@ describe('PPT relay: round-4 fixes (XIN-1660)', () => {
     const c = await h.connect({ uid: 'u1', role: 'writer' })
     expect(c.ws.protocol).toBe('ppt-relay')
     c.close()
+  })
+})
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * XIN-1693 round-6 blockers: read-path authz (P1-2), read-path membership
+ * fail-close (P1-6), the handshake listener race (Jerry-Xin), replay coalescing
+ * (P1-3), and the live-frame buffering that keeps replay idempotent (P1-4).
+ */
+describe('PPT relay: round-6 fixes (XIN-1693)', () => {
+  it('P1-5: storage-retry is a retryable refusal code; storage-failed stays permanent', () => {
+    expect(isRetryable('storage-retry')).toBe(true)
+    expect(isRetryable('rate-limited')).toBe(true)
+    expect(isRetryable('storage-failed')).toBe(false)
+  })
+
+  it('P1-2: hello on a soft-deleted doc is refused doc-deleted + closed 4404, not served', async () => {
+    const h = await setup()
+    const c = await h.connect({ uid: 'u_r', role: 'reader' })
+    await helloReady(c) // healthy while live
+    h.setDocStatus('deleted')
+    c.send({ t: 'hello', pv: 2, since: 0 })
+    expect(await c.recv()).toMatchObject({ ctl: 'refused', code: 'doc-deleted' })
+    expect((await c.closed).code).toBe(4404)
+  })
+
+  it('P1-2: hello on a connection revoked (role -> none) after an epoch bump is refused + closed 4403', async () => {
+    const h = await setup()
+    const c = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(c)
+    // Revoke after connect: the live epoch advances and the role resolves to none.
+    h.setRole('u_w', 'none')
+    h.setEpoch(1)
+    c.send({ t: 'hello', pv: 2, since: 0 })
+    expect(await c.recv()).toMatchObject({ ctl: 'refused', code: 'forbidden-role' })
+    expect((await c.closed).code).toBe(4403)
+  })
+
+  it('P1-6: the read path fail-closes (4403) when a frozen space-membership claim becomes load-bearing after an epoch bump', async () => {
+    // Share writer: writer ONLY via the space_member claim (no direct role).
+    const h = await setup({
+      roleProvider: async ({ spaceMember }) => (spaceMember ? 'writer' : 'none'),
+    })
+    const ticket = issuePptCollabToken({
+      uid: 'u_share',
+      docId: DOC,
+      documentName: DOCNAME,
+      role: 'writer',
+      permission_epoch: 0,
+      snapshotVersion: 0,
+      spaceMember: true,
+    }).ticket
+    const c = await h.connect({ uid: 'u_share', role: 'writer', ticket })
+    await helloReady(c) // connect-time trusts the fresh claim (B6)
+    // An epoch bump ages the frozen claim. The relay cannot re-derive fresh
+    // membership on a live socket, and the claim is load-bearing (writer WITH it,
+    // none WITHOUT), so the read path fails closed rather than trust it (P1-6).
+    h.setEpoch(1)
+    c.send({ t: 'hello', pv: 2, since: 0 })
+    expect((await c.closed).code).toBe(4403)
+  })
+
+  it('Jerry-Xin: a hello sent immediately after open (during the async handshake) is not lost', async () => {
+    // A slow epoch lookup widens the handshake window. `ws` does not buffer frames
+    // before a `message` listener exists, so before the fix (listeners attached
+    // AFTER the awaits) a hello sent right after open was dropped -> silent hang.
+    const h = await setup({ epochProvider: async () => { await sleep(60); return 0 } })
+    const c = await h.connect({ uid: 'u1', role: 'writer' })
+    c.send({ t: 'hello', pv: 2, since: 0 }) // fired while the handshake is still awaiting
+    const ready = await c.recvUntil((m) => m.ctl === 'ready')
+    expect(ready[ready.length - 1]).toMatchObject({ ctl: 'ready' })
+  })
+
+  it('P1-3: a burst of hello frames coalesces into at most one in-flight + one queued replay', async () => {
+    class CountingReplayStore extends InMemoryPptRelayStore {
+      replayCalls = 0
+      override async readReplay(docId: string, since: number): ReturnType<InMemoryPptRelayStore['readReplay']> {
+        this.replayCalls++
+        await sleep(25) // hold the replay so the burst overlaps it
+        return super.readReplay(docId, since)
+      }
+    }
+    const store = new CountingReplayStore()
+    const h = await setup({ store })
+    const c = await h.connect({ uid: 'u1', role: 'writer' })
+    for (let i = 0; i < 10; i++) c.send({ t: 'hello', pv: 2, since: 0 })
+    await sleep(200)
+    // 1 replay runs immediately; the other 9 collapse into a single queued replay.
+    expect(store.replayCalls).toBeLessThanOrEqual(2)
+    expect(store.replayCalls).toBeGreaterThanOrEqual(1)
+  })
+
+  it('P1-4: a peer op that arrives before a joiner has replayed is delivered exactly once (buffered, deduped)', async () => {
+    const h = await setup()
+    // Joiner connects (joins the room) but does NOT replay yet.
+    const joiner = await h.connect({ uid: 'u_j', role: 'writer' })
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    await helloReady(a)
+    // A's op is broadcast to the joiner while the joiner is not caught up -> buffered.
+    a.send(OPS_FRAME(1, 'op1'))
+    expect((await a.recv()).q).toBe(1)
+    // The joiner now replays: it must receive op1 ONCE (from the replay), and the
+    // buffered live copy is deduped on flush — never delivered a second time.
+    const { replay } = await helloReady(joiner, 0)
+    expect(replay.filter((m) => m.ctl === 'op').map((m) => m.q)).toEqual([1])
+    // No duplicate op arrives after `ready`.
+    await expect(joiner.recv(150)).rejects.toThrow()
   })
 })

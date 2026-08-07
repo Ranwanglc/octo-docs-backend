@@ -395,6 +395,15 @@ CREATE TABLE ppt_collab_seq (
 -- mapping OUTLIVES the op row: a snapshot prunes ppt_collab_op with a plain DELETE,
 -- but this ledger is never pruned, so a re-send of a pruned frame still re-acks its
 -- ORIGINAL seq instead of being minted a fresh one and rebroadcast.
+--
+-- INVARIANT (ledger ⊇ op rows): this ledger is a SUPERSET of the (doc_id, frame_id)
+-- pairs in ppt_collab_op — every persisted op has a ledger row (written at append
+-- time, and backfilled for pre-existing rows by
+-- 2026-08-07-backfill-ppt-collab-frame-ledger.sql), and the ledger additionally
+-- retains mappings whose op rows were pruned. A future retention job on this table
+-- MUST preserve it: only a mapping whose op row is already gone AND subsumed by a
+-- durable snapshot may be dropped, never one whose op row is still live — otherwise
+-- a live resend re-mints a fresh seq and rebroadcasts a duplicate (XIN-1693 P1-1).
 CREATE TABLE ppt_collab_frame (
   doc_id      VARCHAR(64) NOT NULL,                        -- FK-by-convention to doc_meta.doc_id (html_ppt row)
   frame_id    VARCHAR(64) NOT NULL,                        -- globally-unique Bento frame id (dedup key)

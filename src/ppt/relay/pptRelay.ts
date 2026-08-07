@@ -23,7 +23,7 @@
 import type { IncomingMessage } from 'node:http'
 import type { Server as HttpServer } from 'node:http'
 import type { Duplex } from 'node:stream'
-import { WebSocketServer, type WebSocket } from 'ws'
+import { WebSocketServer, WebSocket } from 'ws'
 import { config } from '../../config/env.js'
 import { roleAtLeast, roleRank, type ResolvedRole } from '../../permission/role.js'
 import { isBentoDoc, type BentoDoc } from '../bentoDoc.js'
@@ -36,7 +36,7 @@ import {
   type RefusedCode,
   type ServerFrame,
 } from './frames.js'
-import type { PptRelayStore, RelaySnapshot } from './store.js'
+import { isRetryableStorageError, RetryableStorageError, type PptRelayStore, type RelaySnapshot, type ReplayView } from './store.js'
 import {
   verifyPptRelayTicket,
   InMemoryTicketStore,
@@ -62,6 +62,12 @@ export interface RelayLimits {
   maxEphemeralFrameBytes: number
   /** Max op rows read per replay batch (bounds replay memory). */
   replayPageSize: number
+  /**
+   * Socket `bufferedAmount` (bytes) above which replay pauses before sending the
+   * next frame, so one slow/greedy consumer cannot make the relay buffer an
+   * unbounded backlog in kernel/userspace send queues (XIN-1693 P1-3).
+   */
+  sendHighWaterBytes: number
 }
 
 function defaultLimits(): RelayLimits {
@@ -75,7 +81,24 @@ function defaultLimits(): RelayLimits {
     maxRoomFrameBytes: r.maxRoomFrameBytes,
     maxEphemeralFrameBytes: r.maxEphemeralFrameBytes,
     replayPageSize: r.replayPageSize,
+    sendHighWaterBytes: r.sendHighWaterBytes,
   }
+}
+
+/** Max client frames buffered during the pre-auth handshake window before they
+ * are dropped (a flood before auth cannot grow memory unbounded, XIN-1693). */
+const MAX_PREAUTH_FRAMES = 16
+/** Max live frames buffered per connection until its replay reaches a stable
+ * boundary; beyond this the client must resync via reconnect (XIN-1693 P1-4). */
+const MAX_LIVE_BUFFER_FRAMES = 4096
+/** Max time (ms) replay waits for a congested socket to drain before proceeding. */
+const MAX_SEND_DRAIN_MS = 5000
+/** Poll interval (ms) while waiting for the socket send buffer to drain. */
+const SEND_DRAIN_POLL_MS = 5
+
+/** Await `ms`, resolving via a timer. */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 /**
@@ -138,6 +161,26 @@ interface Conn {
    * neither consumes the op budget nor is masked by it (XIN-1660 hardening).
    */
   ephemeralFrameTimes: number[]
+  /**
+   * True once this connection's first replay reached a stable boundary. Until
+   * then — and while any replay is in flight — a peer's live op/presence frame is
+   * BUFFERED (see {@link liveBuffer}) instead of delivered, so a peer op is never
+   * delivered live AND again from the replay's op log (non-idempotent for the
+   * ins/txt RGA), which would diverge the doc permanently (XIN-1693 P1-4).
+   */
+  caughtUp: boolean
+  /** A replay is currently streaming to this connection (XIN-1693 P1-3). */
+  replayInFlight: boolean
+  /**
+   * A coalesced pending replay request (latest wins) captured while one was in
+   * flight. At most one replay runs and at most one is queued per connection, so a
+   * `hello`/`need` burst cannot fan out into N concurrent snapshot reads (P1-3).
+   */
+  replayPending: { since: number; ready: boolean } | null
+  /** Live frames buffered while this connection is not yet caught up (P1-4). */
+  liveBuffer: ServerFrame[]
+  /** Highest op seq already delivered to this connection (dedup on buffer flush). */
+  lastDelivered: number
 }
 
 function send(socket: WebSocket, frame: ServerFrame): void {
@@ -246,6 +289,34 @@ export class PptRelay {
 
   /** Test seam: drive a connection directly against an already-open socket. */
   async onConnection(socket: WebSocket, req: IncomingMessage): Promise<void> {
+    // Handshake listener race (Jerry-Xin round-5): `ws` does NOT buffer inbound
+    // messages before a `message` listener exists, and the handshake below has
+    // several awaits (ticket consume, doc-status, epoch, role — Redis/DB-backed in
+    // prod). Register `message`/`close`/`error` handlers SYNCHRONOUSLY, before the
+    // first await, so a client `hello` sent immediately after `open` is buffered
+    // (not lost -> silent hang) and an early `close` is observed (so we never
+    // `addToRoom` a socket that already went away). Frames received before auth
+    // completes are queued and drained in order once `conn` is live.
+    let conn: Conn | null = null
+    let earlyClosed = false
+    const preauth: string[] = []
+    const onData = (data: unknown): void => {
+      const raw = typeof data === 'string' ? data : String(data)
+      if (conn) {
+        void this.onMessage(conn, raw)
+        return
+      }
+      if (preauth.length < MAX_PREAUTH_FRAMES) preauth.push(raw)
+      // else: pre-auth flood — drop; the client gets no `ready` and can reconnect.
+    }
+    const onGone = (): void => {
+      earlyClosed = true
+      if (conn) this.removeFromRoom(conn)
+    }
+    socket.on('message', onData)
+    socket.on('close', onGone)
+    socket.on('error', onGone)
+
     const ticket = extractTicket(req)
     if (!ticket) {
       socket.close(CLOSE_UNAUTHORIZED, 'missing ticket')
@@ -309,6 +380,15 @@ export class PptRelay {
         socket.close(CLOSE_UNAUTHORIZED, 'stale ticket epoch')
         return
       }
+      // At CONNECT the ticket's `space_member` claim is the FRESHEST membership
+      // signal available (minted seconds ago at issuance, within the short ticket
+      // TTL), so it is trusted as-is here — a legitimate `anyone_in_space` share
+      // writer whose epoch bumped between issuance and connect must re-resolve to
+      // writer, not be revoked (B6 / P1-7). The P1-6 fail-closed membership recheck
+      // applies only LATER, once the claim has aged across an epoch bump (see
+      // {@link refreshRoleDownOnly} / {@link applyEpochBump}): there the client can
+      // re-mint to refresh the claim, whereas failing closed at connect would
+      // deadlock a share writer that just presented a valid fresh ticket.
       try {
         role = await this.roleProvider({
           uid: claims.uid,
@@ -325,7 +405,11 @@ export class PptRelay {
       }
     }
 
-    const conn: Conn = {
+    // If the socket already closed during the async handshake window, do NOT join
+    // the room (Jerry-Xin: never `addToRoom` a closed socket).
+    if (earlyClosed || socket.readyState !== WebSocket.OPEN) return
+
+    conn = {
       socket,
       uid: claims.uid,
       docId: claims.docId,
@@ -337,15 +421,17 @@ export class PptRelay {
       spaceMember,
       frameTimes: [],
       ephemeralFrameTimes: [],
+      caughtUp: false,
+      replayInFlight: false,
+      replayPending: null,
+      liveBuffer: [],
+      lastDelivered: 0,
     }
     this.addToRoom(conn)
-
-    socket.on('message', (data: unknown) => {
-      const raw = typeof data === 'string' ? data : String(data)
-      void this.onMessage(conn, raw)
-    })
-    socket.on('close', () => this.removeFromRoom(conn))
-    socket.on('error', () => this.removeFromRoom(conn))
+    // Drain frames buffered before auth completed, in receipt order. No `await`
+    // runs between assigning `conn` and this loop, so no `onData` callback can
+    // interleave and reorder ahead of the queued frames.
+    for (const raw of preauth) void this.onMessage(conn, raw)
   }
 
   private addToRoom(conn: Conn): void {
@@ -375,8 +461,65 @@ export class PptRelay {
     if (!room) return
     for (const peer of room) {
       if (peer === conn) continue // sender never echoes its own op
-      send(peer.socket, frame)
+      this.deliver(peer, frame)
     }
+  }
+
+  /**
+   * Deliver a live frame to one peer, BUFFERING it while that peer has not yet
+   * caught up (its first replay has not reached a stable boundary, or a replay is
+   * in flight). This is the P1-4 fix: a peer that joined the room before replaying
+   * must not receive an op live AND again from its replay's op log — the ins/txt
+   * RGA is non-idempotent, so a double-apply diverges the doc permanently. The
+   * buffer is bounded; a peer that never catches up drops overflow and must resync
+   * via reconnect rather than grow memory unbounded.
+   */
+  private deliver(peer: Conn, frame: ServerFrame): void {
+    if (!peer.caughtUp || peer.replayInFlight) {
+      if (peer.liveBuffer.length < MAX_LIVE_BUFFER_FRAMES) peer.liveBuffer.push(frame)
+      return
+    }
+    send(peer.socket, frame)
+  }
+
+  /**
+   * Flush a connection's buffered live frames once its replay has caught up.
+   * Op frames whose seq the replay already delivered are dropped (dedup on
+   * `lastDelivered`), so an op buffered during replay that the replay also
+   * streamed is delivered exactly once (P1-4).
+   */
+  private flushLiveBuffer(conn: Conn): void {
+    if (conn.liveBuffer.length === 0) return
+    const buffered = conn.liveBuffer
+    conn.liveBuffer = []
+    for (const frame of buffered) {
+      if (frame.ctl === 'op') {
+        if (frame.q <= conn.lastDelivered) continue
+        conn.lastDelivered = frame.q
+      }
+      send(conn.socket, frame)
+    }
+  }
+
+  /**
+   * Send a replay frame, PAUSING first while the socket's send buffer is over the
+   * high-water mark so a slow/greedy consumer cannot make the relay accumulate an
+   * unbounded backlog (XIN-1693 P1-3). Bounded by {@link MAX_SEND_DRAIN_MS} so a
+   * wedged client cannot stall replay forever; on a closed socket it is a no-op.
+   */
+  private async gatedSend(conn: Conn, frame: ServerFrame): Promise<void> {
+    const socket = conn.socket
+    let waited = 0
+    while (
+      socket.readyState === WebSocket.OPEN &&
+      socket.bufferedAmount > this.limits.sendHighWaterBytes &&
+      waited < MAX_SEND_DRAIN_MS
+    ) {
+      await delay(SEND_DRAIN_POLL_MS)
+      waited += SEND_DRAIN_POLL_MS
+    }
+    if (socket.readyState !== WebSocket.OPEN) return
+    send(socket, frame)
   }
 
   /**
@@ -389,7 +532,14 @@ export class PptRelay {
    */
   private runSerialized(docId: string, task: () => Promise<void>): Promise<void> {
     const prev = this.roomChains.get(docId) ?? Promise.resolve()
-    const run = prev.then(task, task).catch(() => {})
+    const run = prev.then(task, task).catch((err) => {
+      // A handler owns its own client-facing error surfacing (via `refuse`); this
+      // tail only guards the CHAIN so one frame's failure cannot stall the room's
+      // queue. A throw reaching here is unexpected — log it rather than silently
+      // discard, so a latent handler bug is observable (XIN-1693 P2-j).
+      // eslint-disable-next-line no-console
+      console.warn('[ppt-relay] serialized frame handler threw:', err)
+    })
     this.roomChains.set(docId, run)
     void run.then(() => {
       if (this.roomChains.get(docId) === run) this.roomChains.delete(docId)
@@ -455,14 +605,19 @@ export class PptRelay {
     switch (frame.t) {
       case 'hello':
         if (this.enforceEphemeralLimits(conn, rawBytes)) return
-        await this.replay(conn, typeof frame.since === 'number' ? frame.since : 0)
+        if (!(await this.authorizeRead(conn))) return
+        this.requestReplay(conn, typeof frame.since === 'number' ? frame.since : 0, /* ready */ true)
         return
       case 'need':
         if (this.enforceEphemeralLimits(conn, rawBytes)) return
-        await this.replay(conn, typeof frame.since === 'number' ? frame.since : 0, /* ready */ false)
+        if (!(await this.authorizeRead(conn))) return
+        this.requestReplay(conn, typeof frame.since === 'number' ? frame.since : 0, /* ready */ false)
         return
       case 'p':
         if (this.enforceEphemeralLimits(conn, rawBytes)) return
+        // A revoked/soft-deleted/downgraded-to-none reader must not broadcast
+        // presence either — gate `p` with the same read-path authz (P1-2).
+        if (!(await this.authorizeRead(conn))) return
         this.broadcast(conn, { ctl: 'presence', uid: conn.uid, ...(conn.name ? { name: conn.name } : {}), presence: (frame as { presence?: unknown }).presence })
         return
       case 'bye':
@@ -489,88 +644,200 @@ export class PptRelay {
   }
 
   /**
+   * Read-path authorization for `hello`/`need`/`p` (§7.3 / XIN-1693 P1-2).
+   *
+   * `replay()` used to serve the full snapshot + op log after only a handshake
+   * ticket check, so a reader revoked or soft-deleted AFTER connect kept receiving
+   * state for the whole socket lifetime (unbounded by the ticket TTL). Give the
+   * read path the SAME doc-status / epoch / role gate `guardMutation` enforces on
+   * `ops`/`snap`: a deleted doc closes 4404, a revoked (`none`) role closes 4403,
+   * and a stale epoch triggers a downgrade-only re-resolution (with the P1-6
+   * share-membership fail-closed check). Returns false when the connection was
+   * refused/closed (the caller must not proceed).
+   */
+  private async authorizeRead(conn: Conn): Promise<boolean> {
+    if (conn.socket.readyState !== WebSocket.OPEN) return false
+    if (this.docStatusProvider) {
+      let deleted: boolean
+      try {
+        deleted = (await this.docStatusProvider(conn.docId)) === 'deleted'
+      } catch {
+        deleted = true // fail closed
+      }
+      if (deleted) {
+        this.refuse(conn, 'doc-deleted', { message: 'document deleted' })
+        conn.socket.close(CLOSE_NOT_FOUND, 'document deleted')
+        this.removeFromRoom(conn)
+        return false
+      }
+    }
+    let live: number
+    try {
+      live = await this.epochProvider(conn.documentName)
+    } catch {
+      // Unconfirmable epoch on the read path: fail closed rather than serve state.
+      this.refuse(conn, 'doc-deleted', { message: 'document unavailable' })
+      conn.socket.close(CLOSE_NOT_FOUND, 'document unavailable')
+      this.removeFromRoom(conn)
+      return false
+    }
+    if (conn.roleEpoch !== live) {
+      const closed = await this.refreshRoleDownOnly(conn, live)
+      if (closed) return false
+    }
+    if (!roleAtLeast(conn.role, 'reader')) {
+      this.refuse(conn, 'forbidden-role', { message: 'access revoked' })
+      conn.socket.close(CLOSE_FORBIDDEN, 'access revoked')
+      this.removeFromRoom(conn)
+      return false
+    }
+    return true
+  }
+
+  /**
+   * Request a replay, coalescing bursts so at most ONE replay runs and at most one
+   * is queued per connection (XIN-1693 P1-3). `onMessage` is fire-and-forget, so
+   * without this a 50-`hello` burst would fan out into 50 concurrent snapshot
+   * reads. A request arriving while a replay is in flight overwrites the pending
+   * one (latest cursor wins) rather than stacking.
+   */
+  private requestReplay(conn: Conn, since: number, ready: boolean): void {
+    if (conn.replayInFlight) {
+      conn.replayPending = { since, ready }
+      return
+    }
+    conn.replayInFlight = true
+    void this.runReplay(conn, since, ready)
+  }
+
+  /** Drive one replay, then either run a coalesced pending one or, once none
+   * remains, mark the connection caught up and flush its buffered live frames. */
+  private async runReplay(conn: Conn, since: number, ready: boolean): Promise<void> {
+    let ok = false
+    try {
+      ok = await this.replay(conn, since, ready)
+    } catch {
+      ok = false
+    }
+    conn.replayInFlight = false
+    const pending = conn.replayPending
+    conn.replayPending = null
+    if (pending && conn.socket.readyState === WebSocket.OPEN) {
+      conn.replayInFlight = true
+      void this.runReplay(conn, pending.since, pending.ready)
+      return
+    }
+    // Only a SUCCESSFUL replay establishes the caught-up boundary. A refused
+    // replay (e.g. a bogus cursor) leaves the connection buffering so it does not
+    // receive live ops with no base state; the client re-hello's with a valid
+    // cursor and that replay flushes.
+    if (ok) {
+      conn.caughtUp = true
+      this.flushLiveBuffer(conn)
+    }
+  }
+
+  /**
    * Replay `snapshot -> ops since q -> ready` (§7.3). `need` omits the ready.
+   * Returns true when the replay completed successfully (the caller then marks the
+   * connection caught up and flushes buffered live frames), false on a refusal.
    *
    * `since` is an OP-SEQUENCE cursor, NOT a snapshot version (XIN-1655 C5): the
    * client resumes from the highest op seq it has already applied — 0 on a fresh
    * join, or the last `ready.q`/`op.q`/`ack.q` it saw on a reconnect. The
    * `snapshotVersion` the collab-token hands the client is a version TAG for
-   * change detection, never a replay cursor; conflating the two would skip ops
-   * whenever the version counter and the covered op-seq diverge.
+   * change detection, never a replay cursor.
    *
-   * `since` is client-supplied and unvalidated, so it is CLAMPED to the room's real
-   * high-water (`currentSeq`) before use: a bogus/oversized cursor would otherwise
-   * be endorsed straight back in `ready.q`, making the client believe it is synced
-   * through a seq that does not exist and skip every future op below it (XIN-1660).
+   * `since` is client-supplied. A cursor ABOVE the room high-water cannot arise
+   * legitimately (the counter never regresses), so it is REFUSED as a protocol
+   * error rather than clamped — clamping would endorse a non-existent boundary
+   * back in `ready.q` and make the client skip every op below it (XIN-1693 P2-e).
    *
-   * A store failure here must never leave the client hanging with neither `ready`
-   * nor `refused` (§7.3 "never a silent drop"): the whole replay is wrapped so a
-   * failure surfaces a permanent `storage-failed` refusal and closes the socket
-   * (XIN-1655 C4).
+   * The high-water, snapshot, and op tail are read as ONE consistent view
+   * ({@link PptRelayStore.readReplay}) so a concurrent `snap`+prune cannot slip
+   * between them and leave a reader with neither the snapshot nor the pruned ops
+   * (XIN-1693 P1-4). A store failure surfaces a `storage-failed` refusal + close,
+   * never a silent hang (XIN-1655 C4). Replay sends are backpressure-gated (P1-3).
    */
-  private async replay(conn: Conn, rawSince: number, ready = true): Promise<void> {
+  private async replay(conn: Conn, rawSince: number, ready = true): Promise<boolean> {
+    let view: ReplayView
     try {
-      // Clamp the client-supplied cursor to the real delivered boundary: it can
-      // never legitimately exceed the highest seq the room ever assigned.
-      const highWater = await this.store.currentSeq(conn.docId)
-      const since = Math.max(0, Math.min(rawSince, highWater))
-      const snap = await this.store.getSnapshot(conn.docId)
-      let fromSeq = since
+      view = this.store.readReplay
+        ? await this.store.readReplay(conn.docId, rawSince, this.limits.replayPageSize)
+        : await this.composeReplayView(conn.docId, rawSince)
+    } catch {
+      this.refuse(conn, 'storage-failed', { message: 'replay failed' })
+      conn.socket.close(CLOSE_UNAVAILABLE, 'replay failed')
+      return false
+    }
+    const { highWater, snapshot, ops } = view
+    if (rawSince > highWater) {
+      this.refuse(conn, 'protocol-version', { message: 'resume cursor exceeds room high-water' })
+      return false
+    }
+    try {
+      let fromSeq = rawSince
       // Only send the snapshot to a peer behind it; an already-synced peer is not
       // forced to reapply it (PPT-COLLAB-003).
-      if (snap && since < snap.coveredSeq) {
-        send(conn.socket, { ctl: 'snapshot', snapshotVersion: snap.snapshotVersion, doc: snap.doc })
-        fromSeq = snap.coveredSeq
+      if (snapshot && rawSince < snapshot.coveredSeq) {
+        await this.gatedSend(conn, { ctl: 'snapshot', snapshotVersion: snapshot.snapshotVersion, doc: snapshot.doc })
+        fromSeq = snapshot.coveredSeq
       }
-      // Track the highest op seq ACTUALLY delivered in this replay so `ready.q`
-      // reports what the client is truly synced through — not the counter
-      // high-water (XIN-1655 C6). The floor is `fromSeq`: after a snapshot the
-      // client is synced through `coveredSeq` even when no tail op follows; on a
-      // plain resume it is already synced through `since`.
-      //
-      // Ops are streamed in bounded PAGES so a huge backlog is never read
-      // unbounded into memory (XIN-1660 hardening): fetch up to `replayPageSize`
-      // rows past the cursor, send them, advance the cursor, and stop when a short
-      // page signals the tail.
+      // Highest op seq ACTUALLY delivered, so `ready.q` reports what the client is
+      // truly synced through, not the counter high-water (XIN-1655 C6).
       let delivered = fromSeq
-      let cursor = fromSeq
-      const pageSize = this.limits.replayPageSize
-      for (;;) {
-        const page = await this.store.opsSince(conn.docId, cursor, pageSize)
-        for (const op of page) {
-          send(conn.socket, { ctl: 'op', q: op.seq, frame: op.frame })
-          delivered = op.seq
-          cursor = op.seq
-        }
-        if (page.length < pageSize) break
+      for (const op of ops) {
+        if (op.seq <= fromSeq) continue
+        await this.gatedSend(conn, { ctl: 'op', q: op.seq, frame: op.frame })
+        delivered = op.seq
       }
+      conn.lastDelivered = Math.max(conn.lastDelivered, delivered)
       if (ready) {
         // Fallback is the connection's last-known LIVE epoch (validated at
         // handshake), NOT the snapshot version — stamping a snapshot counter as an
         // epoch would make every subsequent mutation fail `stale-epoch` with no
-        // recovery. If the provider is momentarily down we surface the last real
-        // epoch; a mutating frame re-checks the live epoch anyway.
+        // recovery.
         let epoch = conn.roleEpoch
         try {
           epoch = await this.epochProvider(conn.documentName)
         } catch {
           /* keep replay usable with the last-known epoch; mutation re-checks */
         }
-        send(conn.socket, {
+        await this.gatedSend(conn, {
           ctl: 'ready',
           q: delivered,
-          snapshotVersion: snap?.snapshotVersion ?? 0,
+          snapshotVersion: snapshot?.snapshotVersion ?? 0,
           epoch,
           role: conn.role,
         })
       }
+      return true
     } catch {
-      // A store failure on replay is a permanent refusal, surfaced then closed —
-      // never a silent hang (XIN-1655 C4). The client re-mints a ticket and
-      // reconnects to retry replay.
       this.refuse(conn, 'storage-failed', { message: 'replay failed' })
       conn.socket.close(CLOSE_UNAVAILABLE, 'replay failed')
+      return false
     }
+  }
+
+  /**
+   * Fallback replay view for a store that does not implement the atomic
+   * {@link PptRelayStore.readReplay} seam: compose the individual reads (paged) as
+   * the pre-P1-4 code did. Production ({@link DbPptRelayStore}) and the in-memory
+   * store both provide `readReplay`, so this only serves bespoke test doubles.
+   */
+  private async composeReplayView(docId: string, sinceSeq: number): Promise<ReplayView> {
+    const highWater = await this.store.currentSeq(docId)
+    const snapshot = await this.store.getSnapshot(docId)
+    const ops: ReplayView['ops'] = []
+    const pageSize = this.limits.replayPageSize
+    let cursor = sinceSeq
+    for (;;) {
+      const page = await this.store.opsSince(docId, cursor, pageSize)
+      for (const op of page) ops.push(op)
+      if (page.length < pageSize) break
+      cursor = page[page.length - 1]!.seq
+    }
+    return { highWater, snapshot, ops }
   }
 
   /**
@@ -606,7 +873,7 @@ export class PptRelay {
     // apply DOWNGRADES only — an upgrade still requires a fresh ticket
     // (PPT-EPOCH-003) — failing closed to `none` when re-resolution is impossible.
     if (conn.roleEpoch !== live) {
-      await this.refreshRoleDownOnly(conn, live)
+      if (await this.refreshRoleDownOnly(conn, live)) return 'forbidden-role'
     }
     // Only writer/admin may persist; a reader/commenter (or a downgraded socket
     // at the current epoch) is refused `forbidden-role`.
@@ -615,29 +882,67 @@ export class PptRelay {
   }
 
   /**
+   * Re-resolve a connection's EFFECTIVE role, with the P1-6 share-membership
+   * fail-closed check baked in. The relay holds no octo session token on a live
+   * socket, so it cannot re-derive fresh space membership — it only has the
+   * `space_member` claim FROZEN at ticket issuance. If a connection's authority
+   * currently DEPENDS on that frozen claim (its role WITH the claim differs from
+   * its role WITHOUT it, i.e. an `anyone_in_space` share grant is load-bearing),
+   * the claim can no longer be trusted and we signal the caller to fail closed
+   * (close the socket) so the client re-presents fresh membership via a new
+   * ticket. When the claim is NOT load-bearing (direct role dominates, or the
+   * connection never carried a membership claim) the claim-independent role is
+   * authoritative and returned. `share_scope`/`share_role` are still read FRESH by
+   * the provider, so a scope narrowing tightens immediately either way.
+   */
+  private async recheckRole(
+    ctx: RoleResolutionContext,
+  ): Promise<{ kind: 'role'; role: ResolvedRole } | { kind: 'close-membership' }> {
+    if (!this.roleProvider) return { kind: 'role', role: 'none' }
+    let withClaim: ResolvedRole
+    try {
+      withClaim = await this.roleProvider(ctx)
+    } catch {
+      return { kind: 'role', role: 'none' }
+    }
+    // Without a space-membership claim the share grant contributes nothing, so the
+    // frozen claim can never be load-bearing — skip the second resolve.
+    if (!ctx.spaceMember) return { kind: 'role', role: withClaim }
+    let withoutClaim: ResolvedRole
+    try {
+      withoutClaim = await this.roleProvider({ ...ctx, spaceMember: false })
+    } catch {
+      withoutClaim = 'none'
+    }
+    if (roleRank(withClaim) !== roleRank(withoutClaim)) return { kind: 'close-membership' }
+    return { kind: 'role', role: withoutClaim }
+  }
+
+  /**
    * Re-resolve `conn.role` against the current `live` epoch, applying ONLY a
    * downgrade (elevated authority needs a fresh ticket per PPT-EPOCH-003). Fails
    * closed to `none` when no roleProvider is wired or the lookup throws, so a
    * mutation can never ride a role that predates the live epoch. Stamps
    * `roleEpoch = live` so a settled connection re-resolves at most once per epoch
-   * change rather than on every frame.
+   * change. Returns true when it CLOSED the socket because the frozen
+   * space-membership claim became load-bearing and unverifiable (P1-6).
    */
-  private async refreshRoleDownOnly(conn: Conn, live: number): Promise<void> {
-    let resolved: ResolvedRole = 'none'
-    if (this.roleProvider) {
-      try {
-        resolved = await this.roleProvider({
-          uid: conn.uid,
-          docId: conn.docId,
-          documentName: conn.documentName,
-          spaceMember: conn.spaceMember,
-        })
-      } catch {
-        resolved = 'none'
-      }
+  private async refreshRoleDownOnly(conn: Conn, live: number): Promise<boolean> {
+    const outcome = await this.recheckRole({
+      uid: conn.uid,
+      docId: conn.docId,
+      documentName: conn.documentName,
+      spaceMember: conn.spaceMember,
+    })
+    if (outcome.kind === 'close-membership') {
+      conn.role = 'none'
+      conn.socket.close(CLOSE_FORBIDDEN, 'membership recheck required')
+      this.removeFromRoom(conn)
+      return true
     }
-    if (roleRank(resolved) < roleRank(conn.role)) conn.role = resolved
+    if (roleRank(outcome.role) < roleRank(conn.role)) conn.role = outcome.role
     conn.roleEpoch = live
+    return false
   }
 
   /** Sliding-window rate limit over `times`; returns retry delay ms when over. */
@@ -661,8 +966,11 @@ export class PptRelay {
    * durable state. The counter is process-local, so on a fresh process (restart,
    * or another node) it would otherwise start at 0 and ignore already-persisted
    * ops; seeding from the store's `roomBytes` makes the first frame per room
-   * account for the durable backlog. A seed failure leaves the room unseeded so a
-   * later frame retries rather than pinning a wrong 0.
+   * account for the durable backlog. A seed read that FAILS is fail-CLOSED: it
+   * throws a retryable storage error so the frame is refused `storage-retry` (the
+   * client re-sends) rather than admitted against a wrong 0-byte budget, which
+   * would let a full room accept unbounded frames until the seed happens to
+   * succeed (XIN-1693 P2-c).
    */
   private async ensureRoomBudget(docId: string): Promise<number> {
     if (!this.roomBytesSeeded.has(docId)) {
@@ -671,8 +979,8 @@ export class PptRelay {
         // Do not clobber bytes counted by frames that landed during the seed read.
         this.roomBytes.set(docId, Math.max(durable, this.roomBytes.get(docId) ?? 0))
         this.roomBytesSeeded.add(docId)
-      } catch {
-        /* leave unseeded; retry on the next frame */
+      } catch (err) {
+        throw new RetryableStorageError('room budget seed read failed', { cause: err })
       }
     }
     return this.roomBytes.get(docId) ?? 0
@@ -719,7 +1027,10 @@ export class PptRelay {
       } catch {
         /* keep the re-ack: the frame is already durable regardless of this read */
       }
-      send(conn.socket, { ctl: 'ack', k: frame.k, q: known, snapshotVersion })
+      // `k` is echoed back as the ack counter; apply `?? 0` consistently across
+      // every ack path so an omitted `k` never lands as `undefined` in the frame
+      // (P2-h — parse also refuses a non-integer `k`).
+      send(conn.socket, { ctl: 'ack', k: frame.k ?? 0, q: known, snapshotVersion })
       return
     }
     // Room-full: a room whose durable frame bytes would exceed the cap refuses
@@ -727,7 +1038,16 @@ export class PptRelay {
     // frame bytes (what a prune later reclaims), seeded once from durable state so
     // a restart does not silently reset the room to empty (see ensureRoomBudget).
     const frameBytes = Buffer.byteLength(JSON.stringify(frame), 'utf8')
-    const roomUsed = await this.ensureRoomBudget(conn.docId)
+    let roomUsed: number
+    try {
+      roomUsed = await this.ensureRoomBudget(conn.docId)
+    } catch (err) {
+      // The room-budget seed read could not be confirmed — fail closed and
+      // RETRYABLY rather than admit the frame against a wrong 0 budget (P2-c).
+      const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
+      this.refuse(conn, code, { k, frameId, message: 'room budget unavailable' })
+      return
+    }
     if (roomUsed + frameBytes > this.limits.maxRoomFrameBytes) {
       this.refuse(conn, 'room-full', { k, frameId, message: 'room frame budget exhausted' })
       return
@@ -746,8 +1066,12 @@ export class PptRelay {
       const res = await this.store.appendOp(conn.docId, frameId, frame)
       seq = res.seq
       duplicate = res.duplicate
-    } catch {
-      this.refuse(conn, 'storage-failed', { k, frameId, message: 'durable persistence failed' })
+    } catch (err) {
+      // A TRANSIENT lock failure that outlived the store's retries is
+      // `storage-retry` (retryable) so the client re-sends; anything else is a
+      // permanent `storage-failed` (XIN-1693 P1-5).
+      const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
+      this.refuse(conn, code, { k, frameId, message: 'durable persistence failed' })
       return
     }
     if (!duplicate) this.roomBytes.set(conn.docId, roomUsed + frameBytes)
@@ -763,7 +1087,7 @@ export class PptRelay {
       /* keep the ack: the op is durable regardless of the snapshot read */
     }
     // Ack the sender ONLY after the durable write.
-    send(conn.socket, { ctl: 'ack', k: frame.k, q: seq, snapshotVersion })
+    send(conn.socket, { ctl: 'ack', k: frame.k ?? 0, q: seq, snapshotVersion })
     // Broadcast to peers only for a first-seen frame (no echo, no double-apply).
     if (!duplicate) this.broadcast(conn, { ctl: 'op', q: seq, frame })
   }
@@ -811,11 +1135,19 @@ export class PptRelay {
       return
     }
     let snapshotVersion: number
+    let prunableSeq: number
     try {
       const res = await this.store.saveSnapshot({ docId: conn.docId, coveredSeq: covered, doc: frame.doc as BentoDoc })
       snapshotVersion = res.snapshotVersion
-    } catch {
-      this.refuse(conn, 'storage-failed', { k, message: 'snapshot persistence failed' })
+      // Prune with the AUTHORITATIVE post-write coveredSeq the store read back
+      // (GREATEST(existing, incoming)), never the client's raw `q`: a snapshot may
+      // only ever prune the op prefix the persisted doc actually subsumes, so an
+      // op the snapshot did not cover can never be deleted (XIN-1693 P0-1). Parse
+      // already refuses a fractional/out-of-range `q`, so this is defense in depth.
+      prunableSeq = res.coveredSeq ?? covered
+    } catch (err) {
+      const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
+      this.refuse(conn, code, { k, message: 'snapshot persistence failed' })
       return
     }
     // GC only AFTER the snapshot is durable (§7.3). The snapshot is already
@@ -823,7 +1155,7 @@ export class PptRelay {
     // subsumed by the durable snapshot; leaving them just defers GC). Reclaim the
     // freed bytes from the room budget so it does not monotonically grow.
     try {
-      const freed = await this.store.pruneOpsThrough(conn.docId, covered)
+      const freed = await this.store.pruneOpsThrough(conn.docId, prunableSeq)
       if (this.roomBytesSeeded.has(conn.docId)) {
         const used = this.roomBytes.get(conn.docId) ?? 0
         this.roomBytes.set(conn.docId, Math.max(0, used - freed))
@@ -888,17 +1220,21 @@ export class PptRelay {
     for (const room of this.rooms.values()) {
       for (const conn of [...room]) {
         if (conn.documentName !== documentName) continue
-        let role: ResolvedRole
-        try {
-          role = await this.roleProvider({
-            uid: conn.uid,
-            docId: conn.docId,
-            documentName: conn.documentName,
-            spaceMember: conn.spaceMember,
-          })
-        } catch {
-          role = 'none'
+        const outcome = await this.recheckRole({
+          uid: conn.uid,
+          docId: conn.docId,
+          documentName: conn.documentName,
+          spaceMember: conn.spaceMember,
+        })
+        if (outcome.kind === 'close-membership') {
+          // The frozen space-membership claim became load-bearing and cannot be
+          // re-verified on a live socket — fail closed (P1-6). The client re-mints
+          // a ticket carrying fresh membership.
+          conn.socket.close(CLOSE_FORBIDDEN, 'membership recheck required')
+          this.removeFromRoom(conn)
+          continue
         }
+        const role = outcome.role
         if (role === 'none') {
           conn.socket.close(CLOSE_FORBIDDEN, 'access revoked')
           this.removeFromRoom(conn)

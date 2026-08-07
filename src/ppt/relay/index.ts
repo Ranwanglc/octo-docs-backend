@@ -34,7 +34,12 @@ export function createPptRelay(): PptRelay {
     roleProvider: (ctx) => recheckCurrentRole(ctx.documentName, ctx.uid, ctx.spaceMember),
     docStatusProvider: async (docId) => {
       const meta = await docMetaRepo.getByDocId(docId)
-      return meta && meta.status !== 0 ? 'live' : 'deleted'
+      // status 0 = soft-deleted, 2 = archived (both refused by pptDocGuard, the
+      // REST write path). Treat BOTH as not-writable/readable through the relay so
+      // an archived deck cannot be live-edited via the WS path while the REST path
+      // returns 409/404 for it — archiving bumps no epoch, so this is the guard
+      // (XIN-1693 P2-f). Any other status is live.
+      return meta && meta.status !== 0 && meta.status !== 2 ? 'live' : 'deleted'
     },
   })
 }

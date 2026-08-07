@@ -52,6 +52,14 @@ async function main(): Promise<void> {
 
   const hocuspocus = createServer()
 
+  // R4-B1: construct the Bento-frame PPT relay BEFORE the epoch-invalidation
+  // subscriber below — `handleInvalidate` closes over `pptRelay`, so creating the
+  // relay after wiring `sub.on('message', ...)` left a temporal-dead-zone window
+  // where an invalidation arriving between subscribe and relay-construction would
+  // throw a ReferenceError (XIN-1693 P2-g). It is ATTACHED to the REST HTTP server
+  // further below, once that server exists.
+  const pptRelay = createPptRelay()
+
   // Subscribe to epoch invalidation events (§4.5 step 3). On an event we drop
   // caches and refresh the local watermark. Acting on individual live
   // connections (close 4403 / flip readOnly) is the next layer; the
@@ -101,8 +109,9 @@ async function main(): Promise<void> {
 
   // R4-B1: the Bento-frame PPT relay is hosted INSIDE B — attached to the REST
   // HTTP server on the `/api/v1/ppt/collab` upgrade path (owner-locked "no second
-  // service"), NOT the Hocuspocus server above and NOT a new deployable.
-  const pptRelay = createPptRelay()
+  // service"), NOT the Hocuspocus server above and NOT a new deployable. The relay
+  // itself was constructed earlier (before the epoch subscriber that references
+  // it); here we only bind it to the now-listening HTTP server.
   pptRelay.attach(httpServer)
   // eslint-disable-next-line no-console
   console.log('[octo-docs] PPT relay attached on /api/v1/ppt/collab')

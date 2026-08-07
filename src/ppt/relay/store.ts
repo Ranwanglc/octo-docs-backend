@@ -51,6 +51,52 @@ export interface SaveSnapshotInput {
 export interface SaveSnapshotResult {
   /** The new authoritative snapshot version (previous + 1). */
   snapshotVersion: number
+  /**
+   * The authoritative POST-WRITE covered seq the store read back (via
+   * `GREATEST(existing, incoming)`). The relay prunes with THIS value, never the
+   * client's raw `q`, so a snapshot can never claim to cover — and prune — a seq
+   * the persisted doc does not actually subsume (XIN-1693 P0-1).
+   */
+  coveredSeq?: number
+}
+
+/**
+ * A consistent replay view: the room high-water plus the latest snapshot and the
+ * op tail, all read from ONE point-in-time (a single transaction for the DB
+ * store). Reading them together closes the P1-4 seam where a concurrent
+ * `snap`+prune between separate autocommit reads could leave a reader with
+ * neither the snapshot nor the pruned ops (XIN-1693 P1-4).
+ */
+export interface ReplayView {
+  /** Authoritative room high-water (`ppt_collab_seq.last_seq`), 0 when none. */
+  highWater: number
+  /** Latest durable snapshot, or null when none exists yet. */
+  snapshot: RelaySnapshot | null
+  /** Un-pruned ops with `seq > sinceSeq`, ascending. */
+  ops: PersistedOp[]
+}
+
+/**
+ * A TRANSIENT storage failure that outlived the store's internal retries (a
+ * lock-wait timeout / deadlock, or a room-budget seed read that could not be
+ * confirmed). The relay maps this to the retryable `storage-retry` refusal so the
+ * client re-sends, rather than the permanent `storage-failed` (XIN-1693 P1-5).
+ */
+export class RetryableStorageError extends Error {
+  readonly retryable = true as const
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options)
+    this.name = 'RetryableStorageError'
+  }
+}
+
+/** True when `err` is a transient storage failure the relay should retry. */
+export function isRetryableStorageError(err: unknown): err is RetryableStorageError {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { retryable?: unknown }).retryable === true
+  )
 }
 
 export interface PptRelayStore {
@@ -82,6 +128,15 @@ export interface PptRelayStore {
   saveSnapshot(input: SaveSnapshotInput): Promise<SaveSnapshotResult>
   /** Delete persisted ops with `seq <= coveredSeq`; returns the bytes reclaimed. */
   pruneOpsThrough(docId: string, coveredSeq: number): Promise<number>
+  /**
+   * OPTIONAL atomic replay view: read the high-water, snapshot, and op tail from a
+   * single consistent point-in-time (§7.3 / XIN-1693 P1-4). A store that provides
+   * it lets the relay avoid the separate-autocommit-reads seam where a concurrent
+   * `snap`+prune could leave a reader with neither the snapshot nor the pruned
+   * ops. When absent, the relay composes `currentSeq`/`getSnapshot`/`opsSince`.
+   * `pageSize` bounds each internal fetch batch (memory).
+   */
+  readReplay?(docId: string, sinceSeq: number, pageSize: number): Promise<ReplayView>
 }
 
 interface RoomState {
@@ -160,9 +215,9 @@ export class InMemoryPptRelayStore implements PptRelayStore {
     if (!cur || input.coveredSeq >= cur.coveredSeq) {
       const snapshotVersion = (cur?.snapshotVersion ?? 0) + 1
       r.snapshot = { snapshotVersion, coveredSeq: input.coveredSeq, doc: input.doc }
-      return { snapshotVersion }
+      return { snapshotVersion, coveredSeq: input.coveredSeq }
     }
-    return { snapshotVersion: cur.snapshotVersion }
+    return { snapshotVersion: cur.snapshotVersion, coveredSeq: cur.coveredSeq }
   }
 
   async pruneOpsThrough(docId: string, coveredSeq: number): Promise<number> {
@@ -181,5 +236,19 @@ export class InMemoryPptRelayStore implements PptRelayStore {
     // being minted a fresh seq and rebroadcast. This mirrors the DB store's
     // `ppt_collab_frame` dedup ledger.
     return freed
+  }
+
+  /**
+   * Atomic replay view. The in-memory store's reads are already consistent (no
+   * interleaving await between them touches the same room synchronously), so this
+   * composes the individual reads THROUGH `this` — a subclass that overrides
+   * `currentSeq`/`getSnapshot`/`opsSince` (the test doubles) still sees its
+   * override honored here.
+   */
+  async readReplay(docId: string, sinceSeq: number): Promise<ReplayView> {
+    const highWater = await this.currentSeq(docId)
+    const snapshot = await this.getSnapshot(docId)
+    const ops = await this.opsSince(docId, sinceSeq)
+    return { highWater, snapshot, ops }
   }
 }

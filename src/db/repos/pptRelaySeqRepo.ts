@@ -44,4 +44,16 @@ export const pptRelaySeqRepo = {
     )
     return rows[0] ? Number(rows[0].last_seq ?? 0) : 0
   },
+
+  /**
+   * Highest seq ever assigned for the room, read INSIDE the caller's transaction
+   * so it shares one consistent snapshot with the other replay reads (P1-4).
+   */
+  async currentSeqTx(tx: Tx, docId: string): Promise<number> {
+    const rows = await tx.query<{ last_seq: number | null }>(
+      `SELECT last_seq FROM ppt_collab_seq WHERE doc_id = ?`,
+      [docId],
+    )
+    return rows[0] ? Number(rows[0].last_seq ?? 0) : 0
+  },
 }

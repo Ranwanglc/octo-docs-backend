@@ -83,6 +83,43 @@ export const pptCollabOpRepo = {
   },
 
   /**
+   * Ops with `seq > sinceSeq`, ascending, INSIDE the caller's transaction so the
+   * read shares one consistent snapshot with the other replay reads (P1-4 atomic
+   * replay view). Bounded to `limit` rows when given (paged fetch).
+   */
+  async sinceTx(tx: Tx, docId: string, sinceSeq: number, limit?: number): Promise<PptCollabOpRow[]> {
+    if (limit !== undefined && limit >= 0) {
+      const rows = await tx.query<RawRow>(
+        `SELECT seq, frame_id, frame_json FROM ppt_collab_op
+          WHERE doc_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
+        [docId, sinceSeq, limit],
+      )
+      return rows.map(toOp)
+    }
+    const rows = await tx.query<RawRow>(
+      `SELECT seq, frame_id, frame_json FROM ppt_collab_op
+        WHERE doc_id = ? AND seq > ? ORDER BY seq ASC`,
+      [docId, sinceSeq],
+    )
+    return rows.map(toOp)
+  },
+
+  /**
+   * Seq of the row already stored for `(doc_id, frame_id)` under a LOCKING read,
+   * or null if unseen. Used on the op-table duplicate-key retry path (P1-1 b): a
+   * pre-upgrade op row can exist for a frame that has no dedup-ledger row, so on an
+   * `ER_DUP_ENTRY` from the op insert we read the op's ORIGINAL seq here and re-ack
+   * it instead of failing permanently.
+   */
+  async getSeqByFrameIdForUpdateTx(tx: Tx, docId: string, frameId: string): Promise<number | null> {
+    const rows = await tx.query<{ seq: number }>(
+      `SELECT seq FROM ppt_collab_op WHERE doc_id = ? AND frame_id = ? FOR UPDATE`,
+      [docId, frameId],
+    )
+    return rows[0] ? Number(rows[0].seq) : null
+  },
+
+  /**
    * Highest seq still PRESENT in this table (0 when none). This is NOT the
    * room's authoritative high-water — a prune drops rows so this can regress;
    * {@link ../repos/pptRelaySeqRepo.currentSeq} is the monotonic high-water. Kept

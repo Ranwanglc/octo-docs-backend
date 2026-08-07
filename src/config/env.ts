@@ -751,8 +751,9 @@ export const config = {
     relay: {
       // Bento CRDT sync protocol version the relay speaks (`SYNC_V`). A frame
       // whose `pv` is missing or != this is refused with `protocol-version`
-      // BEFORE any decode/persist. Mirrors ppt_doc_state.bento_sync_pv.
-      protocolVersion: num('PPT_RELAY_SYNC_PV', 2),
+      // BEFORE any decode/persist. Mirrors ppt_doc_state.bento_sync_pv. A protocol
+      // version is a positive integer, so it is floored at 1 like the other knobs.
+      protocolVersion: numMin('PPT_RELAY_SYNC_PV', 2, 1),
       // One-time WS ticket TTL (seconds). The ticket is a single-use handshake
       // credential carried in `Sec-WebSocket-Protocol` (never a long-lived token
       // in the URL); short so a leaked/replayed ticket is useless quickly.
@@ -781,6 +782,11 @@ export const config = {
       // so a huge backlog streams in bounded chunks rather than being read
       // unbounded into memory on a single replay (XIN-1660 hardening).
       replayPageSize: numMin('PPT_RELAY_REPLAY_PAGE_SIZE', 1000, 1),
+      // Socket send-buffer high-water (bytes): replay pauses before sending its
+      // next frame while `socket.bufferedAmount` is above this, so one slow/greedy
+      // consumer cannot make the relay accumulate an unbounded send backlog
+      // (XIN-1693 P1-3). Default 4 MiB — a few large ops/a snapshot in flight.
+      sendHighWaterBytes: numMin('PPT_RELAY_SEND_HIGH_WATER_BYTES', 4 * 1024 * 1024, 1),
     },
   },
 } as const

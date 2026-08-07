@@ -86,4 +86,19 @@ export const pptCollabFrameRepo = {
       [docId, frameId, seq],
     )
   },
+
+  /**
+   * Repoint an existing ledger row at `seq`. Used only on the P1-1(b) op-table
+   * duplicate-key reconciliation path: the append inserted a fresh ledger row at a
+   * newly-allocated seq, then discovered a pre-upgrade op row already holds the
+   * frame at its ORIGINAL seq. We repoint the ledger to that original seq so a
+   * later resend re-acks the same seq the op is actually stored at (the freshly
+   * allocated seq is burned — seq gaps are legal on the wire, §7.3 / P2-d).
+   */
+  async updateSeqTx(tx: Tx, docId: string, frameId: string, seq: number): Promise<void> {
+    await tx.query(
+      `UPDATE ppt_collab_frame SET seq = ? WHERE doc_id = ? AND frame_id = ?`,
+      [seq, docId, frameId],
+    )
+  },
 }

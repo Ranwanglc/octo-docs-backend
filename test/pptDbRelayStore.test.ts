@@ -44,6 +44,11 @@ function makeDb() {
   // ledger row on the fast-path read, yet the PK insert + FOR UPDATE re-read still
   // catch the duplicate. Key: `${docId}:${frameId}`.
   const hiddenFromSnapshot = new Set<string>()
+  // Injected transient lock failures (ER_LOCK_WAIT_TIMEOUT): when > 0, the next
+  // non-locking `SELECT seq FROM ppt_collab_frame` (the FIRST statement in an
+  // append transaction, before any mutation) throws a lock error and decrements,
+  // modelling a lock-wait timeout the store must retry (XIN-1693 P1-5).
+  let lockErrorsOnFrameRead = 0
   // Every SQL statement executed (via both `query` and `tx.query`), so a test can
   // assert on the exact statements a store method issues (e.g. prune is a DELETE,
   // never an INSERT … SELECT into the ledger).
@@ -52,6 +57,12 @@ function makeDb() {
   function dupError(): Error {
     const e = new Error('ER_DUP_ENTRY') as Error & { code: string }
     e.code = 'ER_DUP_ENTRY'
+    return e
+  }
+
+  function lockError(): Error {
+    const e = new Error('ER_LOCK_WAIT_TIMEOUT') as Error & { code: string }
+    e.code = 'ER_LOCK_WAIT_TIMEOUT'
     return e
   }
 
@@ -65,9 +76,24 @@ function makeDb() {
         const forUpdate = sql.includes('FOR UPDATE')
         // Non-locking read = REPEATABLE-READ snapshot: a hidden-but-committed row is
         // invisible. FOR UPDATE = current read of the live committed map.
-        if (!forUpdate && hiddenFromSnapshot.has(`${docId}:${frameId}`)) return []
+        if (!forUpdate) {
+          // Inject a transient lock timeout on the fast-path read (before any
+          // mutation), so the whole append transaction retries cleanly (P1-5).
+          if (lockErrorsOnFrameRead > 0) {
+            lockErrorsOnFrameRead--
+            throw lockError()
+          }
+          if (hiddenFromSnapshot.has(`${docId}:${frameId}`)) return []
+        }
         const seq = frames.get(docId)?.get(frameId)
         return seq !== undefined ? [{ seq }] : []
+      }
+      if (sql.includes('UPDATE ppt_collab_frame')) {
+        // Repoint a ledger row (P1-1 b op-dup reconciliation): `SET seq = ? WHERE
+        // doc_id = ? AND frame_id = ?`.
+        const [seq, docId, frameId] = p as [number, string, string]
+        frames.get(docId)?.set(frameId, seq)
+        return []
       }
       if (sql.includes('INSERT INTO ppt_collab_frame')) {
         const [docId, frameId, seq] = p as [string, string, number]
@@ -167,6 +193,10 @@ function makeDb() {
     frames,
     hiddenFromSnapshot,
     sqlLog,
+    /** Inject N transient lock-wait timeouts on the append fast-path read (P1-5). */
+    setLockErrorsOnFrameRead: (n: number) => {
+      lockErrorsOnFrameRead = n
+    },
     query: vi.fn(async (sql: string, params: unknown[] = []) => route(sql, params, { lastInsertId: 0 })),
     transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => {
       const ctx = { lastInsertId: 0 }
@@ -394,5 +424,54 @@ describe('DbPptRelayStore — snapshot version atomicity (B2 / P0-3)', () => {
     const snap = await store.getSnapshot(D)
     expect(snap!.coveredSeq).toBe(1)
     expect((await store.opsSince(D, 0)).map((o) => o.seq)).toEqual([2])
+  })
+})
+
+describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-1693 P1-1 / P1-5)', () => {
+  it('P1-1 (b): a resend of a pre-upgrade op row that has NO dedup-ledger row re-acks its original seq, not storage-failed', async () => {
+    // Model an already-migrated DB: an op row written by the PREVIOUS deploy exists
+    // in ppt_collab_op (with the (doc_id, frame_id) UNIQUE) but the append-time
+    // dedup ledger has NO row for it, and the counter is at that seq.
+    db.ops.set(D, new Map([[1, { seq: 1, frameId: 'pre', frameJson: '{"v":1}', frameBytes: 8 }]]))
+    db.seqCounter.set(D, 1)
+    expect(db.frames.get(D)?.get('pre')).toBeUndefined() // no ledger row
+
+    const store = new DbPptRelayStore()
+    // Before the fix the op insert (outside the catch) hit the op-table UNIQUE and
+    // rolled back -> permanent storage-failed. Now it re-acks the op's original seq.
+    const res = await store.appendOp(D, 'pre', { v: 1 })
+    expect(res).toMatchObject({ seq: 1, duplicate: true })
+    // The ledger row is reconciled to the op's original seq for future resends.
+    expect(db.frames.get(D)?.get('pre')).toBe(1)
+  })
+
+  it('P1-5: a transient lock-wait timeout is retried and the append then succeeds', async () => {
+    db.setLockErrorsOnFrameRead(2) // fail twice; the 3rd (final) attempt succeeds
+    const store = new DbPptRelayStore()
+    const res = await store.appendOp(D, 'f1', { v: 1 })
+    expect(res).toMatchObject({ seq: 1, duplicate: false })
+    expect(await store.currentSeq(D)).toBe(1) // clean allocate, no burned seq
+  })
+
+  it('P1-5: a lock failure that outlives the retries surfaces as a RETRYABLE storage error, not permanent', async () => {
+    db.setLockErrorsOnFrameRead(99) // never recovers within the attempt budget
+    const store = new DbPptRelayStore()
+    await expect(store.appendOp(D, 'f1', { v: 1 })).rejects.toMatchObject({ retryable: true })
+  })
+
+  it('P1-4: readReplay returns {highWater, snapshot, ops} from ONE transaction (atomic replay view)', async () => {
+    const store = new DbPptRelayStore()
+    await store.appendOp(D, 'f1', { n: 1 })
+    await store.appendOp(D, 'f2', { n: 2 })
+    await store.saveSnapshot({ docId: D, coveredSeq: 1, doc: deck() })
+    await store.pruneOpsThrough(D, 1)
+    db.transaction.mockClear()
+    const view = await store.readReplay(D, 0, 1000)
+    expect(view.highWater).toBe(2) // durable counter, not MAX(seq) over the pruned table
+    expect(view.snapshot?.coveredSeq).toBe(1)
+    expect(view.ops.map((o) => o.seq)).toEqual([2]) // op 1 pruned; only the tail remains
+    // The whole view is read in a SINGLE transaction, so a concurrent snap+prune
+    // cannot slip between the snapshot read and the op reads (P1-4).
+    expect(db.transaction).toHaveBeenCalledTimes(1)
   })
 })

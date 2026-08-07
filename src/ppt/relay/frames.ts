@@ -30,6 +30,12 @@ export type ClientFrameType = (typeof CLIENT_FRAME_TYPES)[number]
 export const REFUSED_CODES = [
   'too-large',
   'storage-failed',
+  // A TRANSIENT storage failure the client should retry: a lock-wait timeout
+  // (ER_LOCK_WAIT_TIMEOUT / 1205) or deadlock (ER_LOCK_DEADLOCK / 1213) that
+  // survived the store's internal retries, or a room-budget seed read that could
+  // not be confirmed. Distinct from the PERMANENT `storage-failed` so the client
+  // re-sends instead of surfacing an unrecoverable unsynced state (XIN-1693 P1-5).
+  'storage-retry',
   'room-full',
   'rate-limited',
   'forbidden-role',
@@ -40,9 +46,22 @@ export const REFUSED_CODES = [
 ] as const
 export type RefusedCode = (typeof REFUSED_CODES)[number]
 
-/** Only rate limiting is transient; all other refusals are permanent (§7.3). */
+/**
+ * Transient (retryable) refusals: rate limiting and a transient storage failure
+ * (`storage-retry`, e.g. a lock-wait timeout / deadlock that outlived the store's
+ * internal retries). Every OTHER code is a PERMANENT refusal the client must
+ * surface as unsynced, never silently drop (§7.3 / XIN-1693 P1-5).
+ */
 export function isRetryable(code: RefusedCode): boolean {
-  return code === 'rate-limited'
+  return code === 'rate-limited' || code === 'storage-retry'
+}
+
+/** `frame_id` is persisted into a VARCHAR(64) column (dedup key). */
+export const MAX_FRAME_ID_LEN = 64
+
+/** A room sequence / counter field: a non-negative safe integer, never fractional. */
+function isSafeSeq(v: unknown): v is number {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0
 }
 
 // ── Client frame shapes ─────────────────────────────────────────────────────
@@ -103,9 +122,16 @@ export interface ReadyCtl {
    * no tail op followed. NOT the room's counter high-water — that can exceed what
    * was delivered (e.g. a seq allocated by an append not yet visible), and
    * reporting it would make the client skip an op it never received (XIN-1655 C6).
-   * The resume cursor is client-supplied, so it is CLAMPED to the room's real
-   * high-water before it can seed this value — a bogus client number can never be
-   * endorsed back as a synced boundary (XIN-1660).
+   * A resume cursor ABOVE the room high-water is REFUSED as a protocol error (it
+   * cannot arise legitimately — the counter never regresses), never clamped and
+   * endorsed back here (XIN-1693 P2-e).
+   *
+   * NOTE on GAPS: the delivered op sequence is monotonic but NOT necessarily
+   * contiguous. The durable per-room counter allocates a seq inside the append
+   * transaction; a rolled-back append (or the P1-1(b) op-dup reconciliation, which
+   * burns a freshly-allocated seq and re-acks the op's original one) leaves that
+   * seq permanently unused. A client must treat a missing intermediate seq as a
+   * legal gap, not a lost op — it never blocks on "waiting for seq N".
    */
   q: number
   snapshotVersion: number
@@ -190,6 +216,47 @@ export function parseClientFrame(raw: unknown, expectedPv: number): FrameParseRe
   const t = f.t
   if (typeof t !== 'string' || !CLIENT_FRAME_TYPES.includes(t as ClientFrameType)) {
     return { ok: false, code: 'protocol-version', k, frameId, message: 'unknown frame type' }
+  }
+  // frameId is persisted into a VARCHAR(64) dedup column. A longer value would
+  // raise ER_DATA_TOO_LONG (1406) at insert time and surface as a PERMANENT
+  // `storage-failed` rather than an up-front protocol refusal — cap it here so an
+  // over-length frameId is rejected on the wire (XIN-1693 Batch 1).
+  if (frameId !== undefined && frameId.length > MAX_FRAME_ID_LEN) {
+    return { ok: false, code: 'protocol-version', k, frameId: undefined, message: `frameId exceeds ${MAX_FRAME_ID_LEN} chars` }
+  }
+  // The numeric envelope fields are room sequences / counters — never fractional.
+  // A fractional/NaN/±Infinity/unsafe value (e.g. `snap.q=4.5`) would otherwise
+  // pass the relay's `typeof === 'number'` guards, be silently rounded by the
+  // BIGINT columns, and prune a co-editor's committed op the snapshot never
+  // covered (P0-1). Require `Number.isSafeInteger` for `k`, `since`, `q`, and
+  // `epoch` up front and refuse anything else as a protocol error.
+  if (f.k !== undefined && !Number.isSafeInteger(f.k)) {
+    return { ok: false, code: 'protocol-version', k, frameId, message: 'k must be an integer' }
+  }
+  switch (t as ClientFrameType) {
+    case 'hello':
+      if (f.since !== undefined && !isSafeSeq(f.since)) {
+        return { ok: false, code: 'protocol-version', k, frameId, message: 'since must be a non-negative integer' }
+      }
+      break
+    case 'need':
+      if (!isSafeSeq(f.since)) {
+        return { ok: false, code: 'protocol-version', k, frameId, message: 'need requires a non-negative integer since' }
+      }
+      break
+    case 'ops':
+      if (f.epoch !== undefined && !Number.isSafeInteger(f.epoch)) {
+        return { ok: false, code: 'protocol-version', k, frameId, message: 'epoch must be an integer' }
+      }
+      break
+    case 'snap':
+      if (!isSafeSeq(f.q)) {
+        return { ok: false, code: 'protocol-version', k, frameId, message: 'snap q must be a non-negative integer' }
+      }
+      if (f.epoch !== undefined && !Number.isSafeInteger(f.epoch)) {
+        return { ok: false, code: 'protocol-version', k, frameId, message: 'epoch must be an integer' }
+      }
+      break
   }
   return { ok: true, frame: f as unknown as ClientFrame }
 }

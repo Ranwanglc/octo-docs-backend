@@ -40,6 +40,22 @@ export const pptLiveSnapshotRepo = {
   },
 
   /**
+   * Latest live snapshot read INSIDE the caller's transaction, so it shares one
+   * consistent snapshot with the other replay reads (P1-4 atomic replay view).
+   */
+  async getTx(tx: Tx, docId: string): Promise<PptLiveSnapshot | null> {
+    const rows = await tx.query<RawRow>(
+      `SELECT snapshot_version, covered_seq, doc_json FROM ppt_live_snapshot WHERE doc_id = ?`,
+      [docId],
+    )
+    const row = rows[0]
+    if (!row) return null
+    const raw = row.doc_json
+    const doc = typeof raw === 'string' ? (JSON.parse(raw) as BentoDoc) : (raw as unknown as BentoDoc)
+    return { snapshotVersion: Number(row.snapshot_version), coveredSeq: Number(row.covered_seq), doc }
+  },
+
+  /**
    * Persist a snapshot AND advance the version ATOMICALLY, in one upsert (§7.3).
    *
    * A single `INSERT ... ON DUPLICATE KEY UPDATE` on the `(doc_id)` row: the
