@@ -79,7 +79,7 @@ export class DbPptRelayStore implements PptRelayStore {
       // so a snapshot miss here is still caught by `ER_DUP_ENTRY` (XIN-1660 D1).
       const existing = await pptCollabFrameRepo.getByFrameIdTx(tx, docId, frameId)
       if (existing !== null) {
-        if (existing.payloadHash !== null && existing.payloadHash !== payloadHash) throw new DuplicateFramePayloadError(frameId)
+        if (existing.payloadHash === null || existing.payloadHash !== payloadHash) throw new DuplicateFramePayloadError(frameId)
         return { seq: existing.seq, duplicate: true, frameBytes }
       }
       const seq = await pptRelaySeqRepo.nextSeqTx(tx, docId)
@@ -94,7 +94,7 @@ export class DbPptRelayStore implements PptRelayStore {
         if (isDuplicateKeyError(err)) {
           const orig = await pptCollabFrameRepo.getByFrameIdForUpdateTx(tx, docId, frameId)
           if (orig !== null) {
-            if (orig.payloadHash !== null && orig.payloadHash !== payloadHash) throw new DuplicateFramePayloadError(frameId)
+            if (orig.payloadHash === null || orig.payloadHash !== payloadHash) throw new DuplicateFramePayloadError(frameId)
             return { seq: orig.seq, duplicate: true, frameBytes }
           }
         }

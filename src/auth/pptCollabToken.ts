@@ -54,6 +54,8 @@ export interface PptCollabClaims {
    * caller's octo session token on the socket. Fail-closed: absent => false.
    */
   space_member?: boolean
+  /** JWT expiry seconds since epoch, present on verified JWTs. */
+  exp?: number
 }
 
 /** Enveloped `data` payload of a successful `collab-token` issuance (§7.1). */
@@ -153,7 +155,7 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
     throw new Error('invalid ppt collab token payload')
   }
   const d = decoded as Record<string, unknown>
-  const { uid, docId, documentName, role, permission_epoch: epoch, name, jti, space_member: spaceMember } = d
+  const { uid, docId, documentName, role, permission_epoch: epoch, name, jti, space_member: spaceMember, exp } = d
   if (
     typeof uid !== 'string' ||
     typeof docId !== 'string' ||
@@ -172,6 +174,7 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
     ...(typeof name === 'string' && name !== '' ? { name } : {}),
     ...(typeof spaceMember === 'boolean' ? { space_member: spaceMember } : {}),
     ...(typeof jti === 'string' ? { jti } : {}),
+    ...(typeof exp === 'number' ? { exp } : {}),
   }
 }
 

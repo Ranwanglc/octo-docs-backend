@@ -347,7 +347,7 @@ CREATE TABLE ppt_idempotency (
 CREATE TABLE ppt_collab_op (
   doc_id      VARCHAR(64) NOT NULL,                       -- FK-by-convention to doc_meta.doc_id (html_ppt row)
   seq         BIGINT      NOT NULL,                        -- monotonic per-room sequence (relay-assigned)
-  frame_id    VARCHAR(64) NOT NULL,                        -- globally-unique Bento frame id (dedup key)
+  frame_id    VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, -- globally-unique Bento frame id (dedup key)
   frame_json  MEDIUMTEXT  NOT NULL,                        -- the original `ops` frame, plaintext JSON
   frame_bytes INT         NOT NULL DEFAULT 0,              -- byte size of frame_json (room-budget accounting)
   created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -406,8 +406,9 @@ CREATE TABLE ppt_collab_seq (
 -- a live resend re-mints a fresh seq and rebroadcasts a duplicate (XIN-1693 P1-1).
 CREATE TABLE ppt_collab_frame (
   doc_id      VARCHAR(64) NOT NULL,                        -- FK-by-convention to doc_meta.doc_id (html_ppt row)
-  frame_id    VARCHAR(64) NOT NULL,                        -- globally-unique Bento frame id (dedup key)
+  frame_id    VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, -- globally-unique Bento frame id (dedup key)
   seq         BIGINT      NOT NULL,                         -- room seq this frame was assigned (retained past prune)
+  payload_hash CHAR(64)   NULL,                             -- sha256(hex) of canonical frame payload; NULL legacy rows fail closed
   recorded_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), -- when the mapping was recorded (append time)
   PRIMARY KEY (doc_id, frame_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

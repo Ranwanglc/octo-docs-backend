@@ -371,6 +371,18 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
     expect((db.ops.get(D) ?? new Map()).has(1)).toBe(false) // no resurrected op row
   })
 
+  it('legacy pruned frame identities with NULL payload_hash fail closed instead of wildcard re-acking', async () => {
+    const store = new DbPptRelayStore()
+    db.frames.set(D, new Map([['legacy-pruned', { seq: 1, payloadHash: null }]]))
+    db.seqCounter.set(D, 1)
+
+    await expect(store.appendOp(D, 'legacy-pruned', { n: 2 })).rejects.toMatchObject({
+      duplicatePayloadMismatch: true,
+    })
+    expect(db.ops.get(D)?.size ?? 0).toBe(0)
+    expect(await store.currentSeq(D)).toBe(1)
+  })
+
   it('D1: a resend whose fast-path ledger read misses the pre-commit snapshot still re-acks the ORIGINAL seq (append-time PK authority), never re-mints/rebroadcasts', async () => {
     const store = new DbPptRelayStore()
     // Original append commits frame-1 at seq 1 (ledger frame-1 -> 1, op row 1).

@@ -4,11 +4,14 @@ import './helpers/pptRelayEnv.js'
 import { describe, it, expect, afterEach, vi } from 'vitest'
 import { createServer, type Server as HttpServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { randomUUID } from 'node:crypto'
+import jwt from 'jsonwebtoken'
 import { WebSocket } from 'ws'
+import { config } from '../src/config/env.js'
 import { PptRelay, type RelayLimits } from '../src/ppt/relay/pptRelay.js'
 import { InMemoryPptRelayStore, type PptRelayStore, RetryableStorageError } from '../src/ppt/relay/store.js'
 import { isRetryable, STORAGE_RETRY_BACKOFF_MS } from '../src/ppt/relay/frames.js'
-import { issuePptCollabToken } from '../src/auth/pptCollabToken.js'
+import { issuePptCollabToken, PPT_RELAY_TICKET_AUD } from '../src/auth/pptCollabToken.js'
 import type { ResolvedRole, Role } from '../src/permission/role.js'
 import type { BentoDoc } from '../src/ppt/bentoDoc.js'
 
@@ -59,11 +62,16 @@ class WsClient {
     const next = this.q.shift()
     if (next) return Promise.resolve(next)
     return new Promise((res, rej) => {
-      const t = setTimeout(() => rej(new Error('recv timeout')), timeoutMs)
-      this.resolvers.push((m) => {
+      const resolver = (m: Record<string, unknown>): void => {
         clearTimeout(t)
         res(m)
-      })
+      }
+      const t = setTimeout(() => {
+        const idx = this.resolvers.indexOf(resolver)
+        if (idx >= 0) this.resolvers.splice(idx, 1)
+        rej(new Error('recv timeout'))
+      }, timeoutMs)
+      this.resolvers.push(resolver)
     })
   }
   /** Receive until `pred` matches; returns every message up to and incl. it. */
@@ -507,6 +515,19 @@ describe('PPT relay: snapshot + GC + offline replay (PPT-COLLAB-003 / PPT-COLLAB
     expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'snapshot-conflict' })
   })
 
+  it('does not treat raw hello since as prune authority for a stale snapshot', async () => {
+    const h = await setup()
+    await h.store.appendOp(DOC, 'seed-op', OPS_FRAME(1, 'seed-op'))
+
+    const stale = await h.connect({ uid: 'u_stale', role: 'writer' })
+    const { replay } = await helloReady(stale, 1)
+    expect(replay.filter((m) => m.ctl === 'op')).toHaveLength(0)
+
+    stale.send({ t: 'snap', pv: 2, k: 1, epoch: 0, q: 1, doc: deck('stale') })
+    expect(await stale.recv()).toMatchObject({ ctl: 'refused', code: 'snapshot-conflict' })
+    expect((await h.store.opsSince(DOC, 0)).map((o) => o.seq)).toEqual([1])
+  })
+
   it('snapshot advances version atomically; covered ops are not replayed; synced peers skip snapshot', async () => {
     const h = await setup()
     const w = await h.connect({ uid: 'u_w', role: 'writer' })
@@ -629,7 +650,7 @@ describe('PPT relay: permission epoch (PPT-EPOCH-001 / 002 / 003)', () => {
     expect(await h.store.currentSeq(DOC)).toBe(0)
   })
 
-  it('does not close still-authorized peers during pending epoch re-resolution', async () => {
+  it('buffers live delivery during pending epoch re-resolution and flushes authorized peers after reauth', async () => {
     let release!: () => void
     const gate = new Promise<void>((res) => {
       release = res
@@ -649,11 +670,39 @@ describe('PPT relay: permission epoch (PPT-EPOCH-001 / 002 / 003)', () => {
     const bump = h.relay.applyEpochBump(DOCNAME)
     a.send(OPS_FRAME(1, 'during-bump', 1))
     expect(await a.recv()).toMatchObject({ ctl: 'ack', q: 1 })
-    expect((await b.recvUntil((m) => m.ctl === 'op')).at(-1)).toMatchObject({ ctl: 'op', q: 1 })
+    await expect(b.recv(75)).rejects.toThrow()
 
     release()
     await bump
+    expect((await b.recvUntil((m) => m.ctl === 'op')).at(-1)).toMatchObject({ ctl: 'op', q: 1 })
     expect(b.ws.readyState).toBe(WebSocket.OPEN)
+  })
+
+  it('discards buffered reads when pending epoch re-resolution revokes the peer', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((res) => {
+      release = res
+    })
+    const h = await setup({
+      roleProvider: async ({ uid }) => {
+        if (uid === 'u_b') await gate
+        return uid === 'u_b' ? 'none' : 'writer'
+      },
+    })
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    const b = await h.connect({ uid: 'u_b', role: 'writer' })
+    await helloReady(a)
+    await helloReady(b)
+
+    h.setEpoch(1)
+    const bump = h.relay.applyEpochBump(DOCNAME)
+    a.send(OPS_FRAME(1, 'during-revoke', 1))
+    expect(await a.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    await expect(b.recv(75)).rejects.toThrow()
+
+    release()
+    await bump
+    expect((await b.closed).code).toBe(4403)
   })
 })
 
@@ -710,6 +759,7 @@ describe('PPT relay: read cache and outbound backpressure', () => {
       replayPending: null,
       liveBuffer: [],
       lastDelivered: 0,
+      pendingObservedSeqs: new Set<number>(),
       liveBufferBytes: 0,
       auth: { readAllowed: true, invalidated: false },
       inboundChain: Promise.resolve(),
@@ -718,6 +768,55 @@ describe('PPT relay: read cache and outbound backpressure', () => {
     await (relay as unknown as { deliver: (conn: unknown, frame: unknown) => Promise<void> }).deliver(peer, { ctl: 'op', q: 1, frame: OPS_FRAME(1, 'live') })
     expect(closed).toEqual([{ code: 1011, reason: 'send drain timeout' }])
     expect(fakeSocket.send).not.toHaveBeenCalled()
+    relay.close()
+  })
+
+  it('preserves live broadcast order when a slow peer drains between a concurrent burst', async () => {
+    const relay = new PptRelay({
+      store: new InMemoryPptRelayStore(),
+      epochProvider: async () => 0,
+      limits: { sendHighWaterBytes: 0, sendDrainTimeoutMs: 250 },
+    })
+    const sent: unknown[] = []
+    const fakeSocket = {
+      readyState: WebSocket.OPEN,
+      bufferedAmount: 1,
+      send: vi.fn((raw: string) => {
+        sent.push(JSON.parse(raw))
+      }),
+      close: vi.fn(),
+    }
+    const peer = {
+      socket: fakeSocket,
+      uid: 'u_slow',
+      docId: DOC,
+      documentName: DOCNAME,
+      role: 'reader',
+      roleEpoch: 0,
+      spaceMember: false,
+      frameTimes: [],
+      ephemeralFrameTimes: [],
+      caughtUp: true,
+      replayInFlight: false,
+      replayPending: null,
+      liveBuffer: [],
+      lastDelivered: 0,
+      pendingObservedSeqs: new Set<number>(),
+      liveBufferBytes: 0,
+      auth: { readAllowed: true, invalidated: false },
+      inboundChain: Promise.resolve(),
+      outboundChain: Promise.resolve(),
+    }
+
+    const deliver = (relay as unknown as { deliver: (conn: unknown, frame: unknown) => Promise<void> }).deliver.bind(relay)
+    const first = deliver(peer, { ctl: 'op', q: 1, frame: OPS_FRAME(1, 'ordered-1') })
+    await sleep(20)
+    const second = deliver(peer, { ctl: 'op', q: 2, frame: OPS_FRAME(2, 'ordered-2') })
+    await sleep(20)
+    fakeSocket.bufferedAmount = 0
+    await Promise.all([first, second])
+
+    expect(sent.map((m) => (m as { q?: number }).q)).toEqual([1, 2])
     relay.close()
   })
 })
@@ -1343,6 +1442,28 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
     // none WITHOUT), so the read path fails closed rather than trust it (P1-6).
     h.setEpoch(1)
     c.send({ t: 'hello', pv: 2, since: 0 })
+    expect((await c.closed).code).toBe(4403)
+  })
+
+  it('closes share-membership sockets at ticket TTL so membership removal cannot read indefinitely without an epoch bump', async () => {
+    const h = await setup({
+      roleProvider: async ({ spaceMember }) => (spaceMember ? 'writer' : 'none'),
+    })
+    const ticket = jwt.sign({
+      uid: 'u_share_ttl',
+      docId: DOC,
+      documentName: DOCNAME,
+      role: 'writer',
+      permission_epoch: 0,
+      space_member: true,
+      jti: randomUUID(),
+    }, config.collabToken.secret, {
+      algorithm: 'HS256',
+      audience: PPT_RELAY_TICKET_AUD,
+      expiresIn: 1,
+    })
+    const c = await h.connect({ uid: 'u_share_ttl', role: 'writer', ticket })
+    await helloReady(c)
     expect((await c.closed).code).toBe(4403)
   })
 

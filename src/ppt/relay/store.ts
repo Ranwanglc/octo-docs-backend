@@ -219,7 +219,7 @@ export interface PptRelayStore {
 interface RoomState {
   ops: Array<PersistedOp & { bytes: number }>
   seq: number
-  byFrameId: Map<string, number>
+  byFrameId: Map<string, { seq: number; payloadHash: string }>
   snapshot: RelaySnapshot | null
 }
 
@@ -246,14 +246,14 @@ export class InMemoryPptRelayStore implements PptRelayStore {
     const payloadHash = canonicalPayloadHash(frame)
     const existing = r.byFrameId.get(frameId)
     if (existing !== undefined) {
-      const prev = r.ops.find((o) => o.seq === existing)
-      if (prev && canonicalPayloadHash(prev.frame) !== payloadHash) throw new DuplicateFramePayloadError(frameId)
-      return { seq: existing, duplicate: true, frameBytes: prev?.bytes ?? bytes }
+      if (existing.payloadHash !== payloadHash) throw new DuplicateFramePayloadError(frameId)
+      const prev = r.ops.find((o) => o.seq === existing.seq)
+      return { seq: existing.seq, duplicate: true, frameBytes: prev?.bytes ?? bytes }
     }
     const seq = r.seq + 1
     r.seq = seq
     r.ops.push({ seq, frameId, frame, bytes })
-    r.byFrameId.set(frameId, seq)
+    r.byFrameId.set(frameId, { seq, payloadHash })
     return { seq, duplicate: false, frameBytes: bytes }
   }
 
@@ -262,16 +262,14 @@ export class InMemoryPptRelayStore implements PptRelayStore {
     // pruneOpsThrough), so a resend of an already-persisted frame is found here
     // even after its op row is gone — the analog of the DB store's
     // append-time `ppt_collab_frame` ledger (XIN-1660 D1/D3).
-    const seq = this.room(docId).byFrameId.get(frameId)
-    return seq ?? null
+    return this.room(docId).byFrameId.get(frameId)?.seq ?? null
   }
 
   async frameIdentity(docId: string, frameId: string): Promise<FrameIdentity | null> {
     const r = this.room(docId)
-    const seq = r.byFrameId.get(frameId)
-    if (seq === undefined) return null
-    const prev = r.ops.find((o) => o.seq === seq)
-    return { seq, payloadHash: prev ? canonicalPayloadHash(prev.frame) : null }
+    const identity = r.byFrameId.get(frameId)
+    if (identity === undefined) return null
+    return { seq: identity.seq, payloadHash: identity.payloadHash }
   }
 
   async opsSince(docId: string, sinceSeq: number, limit?: number): Promise<PersistedOp[]> {
