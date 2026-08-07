@@ -1445,9 +1445,15 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
     expect((await c.closed).code).toBe(4403)
   })
 
-  it('closes share-membership sockets at ticket TTL so membership removal cannot read indefinitely without an epoch bump', async () => {
+  it('fails a share-membership socket closed after the reauth grace when no fresh ticket arrives (membership removal cannot read indefinitely)', async () => {
+    // XIN-1739 P1-3: the ticket TTL no longer hard-disconnects a share-derived
+    // socket (the old connect/replay/close loop). It enters pending-reauth and
+    // fails closed only if no in-place `reauth` arrives within the grace window —
+    // the SAME security bound (cannot read indefinitely without fresh membership),
+    // enforced by a bounded re-verify window rather than an immediate disconnect.
     const h = await setup({
       roleProvider: async ({ spaceMember }) => (spaceMember ? 'writer' : 'none'),
+      limits: { reauthGraceMs: 200 },
     })
     const ticket = jwt.sign({
       uid: 'u_share_ttl',
@@ -1739,5 +1745,242 @@ describe('PPT relay: RC round-12 blockers (XIN-1736)', () => {
     w.send(OPS_FRAME(1, 'dup', 0)) // resend stamped with the pre-downgrade epoch
     const reack = await w.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')
     expect(reack[reack.length - 1]).toMatchObject({ ctl: 'ack', q: 1 })
+  })
+})
+
+/**
+ * XIN-1739 ordering-model redesign: legal seq gaps vs the observed high-water
+ * (P1-1), the replay→live cutover drain-until-empty (P1-2), and in-place `reauth`
+ * for share-derived sockets (P1-3). Each test fails on the pre-fix `3ebeccf` head.
+ */
+describe('PPT relay: ordering-model redesign (XIN-1739)', () => {
+  // A store whose op log has a LEGAL gap: real ops at seq 1 and 3, seq 2 is a
+  // burned compatibility hole, and the durable high-water is 3.
+  class GappedStore extends InMemoryPptRelayStore {
+    private readonly gapOps = [
+      { seq: 1, frameId: 'g1', frame: OPS_FRAME(1, 'g1'), frameBytes: 40 },
+      { seq: 3, frameId: 'g3', frame: OPS_FRAME(3, 'g3'), frameBytes: 40 },
+    ]
+    override async currentSeq(): Promise<number> {
+      return 3
+    }
+    override async opsSince(_docId: string, since: number): Promise<typeof this.gapOps> {
+      return this.gapOps.filter((o) => o.seq > since)
+    }
+    override async openReplay(
+      docId: string,
+      since: number,
+      limits: { pageRows: number; pageBytes: number },
+    ): ReturnType<InMemoryPptRelayStore['openReplay']> {
+      const snapshot = await this.getSnapshot(docId)
+      const rows = this.gapOps.filter((o) => o.seq > since)
+      let i = 0
+      return {
+        highWater: 3,
+        snapshot,
+        fromSeq: since,
+        nextPage: async () => {
+          const page = rows.slice(i, i + limits.pageRows)
+          i += page.length
+          return page
+        },
+        close: async () => {},
+      }
+    }
+  }
+
+  it('P1-1: a burned seq gap does not wedge the watermark — replay delivers 1,3 and a snapshot covering q=3 is ACCEPTED', async () => {
+    const h = await setup({ store: new GappedStore() })
+    const c = await h.connect({ uid: 'u_w', role: 'writer' })
+    const { ready, replay } = await helloReady(c)
+    // The delivered op sequence is monotonic-but-gapped (2 is a legal hole).
+    expect(replay.filter((m) => m.ctl === 'op').map((m) => m.q)).toEqual([1, 3])
+    expect(ready.q).toBe(3)
+    // A snapshot covering q=3 is legal: the writer observed seq 3, and seq 2 has no
+    // durable op row. The pre-fix contiguous watermark stuck at 1 refused this
+    // (`covered > lastDelivered`); the observed-high-water model accepts it.
+    c.send({ t: 'snap', pv: 2, k: 7, epoch: 0, q: 3, doc: deck() })
+    const out = await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')
+    expect(out[out.length - 1]).toMatchObject({ ctl: 'ack', k: 7, q: 3 })
+  })
+
+  it('P1-2: ops that arrive while a joiner is catching up are delivered exactly once, in monotonic order (no mid-flush reorder)', async () => {
+    // Gate the joiner's replay so live ops pile up during catch-up, then release
+    // and assert the cutover drains them in order with no duplicates.
+    let release!: () => void
+    const gate = new Promise<void>((res) => {
+      release = res
+    })
+    class GatedReplayStore extends InMemoryPptRelayStore {
+      armed = false
+      gatedOnce = false
+      override async openReplay(
+        docId: string,
+        since: number,
+        limits: { pageRows: number; pageBytes: number },
+      ): ReturnType<InMemoryPptRelayStore['openReplay']> {
+        if (this.armed && !this.gatedOnce) {
+          this.gatedOnce = true
+          await gate
+        }
+        return super.openReplay(docId, since, limits)
+      }
+    }
+    const store = new GatedReplayStore()
+    const h = await setup({ store })
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    await helloReady(a)
+    store.armed = true // only the joiner's replay is gated from here
+    const joiner = await h.connect({ uid: 'u_j', role: 'writer' })
+    // Joiner starts replaying (blocks on the gate: replayInFlight, buffering).
+    joiner.send({ t: 'hello', pv: 2, since: 0 })
+    // Writer streams ops while the joiner is still catching up — all buffered.
+    for (const [k, id] of [[1, 'c1'], [2, 'c2'], [3, 'c3']] as const) {
+      a.send(OPS_FRAME(k, id))
+      expect((await a.recv()).q).toBe(k)
+    }
+    // Release the replay; the cutover drains the buffer (deduped on the high-water)
+    // and delivers each op exactly once, in order, before `ready`.
+    release()
+    const drained = await joiner.recvUntil((m) => m.ctl === 'ready')
+    const opSeqs = drained.filter((m) => m.ctl === 'op').map((m) => m.q as number)
+    expect(opSeqs).toEqual([...opSeqs].sort((x, y) => x - y)) // strictly monotonic
+    expect(new Set(opSeqs).size).toBe(opSeqs.length) // no duplicates
+    expect(opSeqs).toEqual([1, 2, 3])
+    // A further live op after catch-up continues in order.
+    a.send(OPS_FRAME(4, 'c4'))
+    expect((await a.recv()).q).toBe(4)
+    expect((await joiner.recvUntil((m) => m.ctl === 'op')).at(-1)).toMatchObject({ ctl: 'op', q: 4 })
+  })
+
+  it('P1-2: a broadcast that arrives mid-flush is buffered and ordered AFTER the buffered ops (no 10,12,11)', async () => {
+    // Deterministic cutover race, driven against a fake socket whose drain we gate.
+    // The connection is mid-cutover: replay succeeded, buffer holds ops 10 and 11,
+    // and `flushingLiveBuffer` is set. While the flush awaits the drain of op 10, a
+    // live broadcast (op 12) arrives. The pre-fix head set `caughtUp = true` before
+    // the flush finished and did not gate on flushing, so op 12 bypassed the buffer
+    // and enqueued between 10 and 11 → 10,12,11. The flushingLiveBuffer gate buffers
+    // it and the drain-until-empty loop emits it last → 10,11,12.
+    const relay = new PptRelay({
+      store: new InMemoryPptRelayStore(),
+      epochProvider: async () => 0,
+      limits: { sendHighWaterBytes: 0, sendDrainTimeoutMs: 500 },
+    })
+    const sent: unknown[] = []
+    const fakeSocket = {
+      readyState: WebSocket.OPEN,
+      bufferedAmount: 1, // above the (0) high-water → the first send awaits the drain
+      send: vi.fn((raw: string) => {
+        sent.push(JSON.parse(raw))
+      }),
+      close: vi.fn(),
+    }
+    const op = (q: number) => ({ ctl: 'op' as const, q, frame: OPS_FRAME(q, `l${q}`) })
+    const peer = {
+      socket: fakeSocket,
+      uid: 'u_cut',
+      docId: DOC,
+      documentName: DOCNAME,
+      role: 'reader',
+      roleEpoch: 0,
+      spaceMember: false,
+      frameTimes: [],
+      ephemeralFrameTimes: [],
+      caughtUp: true, // pre-fix set this true before the flush completed (the bug)
+      replayInFlight: false,
+      flushingLiveBuffer: true, // the cutover drain is in progress
+      replayPending: null,
+      liveBuffer: [op(10), op(11)],
+      observedHighWater: 9,
+      observedHoles: new Set<number>(),
+      liveBufferBytes: 0,
+      auth: { readAllowed: true, invalidated: false },
+      inboundChain: Promise.resolve(),
+      inboundDepth: 0,
+      outboundChain: Promise.resolve(),
+    }
+    const asAny = relay as unknown as {
+      flushLiveBuffer: (c: unknown) => Promise<void>
+      deliver: (c: unknown, f: unknown) => Promise<void>
+    }
+    const flushP = asAny.flushLiveBuffer(peer) // sends op 10, then awaits the gated drain
+    await sleep(20)
+    const deliverP = asAny.deliver(peer, op(12)) // arrives mid-flush → must be buffered
+    await sleep(20)
+    fakeSocket.bufferedAmount = 0 // release the drain
+    await Promise.all([flushP, deliverP])
+    expect(sent.map((m) => (m as { q?: number }).q)).toEqual([10, 11, 12])
+    relay.close()
+  })
+
+  /** Sign a fresh single-use ticket (the client mints this via the collab-token endpoint). */
+  const freshTicket = (o: { uid: string; role: Role; spaceMember: boolean; epoch?: number; ttl?: number }): string =>
+    jwt.sign(
+      { uid: o.uid, docId: DOC, documentName: DOCNAME, role: o.role, permission_epoch: o.epoch ?? 0, space_member: o.spaceMember, jti: randomUUID() },
+      config.collabToken.secret,
+      { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: o.ttl ?? 30 },
+    )
+
+  it('P1-3: an in-place reauth keeps a share-derived socket open past its old ticket expiry with NO full replay', async () => {
+    const h = await setup({
+      roleProvider: async ({ spaceMember }) => (spaceMember ? 'writer' : 'none'),
+      limits: { reauthGraceMs: 300 },
+    })
+    const first = freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true, ttl: 1 })
+    const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: first })
+    await helloReady(c)
+    // Before the short-TTL grace elapses, present a freshly-minted ticket in place.
+    c.send({ t: 'reauth', pv: 2, ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true, ttl: 30 }) })
+    // The socket must NOT close (no fail-closed) and must NOT be forced to replay —
+    // a `snap` still acks, proving it kept writer authority in place.
+    const stillOpen = await Promise.race([
+      c.closed.then(() => true),
+      new Promise<boolean>((res) => setTimeout(() => res(false), 700)),
+    ])
+    expect(stillOpen).toBe(false)
+    c.send({ t: 'snap', pv: 2, k: 9, epoch: 0, q: 0, doc: deck() })
+    const out = await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')
+    expect(out[out.length - 1]).toMatchObject({ ctl: 'ack', k: 9 })
+  })
+
+  it('P1-3: a reauth whose fresh authority no longer grants access fails closed (4403)', async () => {
+    let member = true
+    const h = await setup({
+      roleProvider: async ({ spaceMember }) => (spaceMember && member ? 'writer' : 'none'),
+      limits: { reauthGraceMs: 5000 },
+    })
+    const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true, ttl: 1 }) })
+    await helloReady(c)
+    // Membership was revoked at the authority; a reauth minted at a NEW epoch must
+    // re-resolve to none and fail closed rather than refresh access in place.
+    member = false
+    h.setEpoch(1)
+    c.send({ t: 'reauth', pv: 2, ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true, epoch: 0, ttl: 30 }) })
+    expect((await c.closed).code).toBe(4403)
+  })
+
+  it('P1-3: a reauth for a DIFFERENT uid/doc is rejected (identity is immutable across reauth)', async () => {
+    const h = await setup({ roleProvider: async () => 'writer' })
+    const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true }) })
+    await helloReady(c)
+    const foreign = jwt.sign(
+      { uid: 'someone_else', docId: DOC, documentName: DOCNAME, role: 'writer', permission_epoch: 0, space_member: true, jti: randomUUID() },
+      config.collabToken.secret,
+      { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: 30 },
+    )
+    c.send({ t: 'reauth', pv: 2, ticket: foreign })
+    expect((await c.closed).code).toBe(4403)
+  })
+
+  it('P1-3: a replayed reauth ticket (same jti) is rejected — reauth consumes single-use like connect', async () => {
+    const h = await setup({ roleProvider: async () => 'writer' })
+    const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true }) })
+    await helloReady(c)
+    const ticket = freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true })
+    c.send({ t: 'reauth', pv: 2, ticket }) // consumes the jti
+    await sleep(50)
+    expect(c.ws.readyState).toBe(WebSocket.OPEN)
+    c.send({ t: 'reauth', pv: 2, ticket }) // replay of the same jti => rejected
+    expect((await c.closed).code).toBe(4403)
   })
 })

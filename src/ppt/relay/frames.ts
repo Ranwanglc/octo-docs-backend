@@ -19,7 +19,7 @@ export type OpKind = (typeof OP_KINDS)[number]
 const OP_KIND_SET: ReadonlySet<string> = new Set(OP_KINDS)
 
 /** Client → server frame types. */
-export const CLIENT_FRAME_TYPES = ['hello', 'ops', 'need', 'p', 'bye', 'snap'] as const
+export const CLIENT_FRAME_TYPES = ['hello', 'ops', 'need', 'p', 'bye', 'snap', 'reauth'] as const
 export type ClientFrameType = (typeof CLIENT_FRAME_TYPES)[number]
 
 /**
@@ -123,8 +123,23 @@ export interface SnapFrame {
   /** The authoritative BentoDoc snapshot. */
   doc: unknown
 }
+/**
+ * In-place re-authorization on an already-open socket (XIN-1739 P1-3). A
+ * NON-persisted control frame: before its current ticket's membership claim
+ * expires, a share-derived client mints a FRESH relay ticket via the collab-token
+ * endpoint and sends it here, so the relay can re-verify membership in place
+ * instead of forcing a full disconnect/replay (the 30s connect/replay/close loop).
+ * The relay verifies the fresh ticket, consumes its jti, and requires the SAME
+ * uid/docId/documentName as the live connection before refreshing its authority.
+ */
+export interface ReauthFrame {
+  t: 'reauth'
+  pv: number
+  /** A freshly-minted single-use relay ticket (same credential as the handshake). */
+  ticket: string
+}
 
-export type ClientFrame = HelloFrame | NeedFrame | PresenceFrame | ByeFrame | OpsFrame | SnapFrame
+export type ClientFrame = HelloFrame | NeedFrame | PresenceFrame | ByeFrame | OpsFrame | SnapFrame | ReauthFrame
 
 // ── Server control frames ───────────────────────────────────────────────────
 
@@ -269,6 +284,11 @@ export function parseClientFrame(raw: unknown, expectedPv: number): FrameParseRe
       }
       if (f.epoch !== undefined && !Number.isSafeInteger(f.epoch)) {
         return { ok: false, code: 'protocol-version', k, frameId, message: 'epoch must be an integer' }
+      }
+      break
+    case 'reauth':
+      if (typeof f.ticket !== 'string' || f.ticket === '') {
+        return { ok: false, code: 'protocol-version', k, frameId, message: 'reauth requires a non-empty ticket string' }
       }
       break
   }

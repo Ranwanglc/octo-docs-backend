@@ -834,6 +834,12 @@ export const config = {
       sendDrainTimeoutMs: numMin('PPT_RELAY_SEND_DRAIN_TIMEOUT_MS', 5000, 1),
       authRefreshMs: numMin('PPT_RELAY_AUTH_REFRESH_MS', 5000, 1),
       docStatusCacheTtlMs: numMin('PPT_RELAY_DOC_STATUS_CACHE_TTL_MS', 2000, 1),
+      // Grace window (ms) after a share-derived socket's ticket membership claim
+      // expires for the client to present a freshly-minted ticket via an in-place
+      // `reauth` frame before the relay fails closed (XIN-1739 P1-3). Replaces the
+      // old hard disconnect that, with the short ticket TTL, became a permanent
+      // connect/replay/close loop for a genuine `anyone_in_space` share writer.
+      reauthGraceMs: numMin('PPT_RELAY_REAUTH_GRACE_MS', 10_000, 1),
       // Depth cap for a connection's inbound ordering chain. Beyond it the relay
       // sheds further frames with `rate-limited` instead of letting `onData`
       // enqueue an unbounded backlog that keeps persisting after the socket is
