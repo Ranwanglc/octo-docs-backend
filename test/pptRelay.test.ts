@@ -1467,6 +1467,33 @@ describe('PPT relay: round-6 fixes (XIN-1693)', () => {
     expect((await c.closed).code).toBe(4403)
   })
 
+  it('keeps direct-authority sockets open at ticket TTL when the space-member claim is not load-bearing', async () => {
+    const h = await setup({
+      roleProvider: async () => 'writer',
+    })
+    const ticket = jwt.sign({
+      uid: 'u_direct_ttl',
+      docId: DOC,
+      documentName: DOCNAME,
+      role: 'writer',
+      permission_epoch: 0,
+      space_member: true,
+      jti: randomUUID(),
+    }, config.collabToken.secret, {
+      algorithm: 'HS256',
+      audience: PPT_RELAY_TICKET_AUD,
+      expiresIn: 1,
+    })
+    const c = await h.connect({ uid: 'u_direct_ttl', role: 'writer', ticket })
+    await helloReady(c)
+    const closed = await Promise.race([
+      c.closed.then(() => true),
+      new Promise<boolean>((res) => setTimeout(() => res(false), 1200)),
+    ])
+    expect(closed).toBe(false)
+    await helloReady(c)
+  })
+
   it('Jerry-Xin: a hello sent immediately after open (during the async handshake) is not lost', async () => {
     // A slow epoch lookup widens the handshake window. `ws` does not buffer frames
     // before a `message` listener exists, so before the fix (listeners attached

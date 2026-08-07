@@ -867,9 +867,34 @@ export class PptRelay {
     const expiresAt = typeof expSeconds === 'number' ? expSeconds * 1000 : Date.now()
     const delayMs = Math.max(0, expiresAt - Date.now())
     conn.shareExpiryTimer = setTimeout(() => {
-      conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_FORBIDDEN, reason: 'ticket membership expired' } }
-      void this.closeConn(conn, CLOSE_FORBIDDEN, 'ticket membership expired')
+      conn.shareExpiryTimer = undefined
+      void this.expireShareMembership(conn)
     }, delayMs)
+  }
+
+  private async expireShareMembership(conn: Conn): Promise<void> {
+    if (!conn.spaceMember || conn.socket.readyState !== WebSocket.OPEN || !this.rooms.get(conn.docId)?.has(conn)) return
+    let directRole: ResolvedRole = 'none'
+    if (this.roleProvider) {
+      try {
+        directRole = await this.roleProvider({
+          uid: conn.uid,
+          docId: conn.docId,
+          documentName: conn.documentName,
+          spaceMember: false,
+        })
+      } catch {
+        directRole = 'none'
+      }
+    }
+    if (!conn.spaceMember || conn.socket.readyState !== WebSocket.OPEN || !this.rooms.get(conn.docId)?.has(conn)) return
+    if (roleRank(directRole) >= roleRank(conn.role)) {
+      conn.spaceMember = false
+      conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
+      return
+    }
+    conn.auth = { readAllowed: false, invalidated: false, terminalClose: { code: CLOSE_FORBIDDEN, reason: 'ticket membership expired' } }
+    await this.closeConn(conn, CLOSE_FORBIDDEN, 'ticket membership expired')
   }
 
   private async refreshReadAuth(conn: Conn, _reason: string): Promise<boolean> {
