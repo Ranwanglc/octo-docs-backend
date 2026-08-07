@@ -292,10 +292,16 @@ CREATE TABLE doc_access_notify_card (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------------------------------------------------------------------
--- Bento PPT (`html_ppt`) — R2-B1 (XIN-1514): human create + templates +
--- idempotency. These tables are PPT-owned and never touch the legacy doc/Yjs
--- paths. Kept in lockstep with migrations/upgrades/2026-08-05-add-ppt-create-tables.sql
--- so a fresh build from this schema.sql and an upgraded DB are identical.
+-- Bento PPT (`html_ppt`) — R2-B1 create/templates (XIN-1514) + R4-B1 collab
+-- relay durability (ppt_collab_op / ppt_live_snapshot / ppt_collab_seq /
+-- ppt_collab_frame). These tables are PPT-owned and never touch the legacy
+-- doc/Yjs paths. Kept in lockstep with the PPT upgrade migrations so a fresh
+-- build from this schema.sql and an upgraded DB are identical:
+--   · 2026-08-05-add-ppt-create-tables.sql          (ppt_doc_state, ppt_create_idempotency)
+--   · 2026-08-06-add-ppt-collab-relay-tables.sql     (ppt_collab_op, ppt_live_snapshot)
+--   · 2026-08-06-add-ppt-collab-seq-counter.sql      (ppt_collab_seq)
+--   · 2026-08-07-add-ppt-collab-frame-dedup.sql + -append-time-authority + -payload-hash-bin
+--     + -payload-hash-canonical-ops.sql             (ppt_collab_frame + payload-hash scheme)
 -- ---------------------------------------------------------------------------
 
 -- Per-document PPT state that does not belong on the shared doc_meta row: the
@@ -408,7 +414,7 @@ CREATE TABLE ppt_collab_frame (
   doc_id      VARCHAR(64) NOT NULL,                        -- FK-by-convention to doc_meta.doc_id (html_ppt row)
   frame_id    VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, -- globally-unique Bento frame id (dedup key)
   seq         BIGINT      NOT NULL,                         -- room seq this frame was assigned (retained past prune)
-  payload_hash CHAR(64)   NULL,                             -- sha256(hex) of canonical frame payload; NULL legacy rows fail closed
+  payload_hash CHAR(64)   NULL,                             -- sha256(hex) of the CANONICAL ops payload (frame.ops, stable key order); NULL rows are verified against frame_json when the op row exists, else fail closed
   recorded_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), -- when the mapping was recorded (append time)
   PRIMARY KEY (doc_id, frame_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

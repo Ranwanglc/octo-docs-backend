@@ -51,8 +51,42 @@ export class DuplicateFramePayloadError extends Error {
   }
 }
 
-export function canonicalPayloadHash(value: unknown): string {
-  return createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex')
+/**
+ * Stable, key-order-independent JSON serialization: object keys are emitted in
+ * sorted order at every depth so two structurally-equal payloads that differ
+ * only in key order (or were re-serialized by a different client build) hash
+ * identically. Arrays keep their order (op order is semantic).
+ */
+export function canonicalStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null'
+  if (Array.isArray(value)) return `[${value.map(canonicalStringify).join(',')}]`
+  const obj = value as Record<string, unknown>
+  const keys = Object.keys(obj).sort()
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalStringify(obj[k])}`).join(',')}}`
+}
+
+/**
+ * Canonical hash of a frame's SEMANTIC payload — its `ops` array ONLY, with
+ * stable key order — NOT the whole wire envelope.
+ *
+ * The envelope carries transport metadata (`t`, `pv`, `k`, `frameId`, `epoch`)
+ * that legitimately varies between an original frame and an idempotent resend of
+ * the same edit: a resend after a permission-epoch bump carries a NEW `epoch`,
+ * and a different client build may serialize the same object with a different
+ * key order. Hashing the whole envelope (the previous behavior) made such a
+ * resend compute a different hash and be permanently refused `protocol-version`
+ * (non-retryable) for a write that had actually committed — the exact failure
+ * the idempotent-resend contract exists to prevent (XIN-1736 P1-A). Hashing the
+ * canonical `ops` alone makes the dedup identity depend only on the edit, so a
+ * genuine resend re-acks and only a reused frameId carrying DIFFERENT ops is
+ * refused.
+ */
+export function canonicalPayloadHash(frame: unknown): string {
+  const payload =
+    frame !== null && typeof frame === 'object' && 'ops' in (frame as Record<string, unknown>)
+      ? (frame as { ops: unknown }).ops
+      : frame
+  return createHash('sha256').update(canonicalStringify(payload), 'utf8').digest('hex')
 }
 
 export function isDuplicateFramePayloadError(err: unknown): err is DuplicateFramePayloadError {

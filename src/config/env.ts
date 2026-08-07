@@ -30,13 +30,24 @@ function numMin(name: string, fallback: number, min: number): number {
 function pptRelayReplaySlots(): number {
   const mysqlLimit = numMin('MYSQL_CONNECTION_LIMIT', 10, 1)
   const fallback = Math.max(1, Math.min(2, Math.floor(mysqlLimit / 4)))
-  const slots = numMin('PPT_RELAY_MAX_IN_FLIGHT_REPLAYS', fallback, 1)
-  if (slots >= mysqlLimit) {
-    throw new Error(
-      `PPT_RELAY_MAX_IN_FLIGHT_REPLAYS (${slots}) must be lower than MYSQL_CONNECTION_LIMIT (${mysqlLimit})`,
+  const requested = numMin('PPT_RELAY_MAX_IN_FLIGHT_REPLAYS', fallback, 1)
+  // Replay slots MUST stay below the pool size so a saturated replay set cannot
+  // starve the pool of the connection an append/snapshot needs. Previously an
+  // out-of-range value THREW at config load — a boot-trap: the default is
+  // derived from MYSQL_CONNECTION_LIMIT, so a small pool (e.g. the .env.example
+  // MYSQL_CONNECTION_LIMIT=1 or a hardcoded PPT_RELAY_MAX_IN_FLIGHT_REPLAYS) made
+  // the whole process fail to start. Clamp to `mysqlLimit - 1` (min 1) and warn
+  // instead, so a misconfiguration degrades replay concurrency rather than
+  // refusing to boot (XIN-1736 P2-e).
+  const ceiling = Math.max(1, mysqlLimit - 1)
+  if (requested > ceiling) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[config] PPT_RELAY_MAX_IN_FLIGHT_REPLAYS (${requested}) must stay below MYSQL_CONNECTION_LIMIT (${mysqlLimit}); clamping to ${ceiling}`,
     )
+    return ceiling
   }
-  return slots
+  return requested
 }
 
 function bool(name: string, fallback: boolean): boolean {
@@ -810,6 +821,11 @@ export const config = {
       replayPageSize: numMin('PPT_RELAY_REPLAY_PAGE_SIZE', 1000, 1),
       replayPageBytes: numMin('PPT_RELAY_REPLAY_PAGE_BYTES', 4 * 1024 * 1024, 1),
       maxInFlightReplays: pptRelayReplaySlots(),
+      // Max time (ms) a join waits for one of the scarce replay slots before the
+      // relay refuses `storage-retry` (retryable). Bounds a join burst queued
+      // behind a slow replay so it re-tries rather than blocking unboundedly
+      // (XIN-1736 P1-H). Default 10s — above a healthy replay, below a wedged one.
+      replayAcquireTimeoutMs: numMin('PPT_RELAY_REPLAY_ACQUIRE_TIMEOUT_MS', 10_000, 1),
       // Socket send-buffer high-water (bytes): replay pauses before sending its
       // next frame while `socket.bufferedAmount` is above this, so one slow/greedy
       // consumer cannot make the relay accumulate an unbounded send backlog
@@ -818,6 +834,11 @@ export const config = {
       sendDrainTimeoutMs: numMin('PPT_RELAY_SEND_DRAIN_TIMEOUT_MS', 5000, 1),
       authRefreshMs: numMin('PPT_RELAY_AUTH_REFRESH_MS', 5000, 1),
       docStatusCacheTtlMs: numMin('PPT_RELAY_DOC_STATUS_CACHE_TTL_MS', 2000, 1),
+      // Depth cap for a connection's inbound ordering chain. Beyond it the relay
+      // sheds further frames with `rate-limited` instead of letting `onData`
+      // enqueue an unbounded backlog that keeps persisting after the socket is
+      // gone (XIN-1736 P1-F). Sized well above a legitimate in-flight burst.
+      maxInboundQueue: numMin('PPT_RELAY_MAX_INBOUND_QUEUE', 256, 1),
     },
   },
 } as const

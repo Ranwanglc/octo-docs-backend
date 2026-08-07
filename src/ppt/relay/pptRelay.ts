@@ -78,6 +78,8 @@ export interface RelayLimits {
   replayPageBytes: number
   /** Process-wide cap for replay cursors holding store resources. */
   maxInFlightReplays: number
+  /** Max time (ms) to wait for a replay slot before refusing `storage-retry`. */
+  replayAcquireTimeoutMs: number
   /** Max live frames buffered while replay catches up. */
   maxLiveBufferFrames: number
   /** Max live frame bytes buffered while replay catches up. */
@@ -94,6 +96,8 @@ export interface RelayLimits {
   authRefreshMs: number
   /** Short TTL for doc-status read-path cache. */
   docStatusCacheTtlMs: number
+  /** Max inbound frames queued on a connection's ordering chain before shedding. */
+  maxInboundQueue: number
 }
 
 function defaultLimits(): RelayLimits {
@@ -109,12 +113,14 @@ function defaultLimits(): RelayLimits {
     replayPageSize: r.replayPageSize,
     replayPageBytes: r.replayPageBytes,
     maxInFlightReplays: r.maxInFlightReplays,
+    replayAcquireTimeoutMs: r.replayAcquireTimeoutMs,
     maxLiveBufferFrames: r.maxLiveBufferFrames,
     maxLiveBufferBytes: r.maxLiveBufferBytes,
     sendHighWaterBytes: r.sendHighWaterBytes,
     sendDrainTimeoutMs: r.sendDrainTimeoutMs,
     authRefreshMs: r.authRefreshMs,
     docStatusCacheTtlMs: r.docStatusCacheTtlMs,
+    maxInboundQueue: r.maxInboundQueue,
   }
 }
 
@@ -224,6 +230,8 @@ interface Conn {
   auth: ConnAuthState
   /** Per-connection inbound ordering chain. */
   inboundChain: Promise<void>
+  /** Frames currently queued on {@link inboundChain} (backpressure cap, P1-F). */
+  inboundDepth: number
   /** Per-connection outbound ordering chain. */
   outboundChain: Promise<void>
   /** Periodic read-auth refresh timer. */
@@ -240,23 +248,74 @@ function send(socket: WebSocket, frame: ServerFrame): void {
   }
 }
 
-class Semaphore {
+/**
+ * A counting semaphore that never admits more than `max` holders. Exported for
+ * direct unit coverage of the max+1 barge invariant (P1-D).
+ */
+export class Semaphore {
   private active = 0
-  private readonly waiters: Array<() => void> = []
+  // A waiter returns true when it actually took the handed-over permit, false
+  // when it had already been settled (timed out) and the permit must be offered
+  // to the next waiter instead — otherwise a permit handed to a dead waiter
+  // would leak (XIN-1736 P1-H).
+  private readonly waiters: Array<() => boolean> = []
 
   constructor(private readonly max: number) {}
 
-  async acquire(): Promise<() => void> {
-    if (this.active >= this.max) {
-      await new Promise<void>((resolve) => this.waiters.push(resolve))
+  /** Current number of held permits (test observability). */
+  get held(): number {
+    return this.active
+  }
+
+  /**
+   * Acquire a permit, resolving to a release fn. When `timeoutMs` is given and no
+   * permit becomes available in time, rejects with a {@link RetryableStorageError}
+   * (the relay maps it to `storage-retry` so the client retries) and removes its
+   * waiter — so a burst of joins queued behind a slow replay cannot block
+   * unboundedly (XIN-1736 P1-H). Without `timeoutMs` it waits indefinitely.
+   */
+  async acquire(timeoutMs?: number): Promise<() => void> {
+    if (this.active < this.max) {
+      this.active++
+    } else {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false
+        let timer: NodeJS.Timeout | undefined
+        const waiter = (): boolean => {
+          if (settled) return false
+          settled = true
+          if (timer) clearTimeout(timer)
+          resolve()
+          return true
+        }
+        this.waiters.push(waiter)
+        if (timeoutMs !== undefined) {
+          timer = setTimeout(() => {
+            if (settled) return
+            settled = true
+            const i = this.waiters.indexOf(waiter)
+            if (i >= 0) this.waiters.splice(i, 1)
+            reject(new RetryableStorageError('replay slot acquire timeout'))
+          }, timeoutMs)
+        }
+      })
+      // Resumed by release(): the permit was handed over, `active` unchanged.
     }
-    this.active++
     let released = false
     return () => {
       if (released) return
       released = true
-      this.active--
-      this.waiters.shift()?.()
+      // Hand the permit straight to the next LIVE waiter — do NOT drop `active`,
+      // or a concurrent acquire() would see a free slot the waiter is about to
+      // consume and admit one over the cap. Skip waiters that already timed out.
+      for (;;) {
+        const next = this.waiters.shift()
+        if (!next) {
+          this.active--
+          return
+        }
+        if (next()) return
+      }
     }
   }
 }
@@ -376,7 +435,7 @@ export class PptRelay {
     const onData = (data: unknown): void => {
       const raw = typeof data === 'string' ? data : String(data)
       if (conn) {
-        conn.inboundChain = conn.inboundChain.then(() => this.onMessage(conn!, raw), () => this.onMessage(conn!, raw))
+        this.enqueueInbound(conn, raw)
         return
       }
       if (preauth.length < MAX_PREAUTH_FRAMES) preauth.push(raw)
@@ -503,6 +562,7 @@ export class PptRelay {
       liveBufferBytes: 0,
       auth: { readAllowed: roleAtLeast(role, 'reader'), invalidated: false },
       inboundChain: Promise.resolve(),
+      inboundDepth: 0,
       outboundChain: Promise.resolve(),
     }
     this.addToRoom(conn)
@@ -512,8 +572,33 @@ export class PptRelay {
     // runs between assigning `conn` and this loop, so no `onData` callback can
     // interleave and reorder ahead of the queued frames.
     for (const raw of preauth) {
-      conn.inboundChain = conn.inboundChain.then(() => this.onMessage(conn!, raw), () => this.onMessage(conn!, raw))
+      this.enqueueInbound(conn, raw)
     }
+  }
+
+  /**
+   * Enqueue one inbound frame on the connection's ordering chain, bounded by
+   * {@link RelayLimits.maxInboundQueue}. Beyond the cap the frame is shed with
+   * `rate-limited` rather than growing an unbounded work queue that keeps
+   * persisting after the socket is gone — the P1-F defect where 29/30 ops
+   * persisted after a close because `onData` never capped depth and `onMessage`
+   * never checked `readyState` (XIN-1736 P1-F). `onMessage` itself no-ops once the
+   * socket is no longer OPEN, so a queued frame for a gone client never persists.
+   */
+  private enqueueInbound(conn: Conn, raw: string): void {
+    if (conn.inboundDepth >= this.limits.maxInboundQueue) {
+      this.refuse(conn, 'rate-limited', { retryInMs: this.limits.rateWindowMs })
+      return
+    }
+    conn.inboundDepth++
+    const run = async (): Promise<void> => {
+      try {
+        await this.onMessage(conn, raw)
+      } finally {
+        conn.inboundDepth--
+      }
+    }
+    conn.inboundChain = conn.inboundChain.then(run, run)
   }
 
   private addToRoom(conn: Conn): void {
@@ -539,6 +624,10 @@ export class PptRelay {
       // state when the room is next joined, so this only bounds memory.
       this.roomBytes.delete(conn.docId)
       this.roomBytesSeeded.delete(conn.docId)
+      // Evict the room's doc-status cache entry too, so a churn of short-lived
+      // rooms cannot grow the cache unbounded (XIN-1736 P2-b). It re-populates on
+      // the next join within its short TTL.
+      this.docStatusCache.delete(conn.docId)
     }
   }
 
@@ -770,6 +859,12 @@ export class PptRelay {
   }
 
   private async onMessage(conn: Conn, raw: string): Promise<void> {
+    // A frame queued on the ordering chain may only reach here AFTER the socket
+    // closed (client sent a burst then went away, or a slow chain drains post
+    // close). Nothing should be persisted or broadcast for a gone client, so drop
+    // it up front — this is the top-of-onMessage readyState check the inbound
+    // work-queue needs so ops do not persist after close (XIN-1736 P1-F).
+    if (conn.socket.readyState !== WebSocket.OPEN) return
     let parsed: unknown
     try {
       parsed = JSON.parse(raw)
@@ -1006,109 +1101,108 @@ export class PptRelay {
     if (!(await this.refreshReadAuth(conn, 'replay-start'))) return false
     let release: (() => void) | null = null
     let cursor: ReplayCursor | null = null
+    // One try/finally around the WHOLE post-acquire body: the replay semaphore
+    // permit (and the cursor's store resources) are released in `finally`, so a
+    // throw from ANY step — including `cursor.close()` on the early
+    // cursor-exceeds-high-water return — can never skip the release and leak a
+    // permit that then wedges every join process-wide (XIN-1736 P1-C).
     try {
-      release = await this.replaySemaphore.acquire()
-      cursor = this.store.openReplay
-        ? await this.store.openReplay(conn.docId, rawSince, {
-          pageRows: this.limits.replayPageSize,
-          pageBytes: this.limits.replayPageBytes,
-        })
-        : await this.composeReplayCursor(conn.docId, rawSince)
-    } catch (err) {
-      const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
-      this.refuse(conn, code, { message: 'replay failed' })
-      if (code === 'storage-failed') await this.closeConn(conn, CLOSE_UNAVAILABLE, 'replay failed')
-      release?.()
-      return false
-    }
-    const { highWater, snapshot } = cursor
-    if (rawSince > highWater) {
-      this.refuse(conn, 'protocol-version', { message: 'resume cursor exceeds room high-water' })
-      await cursor.close()
-      release?.()
-      return false
-    }
-    try {
-      let fromSeq = rawSince
-      let readySeq = rawSince
-      let delivered = conn.lastDelivered
-      // Only send the snapshot to a peer behind it; an already-synced peer is not
-      // forced to reapply it (PPT-COLLAB-003).
-      if (snapshot && rawSince < snapshot.coveredSeq) {
-        if (!this.canPushRead(conn)) {
-          await cursor.close()
-          release?.()
-          return false
-        }
-        await this.gatedSend(conn, { ctl: 'snapshot', snapshotVersion: snapshot.snapshotVersion, doc: snapshot.doc })
-        fromSeq = snapshot.coveredSeq
-        readySeq = snapshot.coveredSeq
-        conn.lastDelivered = Math.max(conn.lastDelivered, snapshot.coveredSeq)
-        for (const seq of [...conn.pendingObservedSeqs]) if (seq <= conn.lastDelivered) conn.pendingObservedSeqs.delete(seq)
-        delivered = Math.max(delivered, conn.lastDelivered)
-      }
-      // Highest op seq ACTUALLY delivered, so `ready.q` reports what the client is
-      // truly synced through, not the counter high-water (XIN-1655 C6).
-      for (;;) {
-        if (!(await this.refreshReadAuth(conn, 'replay-page'))) {
-          await cursor.close()
-          release?.()
-          return false
-        }
-        const ops = await cursor.nextPage()
-        if (ops.length === 0) break
-        for (const op of ops) {
-          if (op.seq <= fromSeq) continue
-          if (!this.canPushRead(conn)) {
-            await cursor.close()
-            release?.()
-            return false
-          }
-          await this.gatedSend(conn, { ctl: 'op', q: op.seq, frame: op.frame })
-          this.markObservedSeq(conn, op.seq)
-          delivered = conn.lastDelivered
-          readySeq = op.seq
-        }
-      }
-      conn.lastDelivered = Math.max(conn.lastDelivered, delivered)
-      if (ready) {
-        // Fallback is the connection's last-known LIVE epoch (validated at
-        // handshake), NOT the snapshot version — stamping a snapshot counter as an
-        // epoch would make every subsequent mutation fail `stale-epoch` with no
-        // recovery.
-        let epoch = conn.roleEpoch
-        try {
-          epoch = await this.epochProvider(conn.documentName)
-        } catch {
-          /* keep replay usable with the last-known epoch; mutation re-checks */
-        }
-        if (!this.canPushRead(conn)) {
-          await cursor.close()
-          release?.()
-          return false
-        }
-        await this.gatedSend(conn, {
-          ctl: 'ready',
-          q: readySeq,
-          snapshotVersion: snapshot?.snapshotVersion ?? 0,
-          epoch,
-          role: conn.role,
-        })
-      }
-      await cursor.close()
-      release?.()
-      return true
-    } catch (err) {
       try {
-        await cursor.close()
-      } catch {
-        /* ignore close failure */
+        // Bounded wait for a replay slot so a burst of joins queued behind a slow
+        // replay is refused retryably rather than blocking unboundedly (P1-H).
+        release = await this.replaySemaphore.acquire(this.limits.replayAcquireTimeoutMs)
+        cursor = this.store.openReplay
+          ? await this.store.openReplay(conn.docId, rawSince, {
+            pageRows: this.limits.replayPageSize,
+            pageBytes: this.limits.replayPageBytes,
+          })
+          : await this.composeReplayCursor(conn.docId, rawSince)
+      } catch (err) {
+        const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
+        this.refuse(conn, code, { message: 'replay failed' })
+        if (code === 'storage-failed') await this.closeConn(conn, CLOSE_UNAVAILABLE, 'replay failed')
+        return false
+      }
+      const { highWater, snapshot } = cursor
+      if (rawSince > highWater) {
+        this.refuse(conn, 'protocol-version', { message: 'resume cursor exceeds room high-water' })
+        return false
+      }
+      try {
+        // Clamp the replay lower bound to what this connection was ALREADY
+        // delivered. A coalesced re-`hello`/`need` (or a stale client cursor)
+        // must not re-stream ops this socket already applied live or in a prior
+        // replay — the ins/txt RGA is non-idempotent, so a re-delivered op
+        // permanently diverges the doc (XIN-1736 P1-E). The raw cursor is still
+        // used above for the `> highWater` protocol check; only op delivery is
+        // clamped.
+        const effectiveSince = Math.max(rawSince, conn.lastDelivered)
+        let fromSeq = effectiveSince
+        let readySeq = effectiveSince
+        let delivered = conn.lastDelivered
+        // Only send the snapshot to a peer behind it; an already-synced peer is not
+        // forced to reapply it (PPT-COLLAB-003).
+        if (snapshot && effectiveSince < snapshot.coveredSeq) {
+          if (!this.canPushRead(conn)) return false
+          await this.gatedSend(conn, { ctl: 'snapshot', snapshotVersion: snapshot.snapshotVersion, doc: snapshot.doc })
+          fromSeq = snapshot.coveredSeq
+          readySeq = snapshot.coveredSeq
+          conn.lastDelivered = Math.max(conn.lastDelivered, snapshot.coveredSeq)
+          for (const seq of [...conn.pendingObservedSeqs]) if (seq <= conn.lastDelivered) conn.pendingObservedSeqs.delete(seq)
+          delivered = Math.max(delivered, conn.lastDelivered)
+        }
+        // Highest op seq ACTUALLY delivered, so `ready.q` reports what the client is
+        // truly synced through, not the counter high-water (XIN-1655 C6).
+        for (;;) {
+          if (!(await this.refreshReadAuth(conn, 'replay-page'))) return false
+          const ops = await cursor.nextPage()
+          if (ops.length === 0) break
+          for (const op of ops) {
+            if (op.seq <= fromSeq) continue
+            if (!this.canPushRead(conn)) return false
+            await this.gatedSend(conn, { ctl: 'op', q: op.seq, frame: op.frame })
+            this.markObservedSeq(conn, op.seq)
+            delivered = conn.lastDelivered
+            readySeq = op.seq
+          }
+        }
+        conn.lastDelivered = Math.max(conn.lastDelivered, delivered)
+        if (ready) {
+          // Fallback is the connection's last-known LIVE epoch (validated at
+          // handshake), NOT the snapshot version — stamping a snapshot counter as an
+          // epoch would make every subsequent mutation fail `stale-epoch` with no
+          // recovery.
+          let epoch = conn.roleEpoch
+          try {
+            epoch = await this.epochProvider(conn.documentName)
+          } catch {
+            /* keep replay usable with the last-known epoch; mutation re-checks */
+          }
+          if (!this.canPushRead(conn)) return false
+          await this.gatedSend(conn, {
+            ctl: 'ready',
+            q: readySeq,
+            snapshotVersion: snapshot?.snapshotVersion ?? 0,
+            epoch,
+            role: conn.role,
+          })
+        }
+        return true
+      } catch (err) {
+        const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
+        this.refuse(conn, code, { message: 'replay failed' })
+        if (code === 'storage-failed') await this.closeConn(conn, CLOSE_UNAVAILABLE, 'replay failed')
+        return false
+      }
+    } finally {
+      if (cursor) {
+        try {
+          await cursor.close()
+        } catch {
+          /* ignore close failure — the permit still releases below */
+        }
       }
       release?.()
-      const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
-      this.refuse(conn, code, { message: 'replay failed' })
-      if (code === 'storage-failed') await this.closeConn(conn, CLOSE_UNAVAILABLE, 'replay failed')
-      return false
     }
   }
 
@@ -1146,6 +1240,44 @@ export class PptRelay {
         closed = true
       },
     }
+  }
+
+  /**
+   * The IDENTITY half of the mutation gate, run on EVERY `ops` frame — including
+   * the known-duplicate re-ack path — BEFORE any store read (XIN-1736 P1-I).
+   *
+   * The re-ack path previously ran its ledger lookup + positive `ack` ahead of any
+   * authorization, so a revoked/downgraded-to-`none` reader, or a socket on a
+   * soft-deleted doc, could harvest a `frameId` and drive an unauthorized store
+   * read + a bogus `ack` per frame with no shedding — and round-10's
+   * `markObservedSeq` prune watermark now depends on that path. This gate confirms
+   * the connection is still a live-doc reader at the current epoch (doc-status
+   * live, epoch refresh with downgrade-only role re-resolution, `role >= reader`)
+   * so only an authorized reader ever reaches the lookup. It deliberately does NOT
+   * enforce the stale-epoch or writer checks — those stay MUTATION-only in
+   * {@link guardMutation} — so a genuine idempotent resend from a still-authorized
+   * (possibly downgraded-to-reader) connection is still re-acked (round-7 / D3).
+   */
+  private async identityGate(conn: Conn): Promise<RefusedCode | null> {
+    if (this.docStatusProvider) {
+      try {
+        if ((await this.readDocStatus(conn)) === 'deleted') return 'doc-deleted'
+      } catch {
+        return 'doc-deleted'
+      }
+    }
+    let live: number
+    try {
+      live = await this.epochProvider(conn.documentName)
+    } catch {
+      // Unconfirmable epoch: fail closed rather than serve an unauthorized read.
+      return 'doc-deleted'
+    }
+    if (conn.roleEpoch !== live) {
+      if (await this.refreshRoleDownOnly(conn, live)) return 'forbidden-role'
+    }
+    if (!roleAtLeast(conn.role, 'reader')) return 'forbidden-role'
+    return null
   }
 
   /**
@@ -1310,21 +1442,33 @@ export class PptRelay {
       this.refuse(conn, 'too-large', { k, frameId, message: 'op count exceeds per-frame limit' })
       return
     }
+    // P1-I: the IDENTITY gate runs on EVERY ops frame BEFORE the ledger read, so
+    // only a live-doc reader at the current epoch reaches the known-duplicate
+    // lookup below. Without it, a revoked/downgraded-to-`none` reader or a socket
+    // on a deleted doc could drive an unauthorized store read + a bogus re-`ack`
+    // per harvested frameId (and corrupt the markObservedSeq prune watermark). It
+    // does NOT enforce the stale-epoch/writer checks — those stay MUTATION-only —
+    // so a genuine idempotent resend from a still-authorized (possibly
+    // downgraded-to-reader) connection is still re-acked (round-7 / D3).
+    const identityCode = await this.identityGate(conn)
+    if (identityCode) {
+      this.refuse(conn, identityCode, { k, frameId })
+      return
+    }
     // D3 / idempotent-resend: a KNOWN-DUPLICATE resend (its original ack was lost)
     // must re-ack its stored seq and MUST NOT be refused — never `room-full` /
-    // `rate-limited`, and never `stale-epoch` / `forbidden-role` / `doc-deleted`
-    // either. A pure re-ack of an already-durable frame is NOT a new mutation, so
-    // it runs BEFORE `guardMutation` (the epoch/role/status/size gate) and BEFORE
+    // `rate-limited`, and never `stale-epoch` / `forbidden-role` for a still-live
+    // reader. A pure re-ack of an already-durable frame is NOT a new mutation, so
+    // it runs BEFORE `guardMutation` (the stale-epoch/writer/size gate) and BEFORE
     // the byte/rate accounting: a duplicate must acknowledge the durable original
-    // even from a connection that was since downgraded or whose epoch advanced,
-    // otherwise a resend after a lost ack leaves the client showing unsynced state
-    // for a write that actually committed. The lookup is a CURRENT read of the
-    // dedup ledger; it consumes neither budget nor a rate slot, does not persist,
-    // and is not rebroadcast — it only echoes the already-committed seq. A lookup
-    // failure falls through to the normal path (appendOp still dedups
-    // authoritatively). A genuinely NEW frame (`known === null`) still hits
-    // `guardMutation` below, so a downgraded/stale-epoch connection is refused for
-    // any mutation that is not a known-durable duplicate.
+    // even from a connection that was since downgraded (to reader) or whose epoch
+    // advanced, otherwise a resend after a lost ack leaves the client showing
+    // unsynced state for a write that actually committed. The lookup is a CURRENT
+    // read of the dedup ledger; it consumes neither budget nor a rate slot, does
+    // not persist, and is not rebroadcast — it only echoes the already-committed
+    // seq. A lookup failure falls through to the normal path (appendOp still
+    // dedups authoritatively). A genuinely NEW frame (`known === null`) still hits
+    // `guardMutation` below.
     let known: { seq: number; payloadHash: string | null } | null = null
     const payloadHash = canonicalPayloadHash(frame)
     try {
@@ -1337,8 +1481,11 @@ export class PptRelay {
     } catch {
       /* fall through: appendOp's ledger PK remains the authoritative dedup */
     }
-    if (known !== null) {
-      if (known.payloadHash === null || known.payloadHash !== payloadHash) {
+    if (known !== null && known.payloadHash !== null) {
+      // Canonical-ops hashes (XIN-1736 P1-A) are epoch/key-order independent, so
+      // an exact match is a genuine idempotent resend (re-ack); a mismatch is a
+      // reused frameId carrying DIFFERENT ops and is refused.
+      if (known.payloadHash !== payloadHash) {
         this.refuse(conn, 'protocol-version', { k, frameId, message: 'frameId payload mismatch' })
         return
       }
@@ -1356,6 +1503,11 @@ export class PptRelay {
       void this.gatedSend(conn, { ctl: 'ack', k: frame.k ?? 0, q: known.seq, snapshotVersion })
       return
     }
+    // A ledger row with a NULL payload_hash (legacy / hash-scheme transition)
+    // cannot be verified here without the op frame_json, so it is NOT fast-re-acked
+    // and NOT blindly refused: it falls through to the mutation gate + appendOp,
+    // whose `resolveDuplicate` verifies against the stored frame_json (re-ack) or
+    // fails closed if the op row was pruned (XIN-1736 P1-A / P2-d).
     // Not a known duplicate: enforce the mutation gate (size / doc-status / epoch /
     // role). Only genuinely new mutations reach here, so a downgraded or
     // stale-epoch connection is refused for any write it has not already committed.

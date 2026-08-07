@@ -116,4 +116,19 @@ export const pptCollabFrameRepo = {
       [seq, docId, frameId],
     )
   },
+
+  /**
+   * Backfill a NULL `payload_hash` with the canonical-ops hash once it has been
+   * verified against the stored op `frame_json` (XIN-1736 P2-d): a legacy row (or
+   * a row nulled by the hash-scheme migration) is upgraded in place so a
+   * subsequent resend re-acks on the fast hash path instead of re-reading
+   * `frame_json` every time. Guarded on `payload_hash IS NULL` so it never
+   * overwrites a hash already recorded under the canonical scheme.
+   */
+  async updatePayloadHashTx(tx: Tx, docId: string, frameId: string, payloadHash: string): Promise<void> {
+    await tx.query(
+      `UPDATE ppt_collab_frame SET payload_hash = ? WHERE doc_id = ? AND frame_id = ? AND payload_hash IS NULL`,
+      [payloadHash, docId, frameId],
+    )
+  },
 }

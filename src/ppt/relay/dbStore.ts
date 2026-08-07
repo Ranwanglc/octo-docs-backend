@@ -35,6 +35,7 @@ import { pptRelaySeqRepo } from '../../db/repos/pptRelaySeqRepo.js'
 import {
   canonicalPayloadHash,
   DuplicateFramePayloadError,
+  RetryableStorageError,
   withStoreRetry,
   type AppendOpResult,
   type FrameIdentity,
@@ -79,8 +80,7 @@ export class DbPptRelayStore implements PptRelayStore {
       // so a snapshot miss here is still caught by `ER_DUP_ENTRY` (XIN-1660 D1).
       const existing = await pptCollabFrameRepo.getByFrameIdTx(tx, docId, frameId)
       if (existing !== null) {
-        if (existing.payloadHash === null || existing.payloadHash !== payloadHash) throw new DuplicateFramePayloadError(frameId)
-        return { seq: existing.seq, duplicate: true, frameBytes }
+        return this.resolveDuplicate(tx, docId, frameId, existing, payloadHash, frameBytes)
       }
       const seq = await pptRelaySeqRepo.nextSeqTx(tx, docId)
       try {
@@ -94,8 +94,7 @@ export class DbPptRelayStore implements PptRelayStore {
         if (isDuplicateKeyError(err)) {
           const orig = await pptCollabFrameRepo.getByFrameIdForUpdateTx(tx, docId, frameId)
           if (orig !== null) {
-            if (orig.payloadHash === null || orig.payloadHash !== payloadHash) throw new DuplicateFramePayloadError(frameId)
-            return { seq: orig.seq, duplicate: true, frameBytes }
+            return this.resolveDuplicate(tx, docId, frameId, orig, payloadHash, frameBytes)
           }
         }
         throw err
@@ -124,6 +123,44 @@ export class DbPptRelayStore implements PptRelayStore {
       }
       return { seq, duplicate: false, frameBytes }
     })
+  }
+
+  /**
+   * Resolve a frame that already has a ledger row into a duplicate re-ack or a
+   * payload-mismatch error.
+   *
+   * A non-NULL `payload_hash` is the canonical-ops hash (XIN-1736 P1-A): an exact
+   * match is an idempotent resend (re-ack the original seq); anything else is a
+   * reused frameId carrying DIFFERENT ops and is refused.
+   *
+   * A NULL `payload_hash` is a legacy row (recorded before the canonical-ops hash,
+   * or nulled by the hash-scheme migration). Rather than fail closed on the
+   * missing hash — which would permanently refuse a legitimate resend of a
+   * committed write — verify against the stored op `frame_json` when the op row is
+   * still present (XIN-1736 P2-d): equal canonical ops re-ack (and the ledger row
+   * is backfilled so the next resend takes the fast hash path), different ops are
+   * refused. A frame whose op row was already PRUNED has no `frame_json` to verify
+   * against and still fails closed (the round-10 invariant recorded in schema.sql:
+   * "NULL legacy rows fail closed").
+   */
+  private async resolveDuplicate(
+    tx: Tx,
+    docId: string,
+    frameId: string,
+    stored: FrameIdentity,
+    payloadHash: string,
+    frameBytes: number,
+  ): Promise<AppendOpResult> {
+    if (stored.payloadHash !== null) {
+      if (stored.payloadHash === payloadHash) return { seq: stored.seq, duplicate: true, frameBytes }
+      throw new DuplicateFramePayloadError(frameId)
+    }
+    const op = await pptCollabOpRepo.getFrameByFrameIdForUpdateTx(tx, docId, frameId)
+    if (op === null) throw new DuplicateFramePayloadError(frameId)
+    if (canonicalPayloadHash(op.frame) !== payloadHash) throw new DuplicateFramePayloadError(frameId)
+    // Backfill the canonical hash so a subsequent resend re-acks on the fast path.
+    await pptCollabFrameRepo.updatePayloadHashTx(tx, docId, frameId, payloadHash)
+    return { seq: stored.seq, duplicate: true, frameBytes }
   }
 
   /** Seq recorded for a frame id, or null if unseen (pre-gate dedup lookup, D3). */
@@ -171,74 +208,156 @@ export class DbPptRelayStore implements PptRelayStore {
   }
 
   /**
-   * Streaming replay cursor (P1-B/P1-4): read the high-water, snapshot, and op
-   * pages in ONE
-   * transaction so a concurrent `snap`+prune cannot slip between them and leave a
-   * reader with neither the snapshot nor the ops it pruned. Under the default
-   * REPEATABLE READ isolation every SELECT in the transaction sees the same
-   * point-in-time, so the paged op reads stay consistent with the snapshot read.
-   * The relay consumes one page, sends it, drops it, then asks for the next page.
-   * A process-level replay semaphore keeps these read transactions below the pool
-   * reservation while slow clients apply backpressure.
+   * Streaming replay cursor (P1-4 / XIN-1736 P1-B, P1-G, P1-H).
+   *
+   * The round-9/10 implementation opened ONE `REPEATABLE READ` transaction and
+   * held its pooled connection open across every client send. Three defects
+   * followed, all fixed here:
+   *
+   *  - P1-H: the connection + open read transaction were held across `gatedSend`
+   *    (up to `sendDrainTimeoutMs` per frame) behind a process-wide, un-timed
+   *    replay semaphore, so one slow deck's replay pinned a pool connection,
+   *    delayed joins on every deck, and blocked InnoDB purge. Now the head read
+   *    (high-water + snapshot) runs in a short transaction that COMMITS before
+   *    any frame is sent, and each op page runs in its OWN short transaction —
+   *    no transaction is ever held across client I/O.
+   *  - P1-B: `nextPage` retried its SELECT via `withStoreRetry` on the SAME
+   *    connection whose transaction a deadlock had already rolled back, so the
+   *    retried read ran OUTSIDE the consistent snapshot. Each page now opens a
+   *    FRESH consistent-snapshot transaction, so a retry re-reads from a fresh,
+   *    live snapshot instead of a dead one.
+   *  - P1-G: the byte budget was applied AFTER fetching `pageRows` rows and the
+   *    cursor advanced only through the rows that fit, so byte-dropped rows were
+   *    re-SELECTed + re-parsed on every page (~16-24× I/O for large-frame rooms).
+   *    A fetch now advances the cursor past EVERY row it read (buffered in the
+   *    cursor) and the byte budget only bounds how many buffered rows each
+   *    `nextPage` EMITS — nothing is ever re-fetched.
+   *
+   * Consistency across the now-separate page transactions is preserved by a
+   * prune-race guard: each page reads the live snapshot's `covered_seq` in the
+   * same fresh transaction as the op page; if a concurrent `snap`+prune advanced
+   * coverage PAST the cursor (so ops the reader has not yet delivered may have
+   * been physically pruned), the page throws a retryable error and the relay
+   * refuses `storage-retry` — the client re-`hello`s and replays from the new
+   * snapshot rather than silently skipping the pruned ops (the P1-4 property).
    */
   async openReplay(docId: string, sinceSeq: number, limits: ReplayLimits): Promise<ReplayCursor> {
-    return withStoreRetry('openReplay', async () => {
-      const conn = await getPool().getConnection()
-      let closed = false
-      const tx: Tx = {
-        async query<T>(sql: string, params: unknown[] = []): Promise<T[]> {
-          const [rows] = await conn.execute(sql, params as never[])
-          return rows as T[]
-        },
-      }
-      try {
-        await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')
-        await conn.execute('START TRANSACTION WITH CONSISTENT SNAPSHOT')
-        const highWater = await pptRelaySeqRepo.currentSeqTx(tx, docId)
-        const snap = await pptLiveSnapshotRepo.getTx(tx, docId)
-        const snapshot: RelaySnapshot | null = snap
-          ? { snapshotVersion: snap.snapshotVersion, coveredSeq: snap.coveredSeq, doc: snap.doc }
-          : null
-        let cursor = sinceSeq
-        const close = async (): Promise<void> => {
-          if (closed) return
-          closed = true
-          try {
-            await conn.commit()
-          } finally {
-            conn.release()
+    // Head read: high-water + snapshot from ONE consistent snapshot, then the
+    // transaction/connection is released — never held across the client sends
+    // that follow (P1-H).
+    const head = await withStoreRetry('openReplay.head', () => this.readReplayHead(docId))
+    const headCovered = head.snapshot?.coveredSeq ?? 0
+    let cursor = sinceSeq
+    let buffer: PersistedOp[] = []
+    let eof = false
+    let closed = false
+    return {
+      highWater: head.highWater,
+      snapshot: head.snapshot,
+      fromSeq: sinceSeq,
+      nextPage: async () => {
+        if (closed || eof) return []
+        if (buffer.length === 0) {
+          // Fresh short transaction per fetch: a deadlock retry re-opens a live
+          // snapshot (P1-B), and the transaction is committed before we return
+          // (so it is not held across the caller's client I/O, P1-H).
+          const batch = await withStoreRetry('openReplay.page', () =>
+            this.readReplayPage(docId, cursor, headCovered, limits.pageRows),
+          )
+          if (batch.rows.length === 0) {
+            eof = true
+            return []
           }
+          // Advance the cursor past EVERY fetched row and buffer them, so the
+          // byte budget below can trim what we EMIT without ever re-fetching the
+          // remainder next page (P1-G).
+          cursor = batch.rows[batch.rows.length - 1]!.seq
+          buffer = batch.rows
         }
-        return {
-          highWater,
-          snapshot,
-          fromSeq: sinceSeq,
-          nextPage: async () => {
-            if (closed) return []
-            const rows = await withStoreRetry('openReplay.nextPage', () => pptCollabOpRepo.sinceTx(tx, docId, cursor, limits.pageRows))
-            const page: PersistedOp[] = []
-            let bytes = 0
-            for (const row of rows) {
-              const frameBytes = row.frameBytes ?? Buffer.byteLength(JSON.stringify(row.frame), 'utf8')
-              if (page.length > 0 && bytes + frameBytes > limits.pageBytes) break
-              page.push({ seq: row.seq, frameId: row.frameId, frame: row.frame, frameBytes })
-              bytes += frameBytes
-            }
-            if (page.length > 0) cursor = page[page.length - 1]!.seq
-            return page
-          },
-          close,
+        const page: PersistedOp[] = []
+        let bytes = 0
+        while (buffer.length > 0) {
+          const row = buffer[0]!
+          const frameBytes = row.frameBytes ?? Buffer.byteLength(JSON.stringify(row.frame), 'utf8')
+          if (page.length > 0 && bytes + frameBytes > limits.pageBytes) break
+          page.push(buffer.shift()!)
+          bytes += frameBytes
         }
-      } catch (err) {
-        try {
-          await conn.rollback()
-        } catch {
-          /* ignore rollback failure */
-        }
-        conn.release()
-        throw err
-      }
+        return page
+      },
+      close: async () => {
+        closed = true
+        buffer = []
+      },
+    }
+  }
+
+  /** Head of an atomic replay view: high-water + snapshot from one snapshot. */
+  private async readReplayHead(docId: string): Promise<{ highWater: number; snapshot: RelaySnapshot | null }> {
+    return this.inConsistentSnapshot(async (tx) => {
+      const highWater = await pptRelaySeqRepo.currentSeqTx(tx, docId)
+      const snap = await pptLiveSnapshotRepo.getTx(tx, docId)
+      const snapshot: RelaySnapshot | null = snap
+        ? { snapshotVersion: snap.snapshotVersion, coveredSeq: snap.coveredSeq, doc: snap.doc }
+        : null
+      return { highWater, snapshot }
     })
+  }
+
+  /**
+   * One op page from a FRESH consistent snapshot, plus the prune-race guard: if a
+   * concurrent snapshot has advanced `covered_seq` past `cursor`, ops in
+   * `(cursor, covered]` may have been physically pruned, so the reader must
+   * restart from the new snapshot rather than skip them (P1-4 / P1-B).
+   */
+  private async readReplayPage(
+    docId: string,
+    cursor: number,
+    headCovered: number,
+    pageRows: number,
+  ): Promise<{ rows: PersistedOp[] }> {
+    return this.inConsistentSnapshot(async (tx) => {
+      const snap = await pptLiveSnapshotRepo.getTx(tx, docId)
+      // Fire only for a snapshot NEWER than the one the head read already
+      // delivered (`coveredSeq > headCovered`) that also covers ops we have not
+      // yet fetched (`coveredSeq > cursor`). A snapshot at or below `headCovered`
+      // is the one we already sent — the ops it pruned are subsumed by it, so
+      // the reader legitimately skips them; only a newer prune could delete
+      // un-delivered ops (P1-4 / P1-B).
+      if (snap && snap.coveredSeq > headCovered && snap.coveredSeq > cursor) {
+        throw new RetryableStorageError('replay superseded by a concurrent snapshot prune')
+      }
+      const rows = await pptCollabOpRepo.sinceTx(tx, docId, cursor, pageRows)
+      return { rows: rows.map((o) => ({ seq: o.seq, frameId: o.frameId, frame: o.frame, frameBytes: o.frameBytes })) }
+    })
+  }
+
+  /** Run `fn` in a short REPEATABLE READ consistent-snapshot transaction on a
+   * dedicated connection, releasing it (never held across caller I/O). */
+  private async inConsistentSnapshot<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
+    const conn = await getPool().getConnection()
+    const tx: Tx = {
+      async query<T2>(sql: string, params: unknown[] = []): Promise<T2[]> {
+        const [rows] = await conn.execute(sql, params as never[])
+        return rows as T2[]
+      },
+    }
+    try {
+      await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')
+      await conn.execute('START TRANSACTION WITH CONSISTENT SNAPSHOT')
+      const result = await fn(tx)
+      await conn.commit()
+      return result
+    } catch (err) {
+      try {
+        await conn.rollback()
+      } catch {
+        /* ignore rollback failure */
+      }
+      throw err
+    } finally {
+      conn.release()
+    }
   }
 
   async readReplay(docId: string, sinceSeq: number, pageSize: number): Promise<ReplayView> {

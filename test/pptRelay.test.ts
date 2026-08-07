@@ -1657,3 +1657,87 @@ describe('PPT relay: round-7 fixes (XIN-1695)', () => {
     expect(STORAGE_RETRY_BACKOFF_MS).toBeGreaterThan(0)
   })
 })
+
+describe('PPT relay: RC round-12 blockers (XIN-1736)', () => {
+  it('P1-E: a re-hello with a stale (lower) cursor does NOT re-deliver already-delivered ops', async () => {
+    const h = await setup()
+    await h.store.appendOp(DOC, 'f1', OPS_FRAME(1, 'f1'))
+    await h.store.appendOp(DOC, 'f2', OPS_FRAME(2, 'f2'))
+    const c = await h.connect({ uid: 'u1', role: 'writer' })
+    const first = await helloReady(c, 0)
+    expect(first.replay.filter((m) => m.ctl === 'op').map((m) => m.q)).toEqual([1, 2])
+    // Re-hello from the SAME stale cursor 0 (a coalesced burst / reconnect race).
+    // The connection already applied ops 1 and 2; re-delivering them would double-
+    // apply the non-idempotent ins/txt RGA and diverge the doc.
+    const second = await helloReady(c, 0)
+    expect(second.replay.filter((m) => m.ctl === 'op')).toEqual([])
+    const ready = second.replay[second.replay.length - 1]!
+    expect(ready.q).toBe(2) // reports the true synced-through seq, not the stale cursor
+  })
+
+  it('P1-C: a replay cursor.close() failure still releases the replay permit (no process-wide leak)', async () => {
+    let closeCalls = 0
+    const store = new InMemoryPptRelayStore()
+    const realOpen = store.openReplay.bind(store)
+    ;(store as { openReplay: PptRelayStore['openReplay'] }).openReplay = async (docId, since, limits) => {
+      const cursor = await realOpen(docId, since, limits!)
+      // Force the cursor-exceeds-high-water refusal path (highWater 0) AND make
+      // close() reject, so the pre-fix `close(); release()` sequence skipped the
+      // release and leaked the sole replay permit.
+      return { ...cursor, highWater: 0, close: async () => { closeCalls++; throw new Error('close boom') } }
+    }
+    const h = await setup({ store, limits: { maxInFlightReplays: 1 } })
+    const c = await h.connect({ uid: 'u1', role: 'writer' })
+    c.send({ t: 'hello', pv: 2, since: 5 }) // since > highWater(0) -> protocol-version, close() throws
+    const r1 = await c.recvUntil((m) => m.ctl === 'refused')
+    expect(r1[r1.length - 1]!.code).toBe('protocol-version')
+    // A SECOND replay must still acquire the (single) permit — proving the first
+    // one's permit was released in `finally` despite close() throwing.
+    c.send({ t: 'hello', pv: 2, since: 5 })
+    const r2 = await c.recvUntil((m) => m.ctl === 'refused', 1500)
+    expect(r2[r2.length - 1]!.code).toBe('protocol-version')
+    expect(closeCalls).toBe(2)
+  })
+
+  it('P1-F: inbound frames beyond the queue cap are shed with rate-limited (bounded work queue)', async () => {
+    // A tiny inbound-queue cap with a huge frame-rate window so any rate-limited
+    // refusal comes from the QUEUE cap, not the per-window rate limit.
+    const h = await setup({ limits: { maxInboundQueue: 1, maxFramesPerWindow: 1_000_000 } })
+    const w = await h.connect({ uid: 'u1', role: 'writer' })
+    await helloReady(w)
+    for (let i = 0; i < 40; i++) w.send(OPS_FRAME(i, `flood-${i}`))
+    const msgs = await w.recvUntil((m) => m.ctl === 'refused' && m.code === 'rate-limited', 3000)
+    expect(msgs.some((m) => m.ctl === 'refused' && m.code === 'rate-limited')).toBe(true)
+  })
+
+  it('P1-I: a revoked (none) reader cannot re-ack a harvested frameId — the identity gate precedes the ledger lookup', async () => {
+    const h = await setup()
+    await h.store.appendOp(DOC, 'harv', OPS_FRAME(1, 'harv')) // a durable frame authored earlier
+    const c = await h.connect({ uid: 'u_r', role: 'reader' })
+    await helloReady(c)
+    // Revoke to `none` and bump the epoch, WITHOUT pushing applyEpochBump: the
+    // per-frame identity gate must catch it on the re-ack path.
+    h.setRole('u_r', 'none')
+    h.setEpoch(1)
+    c.send(OPS_FRAME(1, 'harv', 1)) // try to re-ack the harvested (durable) frameId
+    const refused = await c.recvUntil((m) => m.ctl === 'refused')
+    expect(refused[refused.length - 1]!.code).toBe('forbidden-role')
+    // No `ack` for the harvested frame was ever sent.
+    expect(refused.some((m) => m.ctl === 'ack')).toBe(false)
+  })
+
+  it('P1-I: a still-authorized reader downgraded from writer STILL re-acks a genuine duplicate (round-7/D3 preserved)', async () => {
+    const h = await setup()
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+    w.send(OPS_FRAME(1, 'dup'))
+    expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    // Downgrade writer -> reader and bump the epoch; the connection is still a
+    // live reader, so its idempotent resend of the durable frame is re-acked.
+    h.setRole('u_w', 'reader')
+    h.setEpoch(1)
+    w.send(OPS_FRAME(1, 'dup', 0)) // resend stamped with the pre-downgrade epoch
+    const reack = await w.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')
+    expect(reack[reack.length - 1]).toMatchObject({ ctl: 'ack', q: 1 })
+  })
+})

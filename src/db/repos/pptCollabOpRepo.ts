@@ -123,6 +123,30 @@ export const pptCollabOpRepo = {
   },
 
   /**
+   * The stored op frame (seq + parsed `frame_json`) for `(doc_id, frame_id)`
+   * under a LOCKING read, or null when no op row exists (unseen, or pruned).
+   * Used to verify a duplicate whose ledger row has a NULL `payload_hash` (a
+   * legacy row recorded before the canonical-ops hash, or a row nulled by the
+   * hash-scheme migration): when the op row is still present we can recompute the
+   * canonical-ops hash from `frame_json` and decide match-vs-mismatch instead of
+   * failing closed on the missing hash (XIN-1736 P2-d). A pruned frame (op row
+   * gone) has no `frame_json` to verify against and still fails closed.
+   */
+  async getFrameByFrameIdForUpdateTx(
+    tx: Tx,
+    docId: string,
+    frameId: string,
+  ): Promise<{ seq: number; frame: unknown } | null> {
+    const rows = await tx.query<RawRow>(
+      `SELECT seq, frame_id, frame_json FROM ppt_collab_op WHERE doc_id = ? AND frame_id = ? FOR UPDATE`,
+      [docId, frameId],
+    )
+    if (!rows[0]) return null
+    const op = toOp(rows[0])
+    return { seq: op.seq, frame: op.frame }
+  },
+
+  /**
    * Highest seq still PRESENT in this table (0 when none). This is NOT the
    * room's authoritative high-water — a prune drops rows so this can regress;
    * {@link ../repos/pptRelaySeqRepo.currentSeq} is the monotonic high-water. Kept

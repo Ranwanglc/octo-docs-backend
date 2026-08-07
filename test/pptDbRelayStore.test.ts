@@ -99,6 +99,15 @@ function makeDb() {
         return row !== undefined ? [{ seq: row.seq, payload_hash: row.payloadHash }] : []
       }
       if (sql.includes('UPDATE ppt_collab_frame')) {
+        if (sql.includes('SET payload_hash')) {
+          // Backfill a NULL payload_hash after frame_json verification (P2-d):
+          // `SET payload_hash = ? WHERE doc_id = ? AND frame_id = ? AND payload_hash IS NULL`.
+          const [hash, docId, frameId] = p as [string, string, string]
+          const ledger = frames.get(docId)
+          const prev = ledger?.get(frameId)
+          if (prev && prev.payloadHash === null) ledger!.set(frameId, { seq: prev.seq, payloadHash: hash })
+          return []
+        }
         // Repoint a ledger row (P1-1 b op-dup reconciliation): `SET seq = ? WHERE
         // doc_id = ? AND frame_id = ?`.
         const [seq, docId, frameId] = p as [number, string, string]
@@ -136,7 +145,9 @@ function makeDb() {
       const [docId, frameId] = p as [string, string]
       const room = ops.get(docId)
       if (!room) return []
-      for (const row of room.values()) if (row.frameId === frameId) return [{ seq: row.seq }]
+      // Return the full row (seq + frame_json) so both the seq-only lookup and
+      // the frame_json lookup (NULL-hash verification, P2-d) route here.
+      for (const row of room.values()) if (row.frameId === frameId) return [{ seq: row.seq, frame_id: row.frameId, frame_json: row.frameJson }]
       return []
     }
     if (sql.includes('INSERT INTO ppt_collab_op')) {
@@ -265,6 +276,7 @@ vi.mock('../src/db/pool.js', () => ({
 }))
 
 import { DbPptRelayStore } from '../src/ppt/relay/dbStore.js'
+import { canonicalPayloadHash } from '../src/ppt/relay/store.js'
 import type { BentoDoc } from '../src/ppt/bentoDoc.js'
 
 function deck(title = 'S'): BentoDoc {
@@ -554,3 +566,101 @@ describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-169
     await cursor.close()
   })
 })
+
+describe('DbPptRelayStore — RC round-12 (XIN-1736)', () => {
+  const opsFrame = (value: unknown, extra: Record<string, unknown> = {}): unknown => ({
+    t: 'ops',
+    pv: 2,
+    k: 1,
+    frameId: 'x',
+    epoch: 0,
+    ops: [{ kind: 'set', key: 's1e1', prop: 'x', value }],
+    ...extra,
+  })
+
+  it('P1-A: a resend of the SAME edit after an epoch bump (new epoch/k, reordered keys) re-acks, not refused', async () => {
+    const store = new DbPptRelayStore()
+    const first = await store.appendOp(D, 'e1', opsFrame(1, { epoch: 0, k: 1 }))
+    expect(first.duplicate).toBe(false)
+    // Same ops, different transport envelope (the exact resend the pre-fix
+    // whole-envelope hash permanently refused as `protocol-version`).
+    const resend = { pv: 2, t: 'ops', frameId: 'e1', k: 9, epoch: 5, ops: [{ value: 1, prop: 'x', key: 's1e1', kind: 'set' }] }
+    const again = await store.appendOp(D, 'e1', resend)
+    expect(again).toMatchObject({ seq: first.seq, duplicate: true })
+    expect(db.ops.get(D)!.size).toBe(1)
+  })
+
+  it('P1-A: a resend with the SAME frameId but DIFFERENT ops is still refused', async () => {
+    const store = new DbPptRelayStore()
+    await store.appendOp(D, 'e2', opsFrame(1))
+    await expect(store.appendOp(D, 'e2', opsFrame(2))).rejects.toMatchObject({ duplicatePayloadMismatch: true })
+  })
+
+  it('P2-d: a NULL-hash ledger row whose op row still exists is verified against frame_json (re-ack + backfill)', async () => {
+    const store = new DbPptRelayStore()
+    const frame = opsFrame(1)
+    db.ops.set(D, new Map([[1, { seq: 1, frameId: 'legacy', frameJson: JSON.stringify(frame), frameBytes: 40 }]]))
+    db.seqCounter.set(D, 1)
+    db.frames.set(D, new Map([['legacy', { seq: 1, payloadHash: null }]]))
+    const res = await store.appendOp(D, 'legacy', frame)
+    expect(res).toMatchObject({ seq: 1, duplicate: true })
+    // Backfilled so the next resend re-acks on the fast hash path.
+    expect(db.frames.get(D)!.get('legacy')!.payloadHash).toBe(canonicalPayloadHash(frame))
+  })
+
+  it('P2-d: a NULL-hash ledger row whose op row exists but ops DIFFER is refused (not blindly re-acked)', async () => {
+    const store = new DbPptRelayStore()
+    db.ops.set(D, new Map([[1, { seq: 1, frameId: 'legacy2', frameJson: JSON.stringify(opsFrame(1)), frameBytes: 40 }]]))
+    db.seqCounter.set(D, 1)
+    db.frames.set(D, new Map([['legacy2', { seq: 1, payloadHash: null }]]))
+    await expect(store.appendOp(D, 'legacy2', opsFrame(2))).rejects.toMatchObject({ duplicatePayloadMismatch: true })
+  })
+
+  it('P1-G: a byte-bounded replay advances the cursor past EVERY fetched row (no re-fetch of dropped rows)', async () => {
+    const store = new DbPptRelayStore()
+    for (const n of [1, 2, 3, 4]) await store.appendOp(D, `g${n}`, opsFrame('y'.repeat(60), { frameId: `g${n}` }))
+    // Large row cap, tiny byte cap: the pre-fix code fetched all rows, emitted one
+    // (byte-bounded), advanced the cursor only past it, and re-SELECTed the rest
+    // every page. The fix fetches once and emits byte-by-byte from the buffer.
+    const cursor = await store.openReplay(D, 0, { pageRows: 100, pageBytes: 1 })
+    db.sqlLog.length = 0
+    const seqs: number[] = []
+    for (;;) {
+      const page = await cursor.nextPage()
+      if (page.length === 0) break
+      seqs.push(...page.map((o) => o.seq))
+    }
+    await cursor.close()
+    expect(seqs).toEqual([1, 2, 3, 4]) // each op delivered exactly once, in order
+    const opPageSelects = db.sqlLog.filter((s) => s.includes('SELECT seq, frame_id, frame_json FROM ppt_collab_op')).length
+    expect(opPageSelects).toBeLessThanOrEqual(2) // one batch + one EOF probe; pre-fix re-fetched per row
+  })
+
+  it('P1-H: the head read and each op page run in SEPARATE short transactions (no tx held across pages)', async () => {
+    const store = new DbPptRelayStore()
+    for (const n of [1, 2, 3]) await store.appendOp(D, `h${n}`, opsFrame(n, { frameId: `h${n}` }))
+    db.sqlLog.length = 0
+    const cursor = await store.openReplay(D, 0, { pageRows: 1, pageBytes: 1_000_000 })
+    await cursor.nextPage()
+    await cursor.nextPage()
+    await cursor.nextPage()
+    await cursor.close()
+    const starts = db.sqlLog.filter((s) => s.includes('START TRANSACTION WITH CONSISTENT SNAPSHOT')).length
+    expect(starts).toBeGreaterThan(1) // pre-fix: exactly one long-held transaction
+  })
+
+  it('P1-B: a concurrent snapshot+prune advancing coverage past the cursor makes the next page retryable (no silent skip)', async () => {
+    const store = new DbPptRelayStore()
+    for (const n of [1, 2, 3, 4, 5]) await store.appendOp(D, `b${n}`, opsFrame(n, { frameId: `b${n}` }))
+    const cursor = await store.openReplay(D, 0, { pageRows: 2, pageBytes: 1_000_000 })
+    expect((await cursor.nextPage()).map((o) => o.seq)).toEqual([1, 2])
+    // A snapshot commits covering seq 4 and prunes 1..4 while we page.
+    await store.saveSnapshot({ docId: D, coveredSeq: 4, doc: deck() })
+    await store.pruneOpsThrough(D, 4)
+    // The next page's fresh snapshot read sees coverage advanced past the cursor
+    // (2), so it refuses retryably instead of skipping the now-pruned 3 and 4.
+    await expect(cursor.nextPage()).rejects.toMatchObject({ retryable: true })
+    await cursor.close()
+  })
+})
+
