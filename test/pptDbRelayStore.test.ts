@@ -32,7 +32,7 @@ import { createHash } from 'node:crypto'
 
 // ── In-memory fake of the four relay tables ─────────────────────────────────
 interface OpRow { seq: number; frameId: string; frameJson: string; frameBytes: number }
-interface SnapRow { version: number; covered: number; docJson: string; sha: string; bytes: number }
+interface SnapRow { version: number; covered: number; docJson: string; sha: string; bytes: number; stateJson: string | null }
 interface FrameRow { seq: number; payloadHash: string | null }
 
 function payloadHash(frameJson: string): string {
@@ -204,19 +204,20 @@ function makeDb() {
     }
     // ── ppt_live_snapshot: atomic advance with covered-guard ──
     if (sql.includes('INSERT INTO ppt_live_snapshot')) {
-      const [docId, covered, docJson, sha, bytes] = p as [string, number, string, string, number]
+      // Params: docId, covered, docJson, sha, bytes, stateJson, stateSha, stateBytes
+      const [docId, covered, docJson, sha, bytes, stateJson] = p as [string, number, string, string, number, string | null]
       const cur = snapshot.get(docId)
       if (!cur) {
-        snapshot.set(docId, { version: 1, covered, docJson, sha, bytes })
+        snapshot.set(docId, { version: 1, covered, docJson, sha, bytes, stateJson: stateJson ?? null })
       } else if (covered >= cur.covered) {
-        snapshot.set(docId, { version: cur.version + 1, covered, docJson, sha, bytes })
+        snapshot.set(docId, { version: cur.version + 1, covered, docJson, sha, bytes, stateJson: stateJson ?? null })
       } // else: covered regression -> keep row, no version bump (P0-3 guard)
       return []
     }
     if (sql.includes('FROM ppt_live_snapshot')) {
       const cur = snapshot.get(p[0] as string)
       if (!cur) return []
-      return [{ snapshot_version: cur.version, covered_seq: cur.covered, doc_json: cur.docJson }]
+      return [{ snapshot_version: cur.version, covered_seq: cur.covered, doc_json: cur.docJson, state_json: cur.stateJson }]
     }
     throw new Error(`unrouted SQL in fake: ${sql}`)
   }

@@ -15,6 +15,7 @@ import { RedisTicketStore } from '../../auth/pptCollabToken.js'
 import { currentEpoch } from '../../permission/epoch.js'
 import { recheckCurrentRole } from '../../permission/resolveRole.js'
 import { docMetaRepo } from '../../db/repos/docMetaRepo.js'
+import { pptDocStateRepo } from '../../db/repos/pptDocStateRepo.js'
 
 /** Build the production relay wired to DB/Redis-backed dependencies. */
 export function createPptRelay(): PptRelay {
@@ -41,5 +42,11 @@ export function createPptRelay(): PptRelay {
       // (XIN-1693 P2-f). Any other status is live.
       return meta && meta.status !== 0 && meta.status !== 2 ? 'live' : 'deleted'
     },
+    // Genesis-deck source for the server-side snapshotter's FIRST reduction, before
+    // any durable snapshot exists (XIN-1759 Part B): the materialized starter deck
+    // persisted at create time (`ppt_doc_state.draft_doc`). Once the snapshotter has
+    // produced a snapshot it reduces onto that instead. Null (no row) degrades safely
+    // — the room simply keeps its op log until a base deck is available.
+    baseDocProvider: async (docId) => (await pptDocStateRepo.getSource(docId))?.draftDoc ?? null,
   })
 }

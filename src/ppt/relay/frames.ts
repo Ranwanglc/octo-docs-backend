@@ -12,11 +12,13 @@
  * `snap`) require writer/admin; the ephemeral frames (`hello`, `need`, `p`,
  * `bye`) are allowed for every role.
  */
+import type { SyncStateJSON } from '../sync/slidesSync.js'
 
 /** The five Bento op kinds the relay accepts (§7.2). */
 export const OP_KINDS = ['set', 'ins', 'del', 'ord', 'txt'] as const
 export type OpKind = (typeof OP_KINDS)[number]
 const OP_KIND_SET: ReadonlySet<string> = new Set(OP_KINDS)
+
 
 /** Client → server frame types. */
 export const CLIENT_FRAME_TYPES = ['hello', 'ops', 'need', 'p', 'bye', 'snap', 'reauth'] as const
@@ -194,6 +196,15 @@ export interface SnapshotReplayCtl {
   ctl: 'snapshot'
   snapshotVersion: number
   doc: unknown
+  /**
+   * The serialized Bento `SyncState` (version vector / registers / positions /
+   * births / tombs / text generations / stash / limbo) the `doc` was materialized
+   * from (XIN-1759 Part B / XIN-1764 Option 2). A late joiner needs BOTH `doc` and
+   * `state` to deterministically apply the ops that follow (`q > coveredSeq`): the
+   * doc alone cannot converge concurrent edits against the snapshot boundary. Null
+   * only for a legacy doc-only snapshot with no persisted state (pre-Part-B rows).
+   */
+  state: SyncStateJSON | null
 }
 export interface OpReplayCtl {
   ctl: 'op'
@@ -295,13 +306,95 @@ export function parseClientFrame(raw: unknown, expectedPv: number): FrameParseRe
   return { ok: true, frame: f as unknown as ClientFrame }
 }
 
-/** True when every entry in `ops` is a well-formed op with a whitelisted kind. */
+/** True when every entry in `ops` is a structurally-valid Bento `Op` (XIN-1759
+ * Part B / XIN-1764 Option 2). The relay no longer accepts the legacy octo op
+ * envelope (`{kind,key,prop,delta}`): persisted ops now carry Bento's own wire op
+ * so the server-side snapshotter can reduce them through the vendored Bento
+ * `SyncEngine`. Every op MUST carry the `OpBase` metadata (`a` actor, `s` per-actor
+ * sequence, `l` lamport) plus the per-kind fields the engine reads — validated here
+ * up front so a malformed op is refused on the wire rather than corrupting a
+ * reduction. Envelope validation stays SEPARATE from the CRDT reducer's own
+ * semantics (birth gates, RGA seeds): this only checks shape. */
 export function opsAreValid(ops: unknown): ops is unknown[] {
   if (!Array.isArray(ops)) return false
   for (const op of ops) {
-    if (typeof op !== 'object' || op === null) return false
-    const kind = (op as Record<string, unknown>).kind
-    if (typeof kind !== 'string' || !OP_KIND_SET.has(kind)) return false
+    if (!isBentoOp(op)) return false
   }
   return true
+}
+
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === 'string' && v.length > 0
+}
+
+/** A positive safe integer (Bento's `stamp` starts `l`/`s` at 1). */
+function isPosSafeInt(v: unknown): v is number {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 1
+}
+
+/** A Bento register stamp `[lamport, actor]`. */
+function isReg(v: unknown): boolean {
+  return (
+    Array.isArray(v) &&
+    v.length === 2 &&
+    typeof v[0] === 'number' &&
+    Number.isSafeInteger(v[0]) &&
+    v[0] >= 0 &&
+    typeof v[1] === 'string'
+  )
+}
+
+/**
+ * Structural validation of a single Bento `Op`. Mirrors the op shapes the vendored
+ * engine mints (`src/ppt/sync/crdt.ts` `SetOp`/`InsOp`/`DelOp`/`OrdOp`/`TxtOp`) and
+ * reads in `applyEffect`. Checks the discriminant (`op`), the shared `OpBase`
+ * metadata (`a`/`s`/`l`), and the required per-kind fields; optional fields are
+ * type-checked only when present. Exported for direct unit coverage.
+ */
+export function isBentoOp(op: unknown): boolean {
+  if (typeof op !== 'object' || op === null) return false
+  const o = op as Record<string, unknown>
+  if (typeof o.op !== 'string' || !OP_KIND_SET.has(o.op)) return false
+  // OpBase: every op carries actor + per-actor seq + lamport.
+  if (!isNonEmptyString(o.a) || !isPosSafeInt(o.s) || !isPosSafeInt(o.l)) return false
+  switch (o.op) {
+    case 'set':
+      // node id is implicit @doc when neither el nor sl is present; `k` is required.
+      if (!isNonEmptyString(o.k)) return false
+      if (o.el !== undefined && typeof o.el !== 'string') return false
+      if (o.sl !== undefined && typeof o.sl !== 'string') return false
+      return true // `v` is any (undefined = key delete)
+    case 'ins':
+      if (o.kind !== 'slide' && o.kind !== 'element') return false
+      if (!isNonEmptyString(o.id) || !isNonEmptyString(o.ord)) return false
+      if (typeof o.node !== 'object' || o.node === null) return false
+      if (o.sl !== undefined && typeof o.sl !== 'string') return false
+      return true
+    case 'del':
+      if (o.kind !== 'slide' && o.kind !== 'element') return false
+      if (!isNonEmptyString(o.id)) return false
+      if (o.cas !== undefined && !(Array.isArray(o.cas) && o.cas.every((c) => typeof c === 'string'))) return false
+      return true
+    case 'ord':
+      if (o.kind !== 'slide' && o.kind !== 'element') return false
+      if (!isNonEmptyString(o.id) || !isNonEmptyString(o.ord)) return false
+      if (o.sl !== undefined && typeof o.sl !== 'string') return false
+      return true
+    case 'txt':
+      if (!isNonEmptyString(o.el) || !isReg(o.sd)) return false
+      if (o.base !== undefined && typeof o.base !== 'string') return false
+      if (o.del !== undefined && !(Array.isArray(o.del) && o.del.every((d) => typeof d === 'string'))) return false
+      if (o.ins !== undefined) {
+        if (!Array.isArray(o.ins)) return false
+        for (const seg of o.ins) {
+          if (typeof seg !== 'object' || seg === null) return false
+          const s = seg as Record<string, unknown>
+          if (typeof s.at !== 'string') return false
+          if (!(Array.isArray(s.toks) && s.toks.every((t) => typeof t === 'string'))) return false
+        }
+      }
+      return true
+    default:
+      return false
+  }
 }

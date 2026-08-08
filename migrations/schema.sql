@@ -302,6 +302,7 @@ CREATE TABLE doc_access_notify_card (
 --   · 2026-08-06-add-ppt-collab-seq-counter.sql      (ppt_collab_seq)
 --   · 2026-08-07-add-ppt-collab-frame-dedup.sql + -append-time-authority + -payload-hash-bin
 --     + -payload-hash-canonical-ops.sql             (ppt_collab_frame + payload-hash scheme)
+--   · 2026-08-08-ppt-live-snapshot-sync-state.sql    (ppt_live_snapshot.state_json/_sha/_bytes)
 -- ---------------------------------------------------------------------------
 
 -- Per-document PPT state that does not belong on the shared doc_meta row: the
@@ -373,6 +374,13 @@ CREATE TABLE ppt_live_snapshot (
   doc_json         MEDIUMTEXT  NOT NULL,                  -- the authoritative BentoDoc snapshot, plaintext JSON
   doc_sha          CHAR(64)    NOT NULL,                  -- sha256(hex) of doc_json (integrity / dedup)
   doc_bytes        INT         NOT NULL DEFAULT 0,        -- byte size of doc_json
+  -- Serialized Bento SyncState reduced ALONGSIDE doc_json, persisted atomically
+  -- with it and covered_seq so a late joiner replays (doc,state) then applies ops
+  -- with seq > covered_seq deterministically (R4-B1 XIN-1759 Part B / XIN-1764
+  -- Option 2). NULL only for a legacy doc-only row written before this column.
+  state_json       MEDIUMTEXT  NULL DEFAULT NULL,         -- serialized SyncStateJSON (nullable: legacy doc-only rows)
+  state_sha        CHAR(64)    NULL DEFAULT NULL,         -- sha256(hex) of state_json
+  state_bytes      INT         NOT NULL DEFAULT 0,        -- byte size of state_json (0 when NULL)
   created_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (doc_id)

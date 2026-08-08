@@ -50,6 +50,14 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
   // issuance, and a direct writer/admin resolved no membership IO.
   const { meta, role, spaceMember } = await loadPptDocForRead(uid, spaceId, docId, { token })
 
+  // Access floor FIRST: a caller with no role must be told only that it has no
+  // access — never a stored-name/type defect below. Checking access before the
+  // document_name validation stops a stored-name defect from leaking to a caller
+  // who cannot even see the deck.
+  if (role === 'none') {
+    throw new PptApiError('FORBIDDEN', 'no access to this document')
+  }
+
   // A corrupt document_name / type pairing must not mint a relay credential:
   // treat a malformed or cross-type name as forbidden (never leak more than the
   // guard already did). The type check above is authoritative for the row kind;
@@ -62,10 +70,6 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
   } catch (err) {
     if (err instanceof PptApiError) throw err
     throw new PptApiError('FORBIDDEN', 'document name is malformed')
-  }
-
-  if (role === 'none') {
-    throw new PptApiError('FORBIDDEN', 'no access to this document')
   }
 
   // Live snapshot VERSION tag (snapshot-change detection), sourced from the

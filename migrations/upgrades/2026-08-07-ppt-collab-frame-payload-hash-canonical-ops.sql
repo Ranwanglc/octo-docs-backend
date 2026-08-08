@@ -51,7 +51,22 @@ DROP PROCEDURE IF EXISTS octo_ppt_collab_frame_retire_envelope_hash //
 
 CREATE PROCEDURE octo_ppt_collab_frame_retire_envelope_hash()
 BEGIN
-  DECLARE v_rows BIGINT DEFAULT 1;
+  -- Seek (keyset) cursor over the composite primary key (doc_id, frame_id).
+  -- v_first guards the very first window: before any real key has been seen the
+  -- lower bound is "everything", so we skip the `> cursor` predicate rather than
+  -- rely on a sentinel value that would have to sort below every real key
+  -- (frame_id is utf8mb4_bin, so a naive '' sentinel is fragile). v_done is set
+  -- by the NOT FOUND handler when a window SELECT returns no row.
+  DECLARE v_first TINYINT DEFAULT 1;
+  DECLARE v_done  TINYINT DEFAULT 0;
+  DECLARE v_last_doc    VARCHAR(64) CHARACTER SET utf8mb4;
+  DECLARE v_last_frame  VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+  DECLARE v_batch_doc   VARCHAR(64) CHARACTER SET utf8mb4;
+  DECLARE v_batch_frame VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+
+  -- A window SELECT that finds no more rows raises NOT FOUND (SQLSTATE 02000),
+  -- which is NOT a SQLEXCEPTION and so does not trip the rollback handler below.
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
 
   DECLARE EXIT HANDLER FOR SQLEXCEPTION
   BEGIN
@@ -59,23 +74,82 @@ BEGIN
     RESIGNAL;
   END;
 
-  -- Batch the rewrite so a large ledger is not nulled in one lock-heavy UPDATE.
-  -- ORDER BY the primary key so the batched UPDATE ... LIMIT touches a
-  -- deterministic set of rows each iteration. Safe under ROW-based binlog either
-  -- way, but an unordered UPDATE ... LIMIT is flagged as non-deterministic under
-  -- statement-based/mixed replication (XIN-1739 P2).
+  -- KEYSET (seek) pagination over (doc_id, frame_id), NOT the previous
+  -- OFFSET-free `ORDER BY ... LIMIT 2000` scan.
+  --
+  -- WHY: the old batch loop re-scanned/sorted from the start of the
+  -- (doc_id, frame_id) index on EVERY iteration to find the next non-null rows,
+  -- making the whole retire O(N^2) on a large ledger. Here each batch resumes
+  -- STRICTLY AFTER the last key touched by the previous batch, so every row is
+  -- visited once and the total work is O(N). Advancement is driven by the KEY,
+  -- never by the `payload_hash IS NOT NULL` filter, so a window full of
+  -- already-null rows still moves the cursor forward and the loop cannot stall or
+  -- rescan. It stays deterministic under both row- and statement-based binlog:
+  -- each UPDATE targets a closed key window `(cursor, batch_max]` (no bare
+  -- `LIMIT` on the UPDATE), so the replicated statement rewrites exactly the same
+  -- rows regardless of physical row order.
   retire_loop: LOOP
-    START TRANSACTION;
-    UPDATE ppt_collab_frame
-       SET payload_hash = NULL
-     WHERE payload_hash IS NOT NULL
-     ORDER BY doc_id, frame_id
-     LIMIT 2000;
-    SET v_rows = ROW_COUNT();
-    COMMIT;
-    IF v_rows = 0 THEN
+    -- Boundary probe: the max key of the NEXT up-to-2000 rows after the cursor.
+    -- Take up to 2000 rows in ascending key order, then pick the largest key of
+    -- that window (its last row). This works for both a full 2000-row batch and
+    -- the final partial batch; NOT FOUND (no rows left) sets v_done.
+    SET v_done = 0;
+    IF v_first = 1 THEN
+      SELECT w.doc_id, w.frame_id
+        INTO v_batch_doc, v_batch_frame
+        FROM (
+          SELECT doc_id, frame_id
+            FROM ppt_collab_frame
+           ORDER BY doc_id, frame_id
+           LIMIT 2000
+        ) AS w
+       ORDER BY w.doc_id DESC, w.frame_id DESC
+       LIMIT 1;
+    ELSE
+      SELECT w.doc_id, w.frame_id
+        INTO v_batch_doc, v_batch_frame
+        FROM (
+          SELECT doc_id, frame_id
+            FROM ppt_collab_frame
+           WHERE doc_id > v_last_doc
+              OR (doc_id = v_last_doc AND frame_id > v_last_frame)
+           ORDER BY doc_id, frame_id
+           LIMIT 2000
+        ) AS w
+       ORDER BY w.doc_id DESC, w.frame_id DESC
+       LIMIT 1;
+    END IF;
+
+    IF v_done = 1 THEN
       LEAVE retire_loop;
     END IF;
+
+    -- Null the non-null rows inside this batch's closed key window
+    -- (cursor, batch_max]. Transaction-per-batch keeps each rewrite short-lived.
+    START TRANSACTION;
+    IF v_first = 1 THEN
+      UPDATE ppt_collab_frame
+         SET payload_hash = NULL
+       WHERE payload_hash IS NOT NULL
+         AND (doc_id < v_batch_doc
+              OR (doc_id = v_batch_doc AND frame_id <= v_batch_frame));
+    ELSE
+      UPDATE ppt_collab_frame
+         SET payload_hash = NULL
+       WHERE payload_hash IS NOT NULL
+         AND (doc_id > v_last_doc
+              OR (doc_id = v_last_doc AND frame_id > v_last_frame))
+         AND (doc_id < v_batch_doc
+              OR (doc_id = v_batch_doc AND frame_id <= v_batch_frame));
+    END IF;
+    COMMIT;
+
+    -- Advance the cursor to this batch's max key (strictly ahead of the previous
+    -- cursor because every window row was > cursor), guaranteeing progress and
+    -- termination once no rows remain beyond it.
+    SET v_last_doc = v_batch_doc;
+    SET v_last_frame = v_batch_frame;
+    SET v_first = 0;
   END LOOP;
 END //
 

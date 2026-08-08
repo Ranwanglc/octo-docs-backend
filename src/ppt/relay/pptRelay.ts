@@ -28,7 +28,7 @@ import type { Duplex } from 'node:stream'
 import { WebSocketServer, WebSocket } from 'ws'
 import { config } from '../../config/env.js'
 import { roleAtLeast, roleRank, type ResolvedRole } from '../../permission/role.js'
-import { isBentoDoc, type BentoDoc } from '../bentoDoc.js'
+import { type BentoDoc } from '../bentoDoc.js'
 import {
   parseClientFrame,
   opsAreValid,
@@ -47,9 +47,9 @@ import {
   isRetryableStorageError,
   RetryableStorageError,
   type PptRelayStore,
-  type RelaySnapshot,
   type ReplayCursor,
 } from './store.js'
+import { PptSnapshotter, type SnapshotRunResult } from './snapshotter.js'
 import {
   verifyPptRelayTicket,
   InMemoryTicketStore,
@@ -106,10 +106,18 @@ export interface RelayLimits {
   reauthGraceMs: number
   /** Max inbound frames queued on a connection's ordering chain before shedding. */
   maxInboundQueue: number
+  /**
+   * Room persisted-byte usage above which the server-side snapshotter is triggered
+   * SOFTLY after a non-duplicate append (XIN-1759 Part B). Default
+   * `min(64 MiB, floor(2/3 · maxRoomFrameBytes))` so a room compacts well before it
+   * approaches the hard `maxRoomFrameBytes` cap that would refuse writes `room-full`.
+   */
+  snapshotSoftThresholdBytes: number
 }
 
 function defaultLimits(): RelayLimits {
   const r = config.ppt.relay
+  const softDefault = Math.min(64 * 1024 * 1024, Math.floor((2 / 3) * r.maxRoomFrameBytes))
   return {
     maxFrameBytes: r.maxFrameBytes,
     maxOpsPerFrame: r.maxOpsPerFrame,
@@ -130,6 +138,7 @@ function defaultLimits(): RelayLimits {
     docStatusCacheTtlMs: r.docStatusCacheTtlMs,
     reauthGraceMs: r.reauthGraceMs,
     maxInboundQueue: r.maxInboundQueue,
+    snapshotSoftThresholdBytes: softDefault,
   }
 }
 
@@ -176,6 +185,15 @@ export interface PptRelayDeps {
   roleProvider?: (ctx: RoleResolutionContext) => Promise<ResolvedRole>
   /** Doc liveness for the doc-deleted guard (default: assume live). */
   docStatusProvider?: (docId: string) => Promise<'live' | 'deleted'>
+  /**
+   * The genesis BentoDoc for a room, used by the server-side snapshotter as the
+   * reduction base BEFORE any durable snapshot exists (XIN-1759 Part B). Production
+   * wires it to `ppt_doc_state.draft_doc` (the materialized starter deck). Without
+   * it, the snapshotter cannot produce a room's FIRST snapshot (soft triggers no-op,
+   * a forced trigger falls through to `room-full`) — a safe degradation, never a
+   * corruption. Once a snapshot exists the snapshotter reduces onto it, not this.
+   */
+  baseDocProvider?: (docId: string) => Promise<BentoDoc | null>
   protocolVersion?: number
   limits?: Partial<RelayLimits>
 }
@@ -262,35 +280,19 @@ interface Conn {
   /** Live frames buffered while this connection is not yet caught up (P1-4). */
   liveBuffer: ServerFrame[]
   /**
-   * Highest op seq this connection has an authoritative basis for — observed as a
-   * peer `op.q`, an author `ack.q`, or covered by a delivered snapshot (XIN-1739).
-   * This is a HIGH-WATER, NOT a contiguous prefix: the wire contract allows legal
-   * seq gaps (a burned op-dup-reconciliation seq, a rolled-back append), so a
-   * missing intermediate seq is a hole, never a blocker. The replay clamp, the
-   * snapshot-coverage gate, and the live-buffer dedup all key off this value; it
-   * replaces the old contiguous `lastDelivered`, which a single burned seq wedged
-   * forever (P1-1).
+   * Highest room seq this socket has an authoritative DELIVERY basis for — a peer
+   * op sent live, a replay op, a delivered snapshot's coverage, or a fresh authored
+   * write's ack safe to treat as an observation (XIN-1739 / XIN-1759 Part A, renamed
+   * from the overloaded `deliveredThrough`). This is a HIGH-WATER, NOT a contiguous
+   * prefix: the wire contract allows legal seq gaps (a burned op-dup-reconciliation
+   * seq, a rolled-back append), so a missing intermediate seq is a hole, never a
+   * blocker. The replay clamp and the live-buffer dedup key off this value — its ONLY
+   * contracts are (a) not re-sending ops already delivered to this socket and (b)
+   * exactly-once live delivery to this socket. Snapshot prune authority does NOT read
+   * it (that moved to the server-side snapshotter, XIN-1759 Part A). Replaces the old
+   * contiguous `lastDelivered`, which a single burned seq wedged forever (P1-1).
    */
-  observedHighWater: number
-  /**
-   * The lowest room seq below which this connection's document state is NOT backed
-   * by an actual relay delivery — it was TRUSTED from the client's `hello.since`
-   * claim rather than replayed to the socket (XIN-1739 P0-1/P1 prune-gate bypass).
-   *
-   * Set on every SUCCESSFUL replay to the delivered snapshot's `coveredSeq` (the
-   * connection received a full base doc through it) if a snapshot was delivered,
-   * else the clamped `effectiveSince` (the replay's lower bound — ops at or below it
-   * were never streamed, only claimed). It is the connection's ACTUAL delivery floor
-   * and is the authority a `snap` prune is bound to: a `snap` may only prune the op
-   * prefix when everything below this floor is ALREADY subsumed by a durable snapshot
-   * (`coverageFloor <= existing snapshot coveredSeq`). This closes the path where a
-   * writer `hello`s with `since = room high-water` (receiving NO ops), is marked
-   * caught-up, writes one fresh op that inflates `observedHighWater`, then `snap`s
-   * covering it and prunes durable ops it never observed. `Infinity` until the first
-   * successful replay establishes a floor (no snap can pass before then anyway — the
-   * `caughtUp` gate refuses it).
-   */
-  coverageFloor: number
+  deliveredThrough: number
   /** Approximate bytes held in liveBuffer. */
   liveBufferBytes: number
   /** Cached read authority used by no-I/O push delivery. */
@@ -449,6 +451,16 @@ export class PptRelay {
   private readonly roomChains = new Map<string, Promise<void>>()
   private readonly replaySemaphore: Semaphore
   private readonly docStatusCache = new Map<string, { status: 'live' | 'deleted'; expiresAt: number }>()
+  /** Server-side snapshotter (snapshot advancement + op-log prune, XIN-1759 Part B). */
+  private readonly snapshotter: PptSnapshotter
+  /** Genesis-deck provider for the snapshotter's first-snapshot reduction base. */
+  private readonly baseDocProvider?: (docId: string) => Promise<BentoDoc | null>
+  /**
+   * Rooms with a snapshot job already queued on their chain (XIN-1759 Part B). At
+   * most ONE pending snapshot job per room: a soft trigger no-ops while one is
+   * already queued so an append burst cannot fan out into N concurrent reductions.
+   */
+  private readonly snapshotPending = new Set<string>()
 
   constructor(deps: PptRelayDeps) {
     this.store = deps.store
@@ -460,6 +472,8 @@ export class PptRelay {
     this.pv = deps.protocolVersion ?? config.ppt.relay.protocolVersion
     this.limits = { ...defaultLimits(), ...(deps.limits ?? {}) }
     this.replaySemaphore = new Semaphore(this.limits.maxInFlightReplays)
+    this.snapshotter = new PptSnapshotter(this.store)
+    this.baseDocProvider = deps.baseDocProvider
     // noServer: the relay owns no listener of its own — it is attached to B's
     // existing HTTP server (no second service).
     //
@@ -647,8 +661,7 @@ export class PptRelay {
       flushDepth: 0,
       replayPending: null,
       liveBuffer: [],
-      observedHighWater: 0,
-      coverageFloor: Infinity,
+      deliveredThrough: 0,
       liveBufferBytes: 0,
       auth: { readAllowed: roleAtLeast(role, 'reader'), invalidated: false },
       inboundChain: Promise.resolve(),
@@ -761,19 +774,64 @@ export class PptRelay {
   }
 
   /**
-   * Advance this connection's observed HIGH-WATER (XIN-1739 P1-1). A seq at or
-   * below the high-water is already accounted for; a higher seq advances it. This
-   * is a high-water, NOT a contiguous prefix: the wire contract allows legal seq
-   * gaps (a burned op-dup-reconciliation seq, a rolled-back append), and because
-   * observations arrive in room order, seeing seq N means every real op below N was
-   * already delivered to (or is a legal hole for) this connection. The replay
-   * clamp and the snapshot-coverage gate both key off this value. It is advanced
-   * only by genuine OBSERVATIONS — a peer op delivered, a replay op, delivered
-   * snapshot coverage, or a fresh authored write's ack — never by a duplicate
-   * re-ack (see the re-ack path in {@link handleOps}, XIN-1739 P0-2).
+   * Advance this connection's `deliveredThrough` HIGH-WATER (XIN-1739 P1-1 /
+   * XIN-1759 Part A). `deliveredThrough` is the highest room seq this socket has an
+   * authoritative DELIVERY basis for — observed as a peer `op.q`, a replay op,
+   * delivered snapshot coverage, or a fresh authored write's ack. A seq at or below
+   * it is already accounted for; a higher seq advances it. This is a high-water, NOT
+   * a contiguous prefix: the wire contract allows legal seq gaps (a burned
+   * op-dup-reconciliation seq, a rolled-back append), and because deliveries arrive
+   * in room order, seeing seq N means every real op below N was already delivered to
+   * (or is a legal hole for) this connection. The replay clamp and the live-buffer
+   * dedup both key off this value. It is advanced only by genuine relay DELIVERY —
+   * never by a duplicate re-ack (see the re-ack path in {@link handleOps}, XIN-1739
+   * P0-2). Snapshot PRUNE authority no longer reads it: pruning is a room/store
+   * concern owned by the server-side snapshotter, not a per-connection delivery
+   * fact (XIN-1759 Part A).
    */
-  private markObservedSeq(conn: Conn, seq: number): void {
-    if (seq > conn.observedHighWater) conn.observedHighWater = seq
+  private markDeliveredThrough(conn: Conn, seq: number): void {
+    if (seq > conn.deliveredThrough) conn.deliveredThrough = seq
+  }
+
+  /**
+   * The SINGLE shared delivery-stability predicate (XIN-1759 Part A). A connection
+   * is delivery-stable when its first replay has reached a stable boundary
+   * (`caughtUp`), no replay is streaming to it (`!replayInFlight`), and no catch-up
+   * buffer drain is in progress (`flushDepth === 0`). Every site that must decide
+   * "is this socket in a settled state where a live op can be delivered / a fresh
+   * authored write is a true observation / a new replay may start" reads THIS
+   * predicate instead of restating the three-part busy check — the round-19 P0 was
+   * exactly one of those four sites (`markDeliveredThrough` on an authored write)
+   * omitting `!replayInFlight` and diverging from the others.
+   */
+  private isDeliveryStable(conn: Conn): boolean {
+    return conn.caughtUp && !conn.replayInFlight && conn.flushDepth === 0
+  }
+
+  /**
+   * Whether a fresh authored write may advance `deliveredThrough` (XIN-1759 Part A).
+   * True only for a NON-duplicate write on a delivery-stable socket that can still
+   * be pushed to. A caught-up author with no replay/drain in flight HAS received
+   * every lower real op in room order before its own ack, so advancing then is a
+   * true observation; a duplicate re-ack, a not-yet-caught-up socket, an in-flight
+   * replay (round-19 P0), or a socket mid-drain is NOT (each would advance past ops
+   * this connection never actually received — poisoning the replay clamp and the
+   * live-buffer dedup that key off `deliveredThrough`).
+   */
+  private canAdvanceDeliveredThroughFromAuthor(conn: Conn, duplicate: boolean): boolean {
+    return !duplicate && this.isDeliveryStable(conn) && this.canPushRead(conn)
+  }
+
+  /**
+   * The narrow "a replay or a catch-up drain is in progress" busy check (XIN-1759
+   * Part A). This is the {@link isDeliveryStable} predicate MINUS the `caughtUp`
+   * requirement: {@link requestReplay} must coalesce while a replay/drain is running
+   * even on a NOT-yet-caught-up socket (its first replay), where `isDeliveryStable`
+   * would be false for the wrong reason (`!caughtUp`) and wrongly let a second
+   * concurrent replay start and interleave with the drain (XIN-1739 P1-2).
+   */
+  private isReplayOrDrainBusy(conn: Conn): boolean {
+    return conn.replayInFlight || conn.flushDepth > 0
   }
 
   /**
@@ -795,12 +853,12 @@ export class PptRelay {
       await this.closeConn(peer, terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
       return
     }
-    if (!peer.caughtUp || peer.replayInFlight || peer.flushDepth > 0) {
+    if (!this.isDeliveryStable(peer)) {
       await this.bufferLiveFrame(peer, frame)
       return
     }
     await this.gatedSend(peer, frame)
-    if (frame.ctl === 'op' && peer.socket.readyState === WebSocket.OPEN) this.markObservedSeq(peer, frame.q)
+    if (frame.ctl === 'op' && peer.socket.readyState === WebSocket.OPEN) this.markDeliveredThrough(peer, frame.q)
   }
 
   private async bufferLiveFrame(peer: Conn, frame: ServerFrame): Promise<void> {
@@ -831,7 +889,7 @@ export class PptRelay {
   /**
    * Flush a connection's buffered live frames once its replay has caught up.
    * Op frames whose seq the replay already delivered are dropped (dedup on
-   * `observedHighWater`), so an op buffered during replay that the replay also
+   * `deliveredThrough`), so an op buffered during replay that the replay also
    * streamed is delivered exactly once (P1-4).
    *
    * Drains in BATCHES until the buffer is empty (XIN-1739 P1-2): while flushing,
@@ -852,9 +910,9 @@ export class PptRelay {
           await this.closeConn(conn, terminal?.code ?? CLOSE_FORBIDDEN, terminal?.reason ?? 'read authorization invalidated')
           return
         }
-        if (frame.ctl === 'op' && frame.q <= conn.observedHighWater) continue
+        if (frame.ctl === 'op' && frame.q <= conn.deliveredThrough) continue
         await this.gatedSend(conn, frame)
-        if (frame.ctl === 'op' && conn.socket.readyState === WebSocket.OPEN) this.markObservedSeq(conn, frame.q)
+        if (frame.ctl === 'op' && conn.socket.readyState === WebSocket.OPEN) this.markDeliveredThrough(conn, frame.q)
       }
     }
   }
@@ -1357,7 +1415,7 @@ export class PptRelay {
     // starting a fresh replay mid-drain could interleave replay ops with the
     // buffered live frames and reorder them (XIN-1739 P1-2). Coalesce to the
     // latest cursor and let the current cutover finish first.
-    if (conn.replayInFlight || conn.flushDepth > 0) {
+    if (this.isReplayOrDrainBusy(conn)) {
       conn.replayPending = { since, ready }
       return
     }
@@ -1474,30 +1532,23 @@ export class PptRelay {
         // high-water (not a contiguous prefix) is safe (XIN-1739 P1-1). The raw
         // cursor is still used above for the `> highWater` protocol check; only op
         // delivery is clamped.
-        const effectiveSince = Math.max(rawSince, conn.observedHighWater)
+        const effectiveSince = Math.max(rawSince, conn.deliveredThrough)
         let fromSeq = effectiveSince
         let readySeq = effectiveSince
-        let delivered = conn.observedHighWater
-        // Track whether a snapshot was actually DELIVERED to this socket, and at
-        // what coverage: it sets the connection's prune-authority floor below
-        // (XIN-1739 P0-1/P1). A delivered snapshot means the socket received a full
-        // base doc through its `coveredSeq`; without one, everything at or below the
-        // clamped `effectiveSince` was TRUSTED from the client's `hello.since` claim,
-        // never streamed here.
-        let deliveredSnapshotCovered: number | null = null
+        let delivered = conn.deliveredThrough
         // Only send the snapshot to a peer behind it; an already-synced peer is not
-        // forced to reapply it (PPT-COLLAB-003).
+        // forced to reapply it (PPT-COLLAB-003). Send BOTH doc and state so a late
+        // joiner can deterministically apply the ops that follow (XIN-1759 Part B).
         if (snapshot && effectiveSince < snapshot.coveredSeq) {
           if (!this.canPushRead(conn)) return false
-          await this.gatedSend(conn, { ctl: 'snapshot', snapshotVersion: snapshot.snapshotVersion, doc: snapshot.doc })
+          await this.gatedSend(conn, { ctl: 'snapshot', snapshotVersion: snapshot.snapshotVersion, doc: snapshot.doc, state: snapshot.state })
           fromSeq = snapshot.coveredSeq
           readySeq = snapshot.coveredSeq
-          deliveredSnapshotCovered = snapshot.coveredSeq
           // A snapshot covers all real ops through its coveredSeq; gaps in that
           // interval are legal no-op holes. Advance the high-water to coverage
           // (XIN-1739 P1-1).
-          conn.observedHighWater = Math.max(conn.observedHighWater, snapshot.coveredSeq)
-          delivered = Math.max(delivered, conn.observedHighWater)
+          conn.deliveredThrough = Math.max(conn.deliveredThrough, snapshot.coveredSeq)
+          delivered = Math.max(delivered, conn.deliveredThrough)
         }
         // Highest op seq ACTUALLY delivered, so `ready.q` reports what the client is
         // truly synced through, not the counter high-water (XIN-1655 C6).
@@ -1509,21 +1560,17 @@ export class PptRelay {
             if (op.seq <= fromSeq) continue
             if (!this.canPushRead(conn)) return false
             await this.gatedSend(conn, { ctl: 'op', q: op.seq, frame: op.frame })
-            this.markObservedSeq(conn, op.seq)
-            delivered = conn.observedHighWater
+            this.markDeliveredThrough(conn, op.seq)
+            delivered = conn.deliveredThrough
             readySeq = op.seq
           }
         }
-        conn.observedHighWater = Math.max(conn.observedHighWater, delivered)
-        // Record this replay's ACTUAL delivery floor (XIN-1739 P0-1/P1): a delivered
-        // snapshot means the socket received a full base doc through its coveredSeq;
-        // otherwise ops at or below the clamped `effectiveSince` were only CLAIMED by
-        // the client's `hello.since`, never streamed. `handleSnap` binds prune
-        // authority to this floor so a claimed cursor + one own write can never
-        // authorize pruning ops the connection never observed. Latest replay wins:
-        // a re-`hello` from a higher claimed cursor re-introduces an un-received gap,
-        // while a re-`hello` from `since=0` that streams the whole log lowers it.
-        conn.coverageFloor = deliveredSnapshotCovered ?? effectiveSince
+        conn.deliveredThrough = Math.max(conn.deliveredThrough, delivered)
+        // Snapshot PRUNE authority no longer lives on the connection (XIN-1759 Part
+        // A/B): pruning is a room/store concern owned by {@link PptSnapshotter}, so a
+        // per-connection `coverageFloor` derived from what THIS socket happened to be
+        // streamed is gone. `deliveredThrough` above keeps only its delivery contracts
+        // (replay clamp + live-buffer dedup); it authorizes no prune.
         if (ready) {
           // Fallback is the connection's last-known LIVE epoch (validated at
           // handshake), NOT the snapshot version — stamping a snapshot counter as an
@@ -1607,7 +1654,7 @@ export class PptRelay {
    * authorization, so a revoked/downgraded-to-`none` reader, or a socket on a
    * soft-deleted doc, could harvest a `frameId` and drive an unauthorized store
    * read + a bogus `ack` per frame with no shedding — and round-10's
-   * `markObservedSeq` prune watermark now depends on that path. This gate confirms
+   * `markDeliveredThrough` prune watermark now depends on that path. This gate confirms
    * the connection is still a live-doc reader at the current epoch (doc-status
    * live, epoch refresh with downgrade-only role re-resolution, `role >= reader`)
    * so only an authorized reader ever reaches the lookup. It deliberately does NOT
@@ -1858,7 +1905,7 @@ export class PptRelay {
     // only a live-doc reader at the current epoch reaches the known-duplicate
     // lookup below. Without it, a revoked/downgraded-to-`none` reader or a socket
     // on a deleted doc could drive an unauthorized store read + a bogus re-`ack`
-    // per harvested frameId (and corrupt the markObservedSeq prune watermark). It
+    // per harvested frameId (and corrupt the markDeliveredThrough prune watermark). It
     // does NOT enforce the stale-epoch/writer checks — those stay MUTATION-only —
     // so a genuine idempotent resend from a still-authorized (possibly
     // downgraded-to-reader) connection is still re-acked (round-7 / D3).
@@ -1974,8 +2021,30 @@ export class PptRelay {
       return
     }
     if (roomUsed + frameBytes > this.limits.maxRoomFrameBytes) {
-      this.refuse(conn, 'room-full', { k, frameId, message: 'room frame budget exhausted' })
-      return
+      // FORCED snapshot before refusing (XIN-1759 Part B): the room is full of
+      // persisted ops, but the server-side snapshotter can reduce+prune the tail and
+      // reclaim bytes IN-BAND. We are already inside the room chain here (this handler
+      // runs via `runSerialized`), so call the snapshotter directly (a nested
+      // `runSerialized` would deadlock), then re-read the budget. Only if the write
+      // STILL cannot fit — or the tail could not be reduced (no snapshot produced) —
+      // do we refuse `room-full`. A retryable storage failure surfaces as
+      // `storage-retry` (the client re-sends), never a permanent `room-full`.
+      try {
+        await this.snapshotNow(conn.docId)
+      } catch (err) {
+        if (isRetryableStorageError(err)) {
+          this.refuse(conn, 'storage-retry', { k, frameId, message: 'room-full recovery snapshot deferred' })
+          return
+        }
+        // A permanent snapshot failure cannot reclaim space; the room is still full.
+        this.refuse(conn, 'room-full', { k, frameId, message: 'room frame budget exhausted' })
+        return
+      }
+      roomUsed = this.roomBytes.get(conn.docId) ?? roomUsed
+      if (roomUsed + frameBytes > this.limits.maxRoomFrameBytes) {
+        this.refuse(conn, 'room-full', { k, frameId, message: 'room frame budget exhausted' })
+        return
+      }
     }
     const retryInMs = this.rateLimited(conn.frameTimes)
     if (retryInMs !== null) {
@@ -2015,134 +2084,100 @@ export class PptRelay {
     } catch {
       /* keep the ack: the op is durable regardless of the snapshot read */
     }
-    // Advance the observation high-water for this authored write ONLY when it is a
-    // genuine observation of the room prefix (XIN-1739 P0-1). Three conditions must
-    // all hold, else the watermark would be advanced past ops this connection never
-    // received — poisoning the replay clamp, the live-buffer dedup, and the snapshot
-    // prune gate that all key off it:
-    //   · `!duplicate` — a slow-duplicate resend that fell through to `appendOp`
-    //     (the ledger fast-path missed it) is a re-ack of an already-durable frame,
-    //     NOT evidence the prefix below it was observed (XIN-1739 P0-1b), exactly the
-    //     invariant `reackDuplicate` documents for the pre-gate re-ack paths.
-    //   · `caughtUp` — a fresh authored write from a not-yet-caught-up socket (a
-    //     client that pipelined `hello since=0` with a pending local write) would
-    //     otherwise set its own newly-allocated seq as the replay floor and skip the
-    //     whole op log (XIN-1739 P0-1a).
+    // Advance `deliveredThrough` for this authored write ONLY when it is a genuine
+    // DELIVERY observation of the room prefix, gated by the SINGLE shared predicate
+    // {@link canAdvanceDeliveredThroughFromAuthor} (XIN-1759 Part A) rather than a
+    // restated busy check. That predicate is `!duplicate && isDeliveryStable(conn)
+    // && canPushRead(conn)`, where `isDeliveryStable = caughtUp && !replayInFlight &&
+    // flushDepth === 0`. Each conjunct guards a way the watermark would otherwise
+    // advance past ops this connection never received — poisoning the replay clamp
+    // and the live-buffer dedup that key off `deliveredThrough`:
+    //   · `!duplicate` — a slow-duplicate resend that fell through to `appendOp` is a
+    //     re-ack of an already-durable frame, not evidence the prefix was observed
+    //     (XIN-1739 P0-1b), exactly what `reackDuplicate` documents for the pre-gate paths.
+    //   · `caughtUp` — a write from a not-yet-caught-up socket (a client that
+    //     pipelined `hello since=0` with a pending local write) would set its own
+    //     newly-allocated seq as the floor and skip the whole op log (XIN-1739 P0-1a).
+    //   · `!replayInFlight` — the ROUND-19 P0: a caught-up author that (re-)issued a
+    //     `need`/`hello` so a replay is streaming, buffers a peer op, then authors a
+    //     fresh op, would advance past the buffered-but-undelivered peer op; the
+    //     cutover's dedup (`q <= deliveredThrough`) then DROPS that peer op forever.
+    //     The other three delivery sites already treated an in-flight replay as busy;
+    //     this site alone omitted it. Folding all four onto `isDeliveryStable` closes it.
     //   · `flushDepth === 0` — a caught-up author writing WHILE a drain is in flight
-    //     (an epoch-bump / reauth cutover) would advance past peer ops still sitting
-    //     in `liveBuffer`, which `flushLiveBuffer`'s dedup then silently discards
-    //     (XIN-1739 P0-1c). During a drain the delivered prefix is in flux, so an own
-    //     write is not yet a safe observation.
-    // A caught-up author with no drain pending HAS received every lower real op in
+    //     would advance past peer ops still in `liveBuffer` that the drain's dedup then
+    //     discards (XIN-1739 P0-1c).
+    // A delivery-stable, still-pushable author HAS received every lower real op in
     // room order before its own ack, so advancing then is correct and lets it
     // snapshot its own latest write.
-    if (!duplicate && conn.caughtUp && conn.flushDepth === 0) this.markObservedSeq(conn, seq)
+    if (this.canAdvanceDeliveredThroughFromAuthor(conn, duplicate)) this.markDeliveredThrough(conn, seq)
     void this.gatedSend(conn, { ctl: 'ack', k: frame.k ?? 0, q: seq, snapshotVersion })
     // Broadcast to peers only for a first-seen frame (no echo, no double-apply).
     if (!duplicate) this.broadcast(conn, { ctl: 'op', q: seq, frame })
+    // Soft snapshot trigger (XIN-1759 Part B): a first-seen append grew the room, so
+    // compact opportunistically if it crossed the soft byte threshold. Queued on the
+    // room chain (at most one pending per room); fire-and-forget compaction.
+    if (!duplicate) this.maybeSoftSnapshot(conn.docId)
   }
 
-  private async handleSnap(conn: Conn, frame: SnapFrame, rawBytes: number): Promise<void> {
+  /**
+   * Client `snap` is NO LONGER the GC path (XIN-1759 Part B / XIN-1758). Snapshot
+   * advancement and op-log pruning moved to the in-process server-side
+   * {@link PptSnapshotter}, which reduces persisted ops through the vendored Bento
+   * engine and prunes only after `(doc, state, coveredSeq)` is durable. A
+   * client-provided doc is therefore neither persisted nor used to prune — it can no
+   * longer authorize deleting ops (the P0-1 prune-safety hole that the connection-side
+   * `coverageFloor` guarded is now closed structurally, by not trusting client docs at
+   * all). Reject it as server-managed so R4-F1 stops sending `snap`; non-retryable
+   * (retrying will not change the verdict). `saveSnapshot`/`pruneOpsThrough` are now
+   * callable ONLY from the snapshotter.
+   */
+  private async handleSnap(conn: Conn, frame: SnapFrame, _rawBytes: number): Promise<void> {
     const k = typeof frame.k === 'number' ? frame.k : undefined
-    if (!conn.caughtUp || conn.replayInFlight || conn.flushDepth > 0) {
-      this.refuse(conn, 'snapshot-conflict', { k, message: 'snapshot requires a caught-up connection' })
-      return
+    this.refuse(conn, 'snapshot-conflict', {
+      k,
+      message: 'snapshots are server-managed; client snap is not persisted (XIN-1759)',
+    })
+  }
+
+  /**
+   * Reduce the room to a fresh snapshot and prune the ops it subsumes, updating the
+   * process-local room-byte budget by the reclaimed bytes (XIN-1759 Part B). MUST be
+   * called from inside the room chain (via {@link runSerialized} for the soft path,
+   * or directly from a handler already running in the chain for the forced path) so
+   * it is atomic w.r.t. appends. Returns the run result, or null when there was
+   * nothing to advance / no base doc available. Errors propagate to the caller.
+   */
+  private async snapshotNow(docId: string): Promise<SnapshotRunResult | null> {
+    const res = await this.snapshotter.advance(docId, this.baseDocProvider)
+    if (res && res.freedBytes > 0 && this.roomBytesSeeded.has(docId)) {
+      const used = this.roomBytes.get(docId) ?? 0
+      this.roomBytes.set(docId, Math.max(0, used - res.freedBytes))
     }
-    // The single-blob limit is enforced inside guardMutation (as this frame's
-    // size gate) so a legitimately large snapshot is not pre-empted by the small
-    // per-op-frame cap.
-    const guardCode = await this.guardMutation(conn, typeof frame.epoch === 'number' ? frame.epoch : -1, rawBytes, this.limits.maxSingleBlobBytes)
-    if (guardCode) {
-      this.refuse(conn, guardCode, { k })
-      return
-    }
-    if (!isBentoDoc(frame.doc)) {
-      this.refuse(conn, 'snapshot-conflict', { k, message: 'snapshot is not a valid bento/slides doc' })
-      return
-    }
-    const covered = typeof frame.q === 'number' ? frame.q : -1
-    // D4: the preflight reads run inside `runSerialized`, whose chain tail is
-    // `.catch(()=>{})` — an unguarded throw here is swallowed, so the writer gets
-    // neither `ack` nor `refused` and hangs (the same defect class C4 closed in
-    // `replay()`). Wrap them so a storage failure surfaces `storage-failed`.
-    let currentSeq: number
-    let existing: RelaySnapshot | null
-    try {
-      currentSeq = await this.store.currentSeq(conn.docId)
-      existing = await this.store.getSnapshot(conn.docId)
-    } catch {
-      this.refuse(conn, 'storage-failed', { k, message: 'snapshot preflight failed' })
-      return
-    }
-    // A snapshot must cover a real, non-regressing prefix the connection has
-    // actually observed (its high-water); global currentSeq alone is not authority
-    // for this writer, because an uncaught-up socket could otherwise prune ops it
-    // never saw. Contiguity is NOT required: a writer that observed/acked seq 3 may
-    // snapshot q=3 even if seq 2 is a burned compatibility hole — prune stays safe
-    // because there is no durable op row for the hole and all real ops <= covered
-    // were delivered by the single room order before any higher real op (XIN-1739).
-    //
-    // Prune authority is ALSO bound to the connection's ACTUAL delivery floor
-    // (XIN-1739 P0-1/P1): `observedHighWater` alone can be inflated by a caught-up
-    // socket's own fresh write even though it reached "caught up" via a CLAIMED
-    // `hello.since` cursor and never received the ops below that cursor. Such a
-    // prune would delete a durable op prefix no one on this socket ever observed.
-    // Refuse unless everything below `coverageFloor` is already subsumed by a
-    // DURABLE snapshot (`coverageFloor <= existing.coveredSeq`) — i.e. there are no
-    // un-delivered, un-snapshotted ops the prune could destroy. A from-scratch
-    // socket that streamed the whole log has `coverageFloor = 0` and passes; a
-    // claimed-cursor socket has `coverageFloor = its claimed since` and is refused
-    // until it genuinely replays that prefix or a snapshot already covers it.
-    const existingCovered = existing?.coveredSeq ?? 0
-    if (
-      covered < 0 ||
-      covered > currentSeq ||
-      covered > conn.observedHighWater ||
-      (existing && covered < existing.coveredSeq) ||
-      conn.coverageFloor > existingCovered
-    ) {
-      this.refuse(conn, 'snapshot-conflict', { k, message: 'snapshot covered seq conflicts with the op log' })
-      return
-    }
-    // Rate-limit the persisted snapshot alongside `ops` (shared window): only ops
-    // were rate-limited before, so a client could flood `snap` frames uncapped
-    // (XIN-1660 hardening). Checked after the conflict guard so a rejected snapshot
-    // does not consume a rate slot.
-    const retryInMs = this.rateLimited(conn.frameTimes)
-    if (retryInMs !== null) {
-      this.refuse(conn, 'rate-limited', { k, retryInMs })
-      return
-    }
-    let snapshotVersion: number
-    let prunableSeq: number
-    try {
-      const res = await this.store.saveSnapshot({ docId: conn.docId, coveredSeq: covered, doc: frame.doc as BentoDoc })
-      snapshotVersion = res.snapshotVersion
-      // Prune with the AUTHORITATIVE post-write coveredSeq the store read back
-      // (GREATEST(existing, incoming)), never the client's raw `q`: a snapshot may
-      // only ever prune the op prefix the persisted doc actually subsumes, so an
-      // op the snapshot did not cover can never be deleted (XIN-1693 P0-1). Parse
-      // already refuses a fractional/out-of-range `q`, so this is defense in depth.
-      prunableSeq = res.coveredSeq ?? covered
-    } catch (err) {
-      const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
-      this.refuse(conn, code, { k, message: 'snapshot persistence failed' })
-      return
-    }
-    // GC only AFTER the snapshot is durable (§7.3). The snapshot is already
-    // committed, so a prune failure must NOT swallow the ack (the pruned ops are
-    // subsumed by the durable snapshot; leaving them just defers GC). Reclaim the
-    // freed bytes from the room budget so it does not monotonically grow.
-    try {
-      const freed = await this.store.pruneOpsThrough(conn.docId, prunableSeq)
-      if (this.roomBytesSeeded.has(conn.docId)) {
-        const used = this.roomBytes.get(conn.docId) ?? 0
-        this.roomBytes.set(conn.docId, Math.max(0, used - freed))
+    return res
+  }
+
+  /**
+   * Soft trigger (XIN-1759 Part B): after a non-duplicate append pushed room bytes
+   * past {@link RelayLimits.snapshotSoftThresholdBytes}, queue ONE snapshot job on
+   * the room chain (at most one pending per room). Fire-and-forget: a soft snapshot
+   * is opportunistic compaction, so a failure is logged and the room simply
+   * snapshots on the next trigger (or the forced path before `room-full`).
+   */
+  private maybeSoftSnapshot(docId: string): void {
+    if (this.snapshotPending.has(docId)) return
+    if ((this.roomBytes.get(docId) ?? 0) < this.limits.snapshotSoftThresholdBytes) return
+    this.snapshotPending.add(docId)
+    void this.runSerialized(docId, async () => {
+      try {
+        await this.snapshotNow(docId)
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[ppt-relay] soft snapshot failed (will retry on next trigger):', err)
+      } finally {
+        this.snapshotPending.delete(docId)
       }
-    } catch {
-      /* keep the ack: the snapshot is durable; prune is best-effort GC */
-    }
-    void this.gatedSend(conn, { ctl: 'ack', k: frame.k ?? 0, q: covered, snapshotVersion })
+    })
   }
 
   /**
@@ -2165,13 +2200,6 @@ export class PptRelay {
    */
   async applyEpochBump(documentName: string): Promise<void> {
     this.docStatusCache.clear()
-    for (const room of this.rooms.values()) {
-      for (const conn of room) {
-        if (conn.documentName === documentName) {
-          conn.auth = { readAllowed: false, invalidated: false, pendingReauth: true }
-        }
-      }
-    }
     // Deletion takes precedence: a doc that is now gone closes 4404, not 4403.
     // (This also covers the case where deletion is the only reason for the bump.)
     if (this.docStatusProvider) {
@@ -2196,6 +2224,21 @@ export class PptRelay {
     }
 
     if (!this.roleProvider) return
+    // Freeze every matching socket into `pendingReauth` ONLY now that we know a
+    // `roleProvider` is present to re-resolve (and thereby clear) it below. Setting
+    // this sticky flag before the early return above would wedge sockets on a doc
+    // with no injected `roleProvider`: nothing on that path re-resolves authority or
+    // prompts a `reauth`, so `readAllowed:false, pendingReauth:true` would never be
+    // cleared and every live socket would stall until reconnect (XIN-1739 P2). The
+    // deletion sweep above needs no freeze — a deleted doc's sockets are closed
+    // outright regardless of auth state.
+    for (const room of this.rooms.values()) {
+      for (const conn of room) {
+        if (conn.documentName === documentName) {
+          conn.auth = { readAllowed: false, invalidated: false, pendingReauth: true }
+        }
+      }
+    }
     let newEpoch = 0
     let epochOk = false
     try {

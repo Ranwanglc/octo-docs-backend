@@ -272,6 +272,24 @@ describe('POST /api/v1/ppt/docs/collab-token (§7.1)', () => {
       }
     })
 
+    it('access floor precedes stored-name validation: no-role caller on a malformed-name deck → 403 "no access to this document"', async () => {
+      // The stored document_name is ALSO malformed, but the caller has no role
+      // (neither owner nor member). The access-floor check must win, so the
+      // response must be the access message — never the stored-name defect.
+      seedDoc({ document_name: 'totally-not-a-valid-name' })
+      currentMemberRole = undefined
+      const { base, close } = await listen(makeApp())
+      try {
+        const res = await post(base, { docId: 'd_ppt1' })
+        expect(res.status).toBe(403)
+        const err = ((await res.json()) as { error: { code: string; message: string } }).error
+        expect(err.code).toBe('FORBIDDEN')
+        expect(err.message).toBe('no access to this document')
+      } finally {
+        await close()
+      }
+    })
+
     it('missing docId → 400 VALIDATION_ERROR', async () => {
       const { base, close } = await listen(makeApp())
       try {

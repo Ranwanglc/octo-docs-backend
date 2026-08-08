@@ -110,6 +110,7 @@ async function setup(
     roleProvider?: (ctx: { uid: string; docId: string; documentName: string; spaceMember: boolean }) => Promise<ResolvedRole>
     epochProvider?: (documentName: string) => Promise<number>
     docStatusProvider?: (docId: string) => Promise<'live' | 'deleted'>
+    baseDocProvider?: (docId: string) => Promise<import('../src/ppt/bentoDoc.js').BentoDoc | null>
   } = {},
 ): Promise<Harness> {
   const store = opts.store ?? new InMemoryPptRelayStore()
@@ -122,6 +123,7 @@ async function setup(
     epochProvider: opts.epochProvider ?? (async () => liveEpoch),
     roleProvider: opts.roleProvider ?? (async ({ uid }) => roleMap.get(uid) ?? 'writer'),
     docStatusProvider: opts.docStatusProvider ?? (async () => docStatus),
+    ...(opts.baseDocProvider ? { baseDocProvider: opts.baseDocProvider } : {}),
     limits: opts.limits,
   })
   const server: HttpServer = createServer()
@@ -185,7 +187,19 @@ async function helloReady(c: WsClient, since = 0): Promise<{ ready: Record<strin
   return { ready: replay[replay.length - 1]!, replay }
 }
 
-const OPS_FRAME = (k: number, frameId: string, epoch = 0, ops: unknown[] = [{ kind: 'set', key: 's1e1', prop: 'x', value: 1 }]) => ({
+/** Poll `probe` until it returns a truthy value (fire-and-forget server work like
+ * the soft snapshotter completes on the room chain shortly after an ack). */
+async function waitFor<T>(probe: () => Promise<T | null | undefined>, timeoutMs = 2000): Promise<T> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const v = await probe()
+    if (v) return v
+    if (Date.now() > deadline) throw new Error('waitFor timed out')
+    await new Promise((r) => setTimeout(r, 5))
+  }
+}
+
+const OPS_FRAME = (k: number, frameId: string, epoch = 0, ops: unknown[] = [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'x', v: 1 }]) => ({
   t: 'ops',
   pv: 2,
   k,
@@ -272,11 +286,11 @@ describe('PPT relay: op kinds + ack/broadcast ordering (PPT-WS-003 / PPT-WS-005)
     await helloReady(b)
 
     const ops = [
-      { kind: 'set', key: 's1e1', prop: 'x', value: 1 },
-      { kind: 'ins', key: 's1e1', at: 0, value: 'a' },
-      { kind: 'del', key: 's1e1', at: 0 },
-      { kind: 'ord', key: 's1', order: ['e1'] },
-      { kind: 'txt', key: 's1e1', delta: [{ retain: 1 }] },
+      { op: 'set', a: 'u-test', s: 1, l: 1, k: 'x', v: 1 },
+      { op: 'ins', a: 'u-test', s: 1, l: 1, kind: 'element', id: 's1\u001fe1', sl: 's1', ord: 'a1', node: { id: 'e1' } },
+      { op: 'del', a: 'u-test', s: 1, l: 1, kind: 'element', id: 's1\u001fe1' },
+      { op: 'ord', a: 'u-test', s: 1, l: 1, kind: 'slide', id: 's1', ord: 'a1' },
+      { op: 'txt', a: 'u-test', s: 1, l: 1, el: 's1\u001fe1', sd: [1, 'u-test'], ins: [{ at: '^', toks: ['t'] }] },
     ]
     a.send(OPS_FRAME(42, 'a-f1', 0, ops))
 
@@ -324,10 +338,10 @@ describe('PPT relay: op kinds + ack/broadcast ordering (PPT-WS-003 / PPT-WS-005)
     const a = await h.connect({ uid: 'u_a', role: 'writer' })
     await helloReady(a)
 
-    a.send(OPS_FRAME(1, 'dup-mismatch', 0, [{ kind: 'set', key: 's1e1', prop: 'x', value: 1 }]))
+    a.send(OPS_FRAME(1, 'dup-mismatch', 0, [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'x', v: 1 }]))
     expect(await a.recv()).toMatchObject({ ctl: 'ack', q: 1 })
 
-    a.send(OPS_FRAME(2, 'dup-mismatch', 0, [{ kind: 'set', key: 's1e1', prop: 'x', value: 2 }]))
+    a.send(OPS_FRAME(2, 'dup-mismatch', 0, [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'x', v: 2 }]))
     expect(await a.recv()).toMatchObject({
       ctl: 'refused',
       code: 'protocol-version',
@@ -344,12 +358,12 @@ describe('PPT relay: protocol version (PPT-WS-004)', () => {
     const a = await h.connect({ uid: 'u_a', role: 'writer' })
     await helloReady(a)
 
-    a.send({ t: 'ops', k: 1, frameId: 'x', epoch: 0, ops: [{ kind: 'set' }] }) // no pv
+    a.send({ t: 'ops', k: 1, frameId: 'x', epoch: 0, ops: [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'x', v: 1 }] }) // no pv
     const r1 = await a.recv()
     expect(r1.ctl).toBe('refused')
     expect(r1.code).toBe('protocol-version')
 
-    a.send({ t: 'ops', pv: 1, k: 2, frameId: 'y', epoch: 0, ops: [{ kind: 'set' }] }) // pv=1
+    a.send({ t: 'ops', pv: 1, k: 2, frameId: 'y', epoch: 0, ops: [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'x', v: 1 }] }) // pv=1
     const r2 = await a.recv()
     expect(r2.code).toBe('protocol-version')
 
@@ -370,11 +384,11 @@ describe('PPT relay: refused retry classification (PPT-WS-006)', () => {
     expect((await rdr.recv())).toMatchObject({ code: 'forbidden-role', retryable: false })
 
     // protocol-version
-    w.send({ t: 'ops', pv: 99, k: 1, frameId: 'pv1', epoch: 0, ops: [{ kind: 'set' }] })
+    w.send({ t: 'ops', pv: 99, k: 1, frameId: 'pv1', epoch: 0, ops: [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'x', v: 1 }] })
     expect(await w.recv()).toMatchObject({ code: 'protocol-version', retryable: false })
 
     // too-large (op count over the per-frame cap of 2)
-    w.send(OPS_FRAME(2, 'big', 0, [{ kind: 'set' }, { kind: 'set' }, { kind: 'set' }]))
+    w.send(OPS_FRAME(2, 'big', 0, [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'x', v: 1 }, { op: 'set', a: 'u-test', s: 1, l: 1, k: 'x', v: 1 }, { op: 'set', a: 'u-test', s: 1, l: 1, k: 'x', v: 1 }]))
     expect(await w.recv()).toMatchObject({ code: 'too-large', retryable: false })
 
     // stale-epoch (frame epoch != live epoch)
@@ -528,32 +542,42 @@ describe('PPT relay: snapshot + GC + offline replay (PPT-COLLAB-003 / PPT-COLLAB
     expect((await h.store.opsSince(DOC, 0)).map((o) => o.seq)).toEqual([1])
   })
 
-  it('snapshot advances version atomically; covered ops are not replayed; synced peers skip snapshot', async () => {
-    const h = await setup()
+  it('client snap is server-managed (refused); the server snapshotter advances the snapshot and joiners replay it (XIN-1759 Part B)', async () => {
+    // Soft threshold 1 byte → any append triggers the in-process snapshotter; a
+    // baseDocProvider supplies the genesis reduction base (no client snap needed).
+    const h = await setup({ baseDocProvider: async () => deck('genesis'), limits: { snapshotSoftThresholdBytes: 1 } })
     const w = await h.connect({ uid: 'u_w', role: 'writer' })
     await helloReady(w)
     for (let i = 1; i <= 3; i++) {
       w.send(OPS_FRAME(i, `f${i}`))
-      await w.recv()
+      await w.recvUntil((m) => m.ctl === 'ack')
     }
-    // Upload a snapshot covering seq 2.
-    w.send({ t: 'snap', pv: 2, k: 100, epoch: 0, q: 2, doc: deck('snap') })
-    const snapAck = await w.recv()
-    expect(snapAck.ctl).toBe('ack')
-    expect(snapAck.snapshotVersion).toBe(1)
+    // A client-provided snapshot is REFUSED as server-managed (never persisted/pruned).
+    w.send({ t: 'snap', pv: 2, k: 100, epoch: 0, q: 2, doc: deck('client') })
+    expect((await w.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')).at(-1)).toMatchObject({
+      ctl: 'refused',
+      code: 'snapshot-conflict',
+    })
+    // The SERVER snapshotter advanced a durable snapshot covering the whole log,
+    // carrying BOTH doc and state, and pruned the covered ops — with NO from-scratch
+    // client snapshot socket involved (Round-19 P1 replacement).
+    const snap = await waitFor(async () => {
+      const s = await h.store.getSnapshot(DOC)
+      return s && s.coveredSeq >= 3 ? s : null
+    })
+    expect(snap.state).toBeTruthy()
+    expect(await h.store.opsSince(DOC, 0)).toHaveLength(0)
 
-    // New joiner: gets snapshot + only op 3 (covered ops 1-2 are pruned/not replayed).
+    // A fresh joiner receives the SERVER snapshot (doc + state), then no uncovered ops.
     const joiner = await h.connect({ uid: 'u_j', role: 'reader' })
     const { replay } = await helloReady(joiner)
-    const ctls = replay.map((m) => m.ctl)
-    expect(ctls[0]).toBe('snapshot')
-    const opFrames = replay.filter((m) => m.ctl === 'op')
-    expect(opFrames).toHaveLength(1)
-    expect(opFrames[0]!.q).toBe(3)
+    expect(replay[0]!.ctl).toBe('snapshot')
+    expect((replay[0] as { state?: unknown }).state).toBeTruthy()
+    expect(replay.filter((m) => m.ctl === 'op')).toHaveLength(0)
 
-    // An already-synced peer (since=3) is NOT forced to reapply the snapshot.
+    // An already-synced peer (since=coveredSeq) is NOT forced to reapply the snapshot.
     const synced = await h.connect({ uid: 'u_s', role: 'reader' })
-    const { replay: r2 } = await helloReady(synced, 3)
+    const { replay: r2 } = await helloReady(synced, snap.coveredSeq)
     expect(r2.some((m) => m.ctl === 'snapshot')).toBe(false)
   })
 
@@ -758,12 +782,13 @@ describe('PPT relay: read cache and outbound backpressure', () => {
       replayInFlight: false,
       replayPending: null,
       liveBuffer: [],
-      lastDelivered: 0,
-      pendingObservedSeqs: new Set<number>(),
+      deliveredThrough: 0,
+      flushDepth: 0,
       liveBufferBytes: 0,
       auth: { readAllowed: true, invalidated: false },
       inboundChain: Promise.resolve(),
       outboundChain: Promise.resolve(),
+      drainChain: Promise.resolve(),
     }
     await (relay as unknown as { deliver: (conn: unknown, frame: unknown) => Promise<void> }).deliver(peer, { ctl: 'op', q: 1, frame: OPS_FRAME(1, 'live') })
     expect(closed).toEqual([{ code: 1011, reason: 'send drain timeout' }])
@@ -800,12 +825,13 @@ describe('PPT relay: read cache and outbound backpressure', () => {
       replayInFlight: false,
       replayPending: null,
       liveBuffer: [],
-      lastDelivered: 0,
-      pendingObservedSeqs: new Set<number>(),
+      deliveredThrough: 0,
+      flushDepth: 0,
       liveBufferBytes: 0,
       auth: { readAllowed: true, invalidated: false },
       inboundChain: Promise.resolve(),
       outboundChain: Promise.resolve(),
+      drainChain: Promise.resolve(),
     }
 
     const deliver = (relay as unknown as { deliver: (conn: unknown, frame: unknown) => Promise<void> }).deliver.bind(relay)
@@ -1013,7 +1039,7 @@ describe('PPT relay: no silent drops post-commit (B7 / P1-12)', () => {
     expect(await base.currentSeq(DOC)).toBe(1)
   })
 
-  it('a snapshot still ACKs when the post-save prune throws', async () => {
+  it('the server snapshotter keeps the snapshot durable even if the post-save prune throws', async () => {
     const base = new InMemoryPptRelayStore()
     const store: PptRelayStore = {
       appendOp: (d, f, fr) => base.appendOp(d, f, fr),
@@ -1027,15 +1053,20 @@ describe('PPT relay: no silent drops post-commit (B7 / P1-12)', () => {
         throw new Error('prune down')
       },
     }
-    const h = await setup({ store })
+    // Soft threshold 1 → the server snapshotter runs after the first append.
+    const h = await setup({ store, baseDocProvider: async () => deck('genesis'), limits: { snapshotSoftThresholdBytes: 1 } })
     const w = await h.connect({ uid: 'u_w', role: 'writer' })
     await helloReady(w)
     w.send(OPS_FRAME(1, 'op1'))
-    await w.recv() // ack for the op
-    w.send({ t: 'snap', pv: 2, k: 2, epoch: 0, q: 1, doc: deck() })
-    const ack = await w.recv()
-    expect(ack.ctl).toBe('ack') // snapshot durable -> acked even though GC failed
-    expect(ack.snapshotVersion).toBe(1)
+    await w.recvUntil((m) => m.ctl === 'ack')
+    // The snapshot is durable (saved BEFORE the prune) even though GC threw; the
+    // failure is swallowed by the soft path and the room simply retries GC later.
+    const snap = await waitFor(async () => {
+      const s = await base.getSnapshot(DOC)
+      return s && s.coveredSeq >= 1 ? s : null
+    })
+    expect(snap.snapshotVersion).toBe(1)
+    expect(snap.state).toBeTruthy()
   })
 })
 
@@ -1048,30 +1079,30 @@ describe('PPT relay: byte-accurate limits + binding blob cap (non-blocking)', ()
     const w = await h.connect({ uid: 'u_w', role: 'writer' })
     await helloReady(w)
     const bigValue = '😀'.repeat(60) // 240 UTF-8 bytes, 120 UTF-16 code units
-    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'big', epoch: 0, ops: [{ kind: 'set', key: 's1e1', prop: 'text', value: bigValue }] })
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'big', epoch: 0, ops: [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'text', v: bigValue }] })
     expect(await w.recv()).toMatchObject({ code: 'too-large', retryable: false })
   })
 
-  it('a large snapshot is accepted where an equally large op frame is refused (blob cap binds)', async () => {
-    // maxFrameBytes (op cap) is small; maxSingleBlobBytes (snapshot cap) is large.
-    // The snapshot must not be pre-empted by the op-frame cap.
+  it('an op frame over the op-byte cap is refused too-large; a client snapshot is refused server-managed', async () => {
+    // maxFrameBytes (op cap) is small. Op frames over it are refused; client
+    // snapshots are no longer a persisted path at all (server-managed, XIN-1759).
     const h = await setup({ limits: { maxFrameBytes: 300, maxSingleBlobBytes: 200_000 } })
     const w = await h.connect({ uid: 'u_w', role: 'writer' })
     await helloReady(w)
     // An op frame over the 300-byte op cap: refused.
-    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'bigop', epoch: 0, ops: [{ kind: 'set', key: 'k', prop: 'p', value: 'x'.repeat(400) }] })
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'bigop', epoch: 0, ops: [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'p', v: 'x'.repeat(400) }] })
     expect(await w.recv()).toMatchObject({ code: 'too-large' })
-    // A snapshot of similar size: accepted (under the blob cap).
+    // A client snapshot of any size is refused as server-managed (never persisted).
     const big = deck('x'.repeat(400))
     w.send({ t: 'snap', pv: 2, k: 2, epoch: 0, q: 0, doc: big })
-    expect(await w.recv()).toMatchObject({ ctl: 'ack', snapshotVersion: 1 })
+    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'snapshot-conflict' })
   })
 
   it('room-full budget is seeded from durable state so a fresh process counts existing ops', async () => {
     const store = new InMemoryPptRelayStore()
     // Seed durable ops totalling some bytes BEFORE any socket connects (models a
     // process that restarted with a non-empty room).
-    await store.appendOp(DOC, 'seed1', { t: 'ops', ops: [{ kind: 'set', key: 'k', prop: 'p', value: 'y'.repeat(400) }] })
+    await store.appendOp(DOC, 'seed1', { t: 'ops', ops: [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'p', v: 'y'.repeat(400) }] })
     const seeded = await store.roomBytes(DOC)
     expect(seeded).toBeGreaterThan(0)
     const h = await setup({ store, limits: { maxRoomFrameBytes: seeded + 10 } })
@@ -1079,7 +1110,7 @@ describe('PPT relay: byte-accurate limits + binding blob cap (non-blocking)', ()
     await helloReady(w)
     // The very first frame this process sees would fit if the counter started at
     // 0, but seeding from durable state pushes it over the room cap.
-    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'over', epoch: 0, ops: [{ kind: 'set', key: 'k', prop: 'p', value: 'z'.repeat(50) }] })
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'over', epoch: 0, ops: [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'p', v: 'z'.repeat(50) }] })
     expect(await w.recv()).toMatchObject({ code: 'room-full', retryable: false })
   })
 })
@@ -1248,10 +1279,11 @@ describe('PPT relay: round-4 fixes (XIN-1660)', () => {
     expect(reack.q).toBe(1)
   })
 
-  it('D4: a handleSnap preflight read failure surfaces storage-failed, never a silent hang', async () => {
-    // currentSeq throws only after replay has completed, so the client reaches
-    // `ready` and then the snap's preflight read (currentSeq) fails.
-    class SnapPreflightFailStore extends InMemoryPptRelayStore {
+  it('a client snap is refused server-managed without any store read (no preflight to fail)', async () => {
+    // handleSnap no longer does a preflight read or persists (XIN-1759 Part B):
+    // snapshots are server-managed, so a client snap is refused up front and a
+    // failing store is never even touched by the snap path.
+    class SnapReadFailStore extends InMemoryPptRelayStore {
       failCurrentSeq = false
       failGetSnapshot = false
       override async currentSeq(docId: string): Promise<number> {
@@ -1263,23 +1295,15 @@ describe('PPT relay: round-4 fixes (XIN-1660)', () => {
         return super.getSnapshot(docId)
       }
     }
-    // currentSeq path.
-    const s1 = new SnapPreflightFailStore()
+    const s1 = new SnapReadFailStore()
     const h1 = await setup({ store: s1 })
     const w1 = await h1.connect({ uid: 'u_w', role: 'writer' })
     await helloReady(w1)
     s1.failCurrentSeq = true
+    s1.failGetSnapshot = true
     w1.send({ t: 'snap', pv: 2, k: 5, epoch: 0, q: 0, doc: deck() })
-    expect(await w1.recv()).toMatchObject({ ctl: 'refused', code: 'storage-failed', retryable: false })
-
-    // getSnapshot path (the second preflight read).
-    const s2 = new SnapPreflightFailStore()
-    const h2 = await setup({ store: s2 })
-    const w2 = await h2.connect({ uid: 'u_w2', role: 'writer' })
-    await helloReady(w2)
-    s2.failGetSnapshot = true
-    w2.send({ t: 'snap', pv: 2, k: 6, epoch: 0, q: 0, doc: deck() })
-    expect(await w2.recv()).toMatchObject({ ctl: 'refused', code: 'storage-failed', retryable: false })
+    // Refused as server-managed — NOT storage-failed — because no store read runs.
+    expect(await w1.recv()).toMatchObject({ ctl: 'refused', code: 'snapshot-conflict' })
   })
 
   it('hardening: an oversized ephemeral frame is refused too-large', async () => {
@@ -1368,7 +1392,7 @@ describe('PPT relay: round-4 fixes (XIN-1660)', () => {
     w.send({ ...OPS_FRAME(1, 'x'.repeat(65)) })
     expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version', retryable: false })
     // Non-integer frame counter k.
-    w.send({ t: 'ops', pv: 2, k: 1.5, frameId: 'kfrac', epoch: 0, ops: [{ kind: 'set', key: 's1e1', prop: 'x', value: 1 }] })
+    w.send({ t: 'ops', pv: 2, k: 1.5, frameId: 'kfrac', epoch: 0, ops: [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'x', v: 1 }] })
     expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version', retryable: false })
   })
 
@@ -1783,7 +1807,7 @@ describe('PPT relay: NULL-hash pre-gate re-ack (XIN-1750, round-17)', () => {
     // alone: the canonical-ops hash mismatch routes it to the mutation gate, where
     // the downgraded/stale-epoch socket is correctly refused. A different payload can
     // never ride the pure-re-ack exemption through the gate.
-    a.send({ t: 'ops', pv: 2, k: 1, frameId: 'shared-frame', epoch: 0, ops: [{ kind: 'set', key: 's1e1', prop: 'x', value: 999 }] })
+    a.send({ t: 'ops', pv: 2, k: 1, frameId: 'shared-frame', epoch: 0, ops: [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'x', v: 999 }] })
     const refused = await a.recv()
     expect(refused.ctl).toBe('refused')
     expect(['stale-epoch', 'forbidden-role']).toContain(refused.code)
@@ -1963,19 +1987,20 @@ describe('PPT relay: ordering-model redesign (XIN-1739)', () => {
     }
   }
 
-  it('P1-1: a burned seq gap does not wedge the watermark — replay delivers 1,3 and a snapshot covering q=3 is ACCEPTED', async () => {
+  it('P1-1: a burned seq gap does not wedge the watermark — replay delivers 1,3 and deliveredThrough reaches 3', async () => {
     const h = await setup({ store: new GappedStore() })
     const c = await h.connect({ uid: 'u_w', role: 'writer' })
     const { ready, replay } = await helloReady(c)
     // The delivered op sequence is monotonic-but-gapped (2 is a legal hole).
     expect(replay.filter((m) => m.ctl === 'op').map((m) => m.q)).toEqual([1, 3])
     expect(ready.q).toBe(3)
-    // A snapshot covering q=3 is legal: the writer observed seq 3, and seq 2 has no
-    // durable op row. The pre-fix contiguous watermark stuck at 1 refused this
-    // (`covered > lastDelivered`); the observed-high-water model accepts it.
+    // deliveredThrough reached 3 despite the burned seq 2 (the pre-fix contiguous
+    // watermark stuck at 1). A client snap is server-managed and refused (prune moved
+    // off the connection entirely, XIN-1759 Part A/B), so it no longer probes the
+    // watermark; the [1,3] replay + ready.q=3 above already prove the gap didn't wedge it.
     c.send({ t: 'snap', pv: 2, k: 7, epoch: 0, q: 3, doc: deck() })
     const out = await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')
-    expect(out[out.length - 1]).toMatchObject({ ctl: 'ack', k: 7, q: 3 })
+    expect(out[out.length - 1]).toMatchObject({ ctl: 'refused', code: 'snapshot-conflict' })
   })
 
   it('P1-2: ops that arrive while a joiner is catching up are delivered exactly once, in monotonic order (no mid-flush reorder)', async () => {
@@ -2065,7 +2090,7 @@ describe('PPT relay: ordering-model redesign (XIN-1739)', () => {
       flushDepth: 1, // the cutover drain is in progress
       replayPending: null,
       liveBuffer: [op(10), op(11)],
-      observedHighWater: 9,
+      deliveredThrough: 9,
       liveBufferBytes: 0,
       auth: { readAllowed: true, invalidated: false },
       inboundChain: Promise.resolve(),
@@ -2111,7 +2136,9 @@ describe('PPT relay: ordering-model redesign (XIN-1739)', () => {
       new Promise<boolean>((res) => setTimeout(() => res(false), 700)),
     ])
     expect(stillOpen).toBe(false)
-    c.send({ t: 'snap', pv: 2, k: 9, epoch: 0, q: 0, doc: deck() })
+    // A persisted `ops` write still acks, proving it kept writer authority in place
+    // (snapshots are server-managed now, so `ops` is the authority proxy — XIN-1759).
+    c.send(OPS_FRAME(9, 'reauth-proof'))
     const out = await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')
     expect(out[out.length - 1]).toMatchObject({ ctl: 'ack', k: 9 })
   })
@@ -2167,14 +2194,14 @@ describe('PPT relay: round-16 fixes (XIN-1748)', () => {
   it('P0-2: a re-ack of the connection own durable frame does NOT advance the observation high-water — the un-clamped tail still replays', async () => {
     const h = await setup()
     const c = await h.connect({ uid: 'u_reack', role: 'writer' })
-    await helloReady(c) // caught up on an EMPTY room → observedHighWater stays 0
+    await helloReady(c) // caught up on an EMPTY room → deliveredThrough stays 0
     // Peers durably commit ops 1..3 this socket never observed (seeded straight into
     // the store, so no broadcast reaches c) — the optimistic-write-then-drop shape.
     await h.store.appendOp(DOC, 'f1', OPS_FRAME(1, 'f1'))
     await h.store.appendOp(DOC, 'f2', OPS_FRAME(2, 'f2'))
     await h.store.appendOp(DOC, 'f3', OPS_FRAME(3, 'f3'))
     // c resends a frame already durable (same frameId + payload) — a known duplicate
-    // that re-acks seq 3. On 5fb58629 the re-ack advanced c.observedHighWater to 3.
+    // that re-acks seq 3. On 5fb58629 the re-ack advanced c.deliveredThrough to 3.
     c.send(OPS_FRAME(1, 'f3'))
     const reack = await c.recvUntil((m) => m.ctl === 'ack')
     expect(reack[reack.length - 1]).toMatchObject({ ctl: 'ack', q: 3 })
@@ -2190,7 +2217,7 @@ describe('PPT relay: round-16 fixes (XIN-1748)', () => {
   it('P0-2: a snapshot covering a seq the connection only RE-ACKED (never observed) is refused', async () => {
     const h = await setup()
     const c = await h.connect({ uid: 'u_reack2', role: 'writer' })
-    await helloReady(c) // caught up empty → observedHighWater 0
+    await helloReady(c) // caught up empty → deliveredThrough 0
     await h.store.appendOp(DOC, 'g1', OPS_FRAME(1, 'g1'))
     await h.store.appendOp(DOC, 'g2', OPS_FRAME(2, 'g2'))
     await h.store.appendOp(DOC, 'g3', OPS_FRAME(3, 'g3'))
@@ -2198,7 +2225,7 @@ describe('PPT relay: round-16 fixes (XIN-1748)', () => {
     expect((await c.recvUntil((m) => m.ctl === 'ack')).at(-1)).toMatchObject({ ctl: 'ack', q: 3 })
     // c is caught up but has observed NOTHING; a snapshot covering the re-acked seq 3
     // would prune ops 1..3 it never saw. On 5fb58629 the re-ack had advanced
-    // observedHighWater to 3, so the snap was ACCEPTED and the whole op log pruned.
+    // deliveredThrough to 3, so the snap was ACCEPTED and the whole op log pruned.
     c.send({ t: 'snap', pv: 2, k: 7, epoch: 0, q: 3, doc: deck() })
     const out = await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')
     expect(out[out.length - 1]).toMatchObject({ ctl: 'refused', code: 'snapshot-conflict' })
@@ -2238,8 +2265,7 @@ describe('PPT relay: round-16 fixes (XIN-1748)', () => {
       flushDepth: 0,
       replayPending: null,
       liveBuffer: [op(10), op(11)],
-      observedHighWater: 9,
-      coverageFloor: 0,
+      deliveredThrough: 9,
       liveBufferBytes: 0,
       auth: { readAllowed: true, invalidated: false },
       inboundChain: Promise.resolve(),
@@ -2307,10 +2333,10 @@ describe('PPT relay: round-18 fixes (XIN-1754)', () => {
     await h.store.appendOp(DOC, 'g3', OPS_FRAME(3, 'g3'))
     const c = await h.connect({ uid: 'u_claim', role: 'writer' })
     // Claim since = room high-water (3): replay streams NOTHING; the socket is marked
-    // caught up with observedHighWater 0 and a coverage floor of 3.
+    // caught up with deliveredThrough 0 and a coverage floor of 3.
     const { replay } = await helloReady(c, 3)
     expect(replay.filter((m) => m.ctl === 'op')).toHaveLength(0)
-    // One fresh op → seq 4. On 7133d0e the ack inflates observedHighWater to 4.
+    // One fresh op → seq 4. On 7133d0e the ack inflates deliveredThrough to 4.
     c.send(OPS_FRAME(1, 'g4'))
     expect((await c.recvUntil((m) => m.ctl === 'ack')).at(-1)).toMatchObject({ ctl: 'ack', q: 4 })
     // A snap covering its own seq 4 would prune ops 1..3 it never observed. On 7133d0e
@@ -2329,14 +2355,14 @@ describe('PPT relay: round-18 fixes (XIN-1754)', () => {
     const store = new LedgerFastPathDownStore()
     const h = await setup({ store })
     const c = await h.connect({ uid: 'u_dup', role: 'writer' })
-    await helloReady(c) // caught up on an empty room → observedHighWater 0
+    await helloReady(c) // caught up on an empty room → deliveredThrough 0
     // Peers durably commit ops 1..3 this socket never observed.
     await store.appendOp(DOC, 'a1', OPS_FRAME(1, 'a1'))
     await store.appendOp(DOC, 'a2', OPS_FRAME(2, 'a2'))
     await store.appendOp(DOC, 'a3', OPS_FRAME(3, 'a3'))
     // c resends frame 'a3' (already durable at seq 3). frameIdentity throws → the
     // resend falls through to appendOp → duplicate:true at seq 3. On 7133d0e the
-    // post-append markObservedSeq advanced observedHighWater to 3 for this duplicate.
+    // post-append markObservedSeq advanced deliveredThrough to 3 for this duplicate.
     c.send(OPS_FRAME(1, 'a3'))
     expect((await c.recvUntil((m) => m.ctl === 'ack')).at(-1)).toMatchObject({ ctl: 'ack', q: 3 })
     // A duplicate re-ack is not an observation: a snap covering 3 is refused, and a
@@ -2384,8 +2410,9 @@ describe('PPT relay: round-18 fixes (XIN-1754)', () => {
     // into pendingReauth + fail-closed grace. The generation guard makes it bail.
     releaseDirect()
     await sleep(80)
-    // The socket keeps writer authority in place: a snap acks (not refused/closed).
-    c.send({ t: 'snap', pv: 2, k: 9, epoch: 0, q: 0, doc: deck('reauth') })
+    // The socket keeps writer authority in place: a persisted `ops` write acks (not
+    // refused/closed) — the authority proxy now that snapshots are server-managed.
+    c.send(OPS_FRAME(9, 'reauth-not-undone'))
     expect((await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')).at(-1)).toMatchObject({
       ctl: 'ack',
       k: 9,
@@ -2441,5 +2468,97 @@ describe('PPT relay: round-18 fixes (XIN-1754)', () => {
       ctl: 'refused',
       code: 'protocol-version',
     })
+  })
+})
+
+/**
+ * XIN-1759 round-19 P0 (the reviewers' primary blocker): the authored-write
+ * watermark advance omitted `!replayInFlight` at ONE of the four delivery sites.
+ * A caught-up writer that (re-)issues a `need`/`hello` so a replay is streaming,
+ * buffers a peer op, then authors a fresh op, would advance `deliveredThrough` past
+ * the buffered-but-undelivered peer op; the cutover's dedup (`q <= deliveredThrough`)
+ * then DROPS that peer op forever — a permanent divergence for the non-idempotent
+ * RGA. Folding all four sites onto the shared `isDeliveryStable` predicate closes it.
+ * This FAILS on head a45ba1e (whose inline guard was `caughtUp && flushDepth === 0`)
+ * and PASSES on the fix.
+ */
+describe('PPT relay: round-19 P0 (XIN-1759) — deliveredThrough single-source predicate', () => {
+  it('an authored write during an in-flight replay does NOT advance deliveredThrough, so a buffered peer op survives the cutover', async () => {
+    const relay = new PptRelay({
+      store: new InMemoryPptRelayStore(),
+      epochProvider: async () => 0,
+      limits: { sendHighWaterBytes: 1_000_000_000 },
+    })
+    const sent: unknown[] = []
+    const fakeSocket = {
+      readyState: WebSocket.OPEN,
+      bufferedAmount: 0,
+      send: vi.fn((raw: string) => sent.push(JSON.parse(raw))),
+      close: vi.fn(),
+    }
+    const peer = {
+      socket: fakeSocket,
+      uid: 'u_p',
+      docId: DOC,
+      documentName: DOCNAME,
+      role: 'writer',
+      roleEpoch: 0,
+      spaceMember: false,
+      frameTimes: [],
+      ephemeralFrameTimes: [],
+      caughtUp: true,
+      replayInFlight: true, // a replay is streaming to this socket (re-issued need/hello)
+      flushDepth: 0,
+      replayPending: null,
+      liveBuffer: [],
+      deliveredThrough: 5,
+      liveBufferBytes: 0,
+      auth: { readAllowed: true, invalidated: false },
+      inboundChain: Promise.resolve(),
+      inboundDepth: 0,
+      outboundChain: Promise.resolve(),
+      drainChain: Promise.resolve(),
+    }
+    const asAny = relay as unknown as {
+      deliver: (c: unknown, f: unknown) => Promise<void>
+      flushLiveBuffer: (c: unknown) => Promise<void>
+      isDeliveryStable: (c: unknown) => boolean
+      canAdvanceDeliveredThroughFromAuthor: (c: unknown, dup: boolean) => boolean
+    }
+
+    // A peer op (seq 6) arrives DURING the in-flight replay → buffered, not delivered.
+    await asAny.deliver(peer, { ctl: 'op', q: 6, frame: OPS_FRAME(6, 'peer6') })
+    expect(peer.liveBuffer.map((f) => (f as { q: number }).q)).toEqual([6])
+    expect(sent).toHaveLength(0)
+
+    // The author writes a fresh op (seq 7) while the replay is STILL in flight. The
+    // shared predicate must REFUSE to advance the watermark — the round-19 P0 fix.
+    // On a45ba1e the equivalent guard (caughtUp && flushDepth === 0, no replay check)
+    // was true, advancing deliveredThrough to 7.
+    expect(asAny.isDeliveryStable(peer)).toBe(false)
+    expect(asAny.canAdvanceDeliveredThroughFromAuthor(peer, false)).toBe(false)
+    expect(peer.deliveredThrough).toBe(5) // unchanged: the authored write did not advance it
+
+    // Sanity: once the replay finishes, an authored write WOULD be a true observation.
+    peer.replayInFlight = false
+    expect(asAny.isDeliveryStable(peer)).toBe(true)
+    expect(asAny.canAdvanceDeliveredThroughFromAuthor(peer, false)).toBe(true)
+
+    // Cutover: the replay finished; flush the buffer. The peer op q=6 (> deliveredThrough
+    // 5) is delivered exactly once — NOT dedup-dropped. On a45ba1e the authored write had
+    // advanced deliveredThrough to 7, so `6 <= 7` silently discarded it here.
+    await asAny.flushLiveBuffer(peer)
+    expect(sent.map((m) => (m as { q?: number }).q)).toEqual([6])
+    expect(peer.deliveredThrough).toBe(6)
+    relay.close()
+  })
+
+  it('a duplicate re-ack never advances deliveredThrough even when delivery-stable', () => {
+    const relay = new PptRelay({ store: new InMemoryPptRelayStore(), epochProvider: async () => 0 })
+    const stable = { caughtUp: true, replayInFlight: false, flushDepth: 0, deliveredThrough: 3, auth: { readAllowed: true, invalidated: false }, socket: { readyState: WebSocket.OPEN } }
+    const asAny = relay as unknown as { canAdvanceDeliveredThroughFromAuthor: (c: unknown, dup: boolean) => boolean }
+    expect(asAny.canAdvanceDeliveredThroughFromAuthor(stable, false)).toBe(true)
+    expect(asAny.canAdvanceDeliveredThroughFromAuthor(stable, true)).toBe(false) // duplicate re-ack
+    relay.close()
   })
 })

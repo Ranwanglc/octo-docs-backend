@@ -17,6 +17,7 @@
  */
 import { createHash } from 'node:crypto'
 import type { BentoDoc } from '../bentoDoc.js'
+import type { SyncStateJSON } from '../sync/slidesSync.js'
 
 /** A durably-persisted op frame, addressed by its room sequence. */
 export interface PersistedOp {
@@ -141,12 +142,26 @@ export interface RelaySnapshot {
   /** Room sequence this snapshot covers (ops <= coveredSeq are prunable). */
   coveredSeq: number
   doc: BentoDoc
+  /**
+   * The serialized Bento `SyncState` the `doc` was reduced to (XIN-1759 Part B).
+   * A late joiner replays `doc` + `state`, then deterministically applies ops with
+   * `seq > coveredSeq`. Null for a legacy doc-only snapshot row persisted before
+   * Part B added the state column (the relay then replays doc-only, as before).
+   */
+  state: SyncStateJSON | null
 }
 
 export interface SaveSnapshotInput {
   docId: string
   coveredSeq: number
   doc: BentoDoc
+  /**
+   * The Bento `SyncState` reduced alongside `doc`, persisted ATOMICALLY with it and
+   * `coveredSeq` (XIN-1759 Part B). Only the server-side snapshotter writes
+   * snapshots, and it always reduces state, so this is non-null in practice; the
+   * type stays nullable for the legacy doc-only compatibility path.
+   */
+  state: SyncStateJSON | null
 }
 
 export interface SaveSnapshotResult {
@@ -400,10 +415,10 @@ export class InMemoryPptRelayStore implements PptRelayStore {
     const r = this.room(input.docId)
     const cur = r.snapshot
     // Mirror the DB store's atomic covered-guard: only advance the version and
-    // replace the doc when the incoming coverage does not regress (P0-3).
+    // replace the doc + state when the incoming coverage does not regress (P0-3).
     if (!cur || input.coveredSeq >= cur.coveredSeq) {
       const snapshotVersion = (cur?.snapshotVersion ?? 0) + 1
-      r.snapshot = { snapshotVersion, coveredSeq: input.coveredSeq, doc: input.doc }
+      r.snapshot = { snapshotVersion, coveredSeq: input.coveredSeq, doc: input.doc, state: input.state }
       return { snapshotVersion, coveredSeq: input.coveredSeq }
     }
     return { snapshotVersion: cur.snapshotVersion, coveredSeq: cur.coveredSeq }

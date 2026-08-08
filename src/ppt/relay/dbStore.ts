@@ -223,7 +223,7 @@ export class DbPptRelayStore implements PptRelayStore {
   async getSnapshot(docId: string): Promise<RelaySnapshot | null> {
     const snap = await pptLiveSnapshotRepo.get(docId)
     if (!snap) return null
-    return { snapshotVersion: snap.snapshotVersion, coveredSeq: snap.coveredSeq, doc: snap.doc }
+    return { snapshotVersion: snap.snapshotVersion, coveredSeq: snap.coveredSeq, doc: snap.doc, state: snap.state }
   }
 
   async saveSnapshot(input: SaveSnapshotInput): Promise<SaveSnapshotResult> {
@@ -233,6 +233,7 @@ export class DbPptRelayStore implements PptRelayStore {
         input.docId,
         input.coveredSeq,
         input.doc,
+        input.state,
       )
       // Surface the authoritative POST-WRITE coveredSeq (GREATEST(existing,
       // incoming)) so the relay prunes with it, never the client's raw `q` (P0-1).
@@ -331,7 +332,7 @@ export class DbPptRelayStore implements PptRelayStore {
       const highWater = await pptRelaySeqRepo.currentSeqTx(tx, docId)
       const snap = await pptLiveSnapshotRepo.getTx(tx, docId)
       const snapshot: RelaySnapshot | null = snap
-        ? { snapshotVersion: snap.snapshotVersion, coveredSeq: snap.coveredSeq, doc: snap.doc }
+        ? { snapshotVersion: snap.snapshotVersion, coveredSeq: snap.coveredSeq, doc: snap.doc, state: snap.state }
         : null
       return { highWater, snapshot }
     })
@@ -410,7 +411,7 @@ export class DbPptRelayStore implements PptRelayStore {
       const highWater = await pptRelaySeqRepo.currentSeqTx(tx, docId)
       const snap = await pptLiveSnapshotRepo.getTx(tx, docId)
       const snapshot: RelaySnapshot | null = snap
-        ? { snapshotVersion: snap.snapshotVersion, coveredSeq: snap.coveredSeq, doc: snap.doc }
+        ? { snapshotVersion: snap.snapshotVersion, coveredSeq: snap.coveredSeq, doc: snap.doc, state: snap.state }
         : null
       const ops: PersistedOp[] = []
       let cursor = sinceSeq
