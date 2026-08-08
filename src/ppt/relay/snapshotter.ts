@@ -83,6 +83,34 @@ export function opsOfFrame(frame: unknown): Op[] {
 }
 
 /**
+ * Reduce `baseDoc` + `baseState` through `frames` (ascending seq) into a fresh
+ * engine, returning both the materialized doc and the live engine. Internal seam
+ * shared by {@link reduceFrames} (which serializes the engine) and the
+ * snapshotter's watermark probe (which inspects {@link SyncEngine.bufferedOps}).
+ * Neither `baseDoc` nor `baseState` is mutated — both are cloned first.
+ */
+function reduceInto(
+  baseDoc: BentoDoc,
+  baseState: SyncStateJSON | null,
+  frames: ReducibleFrame[],
+): { doc: BentoDoc; engine: SyncState } {
+  const doc = clone(baseDoc)
+  let engine: SyncState
+  if (baseState) {
+    engine = SyncState.fromJSON(SNAPSHOT_REDUCER_ACTOR, clone(baseState))
+  } else {
+    engine = new SyncState(SNAPSHOT_REDUCER_ACTOR)
+    engine.adopt(doc)
+  }
+  // Ascending seq is the room's authoritative total order; the CRDT converges
+  // regardless of interleaving, but applying in room order keeps a snapshot's
+  // materialized array order deterministic and matches the frontend's live apply.
+  const ordered = [...frames].sort((a, b) => a.seq - b.seq)
+  for (const f of ordered) engine.apply(doc, f.ops)
+  return { doc, engine }
+}
+
+/**
  * The deterministic Bento reduction (pure). Reduces `baseDoc` + `baseState`
  * through `frames` (ascending seq) into a fresh `(doc, state)` via the vendored
  * `SyncEngine`, under the reserved reducer actor.
@@ -100,19 +128,7 @@ export function reduceFrames(
   baseState: SyncStateJSON | null,
   frames: ReducibleFrame[],
 ): ReductionResult {
-  const doc = clone(baseDoc)
-  let engine: SyncState
-  if (baseState) {
-    engine = SyncState.fromJSON(SNAPSHOT_REDUCER_ACTOR, clone(baseState))
-  } else {
-    engine = new SyncState(SNAPSHOT_REDUCER_ACTOR)
-    engine.adopt(doc)
-  }
-  // Ascending seq is the room's authoritative total order; the CRDT converges
-  // regardless of interleaving, but applying in room order keeps a snapshot's
-  // materialized array order deterministic and matches the frontend's live apply.
-  const ordered = [...frames].sort((a, b) => a.seq - b.seq)
-  for (const f of ordered) engine.apply(doc, f.ops)
+  const { doc, engine } = reduceInto(baseDoc, baseState, frames)
   return { doc, state: engine.toJSON() }
 }
 
@@ -175,11 +191,35 @@ export class PptSnapshotter {
     // until a future full-log/state backfill rewrites it with a real state; the op
     // log is simply not pruned in the meantime (a forced trigger degrades to
     // `room-full`, a safe non-lossy fallback — never a lossy prune).
-    if (existing && existing.state === null) return null
+    //
+    // P1-1 (XIN-1772): `state === null` is not the ONLY un-reducible boundary. A
+    // state persisted at a DIFFERENT `SYNC_V` restores as an EMPTY engine
+    // (`SyncEngine.fromJSON` returns a bare engine when `j.v !== SYNC_V`, crdt.ts),
+    // so reducing the tail against it silently produces the SAME fresh-adopt
+    // divergence as the doc-only case — then prunes the tail that proves it wrong.
+    // `assertSyncVersionAligned()` only compares the two compile-time constants; it
+    // cannot catch a ROW written under an older engine build. Treat a version-drifted
+    // persisted state exactly like the legacy doc-only boundary: refuse to advance.
+    //
+    // P1-2 mode 2 (XIN-1772): give the un-reducible boundary a bounded reclaim path
+    // instead of a terminal read-only brick. Ops at/below `coveredSeq` are already
+    // subsumed by the durable doc (that is what the snapshot materialized), so they
+    // are safe to prune even though the tail above cannot be folded in. Re-attempt
+    // that idempotent prune here so a legacy/version-drifted room reclaims its
+    // covered prefix rather than growing unbounded to `room-full`.
+    if (existing && (existing.state === null || existing.state.v !== SYNC_V)) {
+      return this.reattemptPrune(docId, existing.coveredSeq)
+    }
     const highWater = await this.store.currentSeq(docId)
     const coveredSeq = existing?.coveredSeq ?? 0
-    // Nothing above the current coverage to fold in → no work.
-    if (highWater <= coveredSeq) return null
+    // Nothing above the current coverage to fold in → no NEW work. But a prior run
+    // may have committed its snapshot save and then FAILED (or died) before its
+    // separate prune transaction ran (P1-2 mode 1, XIN-1772): the ops it already
+    // covers are still on disk, charged against the room budget, and the raw
+    // `highWater <= coveredSeq` short-circuit would skip pruning them forever →
+    // the room fills and deadlocks read-only. Re-attempt the idempotent prune of
+    // the covered prefix before declaring a no-op.
+    if (highWater <= coveredSeq) return this.reattemptPrune(docId, coveredSeq)
 
     const baseDoc = await this.resolveBaseDoc(docId, existing, baseDocProvider)
     if (!baseDoc) return null
@@ -191,19 +231,108 @@ export class PptSnapshotter {
     // target coverage is the highest seq actually present in the tail, never a hole
     // above it — pruning is bound to what the persisted doc truly subsumes.
     const targetSeq = tail.length > 0 ? tail[tail.length - 1]!.seq : coveredSeq
-    if (targetSeq <= coveredSeq) return null
+    if (targetSeq <= coveredSeq) return this.reattemptPrune(docId, coveredSeq)
 
     const frames: ReducibleFrame[] = tail.map((op) => ({ seq: op.seq, ops: opsOfFrame(op.frame) }))
-    const { doc, state } = reduceFrames(baseDoc, existing?.state ?? null, frames)
+    // Reduce the WHOLE tail once, then bind the covered watermark to what the engine
+    // PROVABLY applied. The vendored engine BUFFERS (never applies) an op whose
+    // per-actor `s` exceeds its running contiguous sequence + 1 — a gap left by a
+    // lower-`s` frame that was refused (too-large/malformed) while a higher-`s` frame
+    // committed (frames.ts validates each `s` only as a bounded positive int, so a
+    // gap CAN persist). A buffered op advances neither the applied doc nor the
+    // version vector and is absent from `toJSON()`, so folding the tail up to
+    // `targetSeq` into the persisted state and pruning `<= targetSeq` would DESTROY
+    // that acked-durable op and diverge the room from peers who applied it live
+    // (XIN-1772 P0-1). The post-reduction version vector is the proof of application:
+    // an op is applied iff `op.s <= vv[op.a]` (vv is the per-actor max CONTIGUOUS
+    // sequence). Refuse to advance past the earliest frame carrying an unapplied op.
+    const probe = reduceInto(baseDoc, existing?.state ?? null, frames)
+    const safeSeq = this.appliedContiguousSeq(frames, probe.engine.vv, targetSeq, coveredSeq)
+    if (safeSeq <= coveredSeq) {
+      // The boundary op itself is a gap — nothing new can be safely folded in yet.
+      // Leave the whole tail durable (it is the proof of the buffered op) and only
+      // re-attempt the idempotent prune of the already-covered prefix.
+      return this.reattemptPrune(docId, coveredSeq)
+    }
+    // Persist the reduction of ONLY the proven-applied prefix. When the whole tail
+    // applied cleanly (`safeSeq === targetSeq`, the common case) reuse the probe;
+    // otherwise re-reduce the prefix so the persisted state stops exactly at the
+    // proven-applied boundary and the unapplied tail is re-reduced next time (once
+    // its missing lower-`s` frame lands).
+    const { doc, engine } =
+      safeSeq === targetSeq
+        ? probe
+        : reduceInto(baseDoc, existing?.state ?? null, frames.filter((f) => f.seq <= safeSeq))
+    const state = engine.toJSON()
 
     // Persist doc + state + coverage atomically BEFORE any prune (§7.3).
-    const saved = await this.store.saveSnapshot({ docId, coveredSeq: targetSeq, doc, state })
+    const saved = await this.store.saveSnapshot({ docId, coveredSeq: safeSeq, doc, state })
     // Prune with the AUTHORITATIVE post-write coveredSeq the store read back
     // (GREATEST(existing, incoming)), never the raw target: a snapshot may only
     // ever prune the op prefix the persisted doc actually subsumes (XIN-1693 P0-1).
-    const prunableSeq = saved.coveredSeq ?? targetSeq
+    const prunableSeq = saved.coveredSeq ?? safeSeq
     const freedBytes = await this.store.pruneOpsThrough(docId, prunableSeq)
-    return { snapshotVersion: saved.snapshotVersion, coveredSeq: saved.coveredSeq ?? targetSeq, prunedThroughSeq: prunableSeq, freedBytes }
+    return { snapshotVersion: saved.snapshotVersion, coveredSeq: saved.coveredSeq ?? safeSeq, prunedThroughSeq: prunableSeq, freedBytes }
+  }
+
+  /**
+   * The highest tail seq the reduction PROVABLY applied: `targetSeq` when every op
+   * applied, otherwise the highest seq strictly below the earliest frame carrying an
+   * unapplied op. An op is applied iff `op.s <= vv[op.a]` (the post-reduction version
+   * vector is the per-actor max CONTIGUOUS sequence; a gapped op leaves `vv[a]` below
+   * its `s`). `frames` is ascending. Returns `coveredSeq` when even the first tail
+   * frame carries an unapplied op (nothing safe to advance). Consulting only the
+   * public `vv` keeps the vendored engine untouched (XIN-1772 P0-1).
+   */
+  private appliedContiguousSeq(
+    frames: ReducibleFrame[],
+    vv: Record<string, number>,
+    targetSeq: number,
+    coveredSeq: number,
+  ): number {
+    const frameApplied = (f: ReducibleFrame): boolean =>
+      f.ops.every((o) => typeof o.a === 'string' && typeof o.s === 'number' && o.s <= (vv[o.a] ?? 0))
+    let earliestUnapplied = Infinity
+    for (const f of frames) {
+      if (!frameApplied(f)) {
+        earliestUnapplied = f.seq
+        break
+      }
+    }
+    if (earliestUnapplied === Infinity) return targetSeq
+    let safe = coveredSeq
+    for (const f of frames) {
+      if (f.seq >= earliestUnapplied) break
+      if (f.seq > safe) safe = f.seq
+    }
+    return safe
+  }
+
+  /**
+   * Idempotently re-attempt the prune of the op prefix `seq <= coveredSeq`. Used
+   * on every no-advance path so a snapshot whose save committed but whose prune did
+   * not (separate transactions — a crash/failure between them, P1-2 mode 1) is
+   * eventually reclaimed instead of deadlocking the room read-only at its byte cap.
+   * Also gives a legacy / version-drifted boundary (P1-2 mode 2) a bounded reclaim
+   * of its already-covered prefix. Restart-safe: it re-derives "is there an
+   * un-pruned covered row?" from the op table rather than a separate durable
+   * cursor, and the store DELETE is a no-op once the prefix is gone — so it is
+   * cheap to call repeatedly and never re-prunes the tail above `coveredSeq`.
+   */
+  private async reattemptPrune(docId: string, coveredSeq: number): Promise<SnapshotRunResult | null> {
+    if (coveredSeq <= 0) return null
+    // Cheap probe: the single lowest surviving op. If none survive at/below
+    // `coveredSeq`, the prune already completed — nothing to do.
+    const lowest = await this.store.opsSince(docId, 0, 1)
+    if (lowest.length === 0 || lowest[0]!.seq > coveredSeq) return null
+    const freedBytes = await this.store.pruneOpsThrough(docId, coveredSeq)
+    const snap = await this.store.getSnapshot(docId)
+    return {
+      snapshotVersion: snap?.snapshotVersion ?? 0,
+      coveredSeq,
+      prunedThroughSeq: coveredSeq,
+      freedBytes,
+    }
   }
 
   /** The base doc to reduce onto: the durable snapshot's doc, else the genesis deck. */

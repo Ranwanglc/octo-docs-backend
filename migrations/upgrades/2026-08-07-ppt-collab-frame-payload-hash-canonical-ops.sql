@@ -36,11 +36,33 @@
 --
 -- SAFETY: idempotent / re-runnable, batched. The UPDATE is chunked
 --   (`LIMIT`-bounded) inside a throwaway procedure so a large ledger is not
---   rewritten in one lock-heavy statement (P2-c). A re-run only matches rows whose
---   `payload_hash IS NOT NULL`; migrate.ts starts the app AFTER migrations
---   complete, so no canonical-scheme rows exist yet when this runs, and a
---   crash-recovery re-run re-nulls the same set. On a fresh install the ledger is
---   empty, so this is a pure no-op.
+--   rewritten in one lock-heavy statement (P2-c). It only ever nulls rows whose
+--   `payload_hash IS NOT NULL` AND that PREDATE the canonical-hash relay's release
+--   boundary (`recorded_at < @cutoff`, see below); migrate.ts starts the app AFTER
+--   migrations complete, so on a genuine upgrade no canonical-scheme row exists yet
+--   when this runs, and a crash-recovery re-run re-nulls the same set. On a fresh
+--   install the ledger is empty, so this is a pure no-op.
+--
+-- P1-3 (XIN-1772) — DO NOT NULL LIVE CANONICAL HASHES ON THE LEDGER-ADOPTION PATH:
+--   `migrate.ts` runs a file whenever `schema_migrations` lacks its row, and
+--   "install from schema.sql, adopt the runner later" is a documented supported
+--   path. On THAT path the app is ALREADY running the canonical-hash relay and has
+--   written live `payload_hash` values — so a guard of merely `payload_hash IS NOT
+--   NULL` would null those live hashes, and an already-GC'd op row (no `frame_json`
+--   to verify against) would then permanently refuse a legitimate resend of a
+--   committed edit (`DuplicateFramePayloadError` → `protocol-version`), the exact
+--   "left permanently unsynced" failure XIN-1750 prevents. Guard the null on a
+--   MARKER instead: only rows recorded BEFORE the release boundary carry the RETIRED
+--   whole-envelope hash and may be nulled. `@cutoff` is a FIXED literal set to this
+--   migration's release date; the canonical-hash relay did not exist before it, so
+--   every whole-envelope row predates it and every canonical-scheme row (written by
+--   the post-release app) is at/after it and is preserved. A genuine upgrade
+--   deployed LATER may leave a bounded window of whole-envelope rows written between
+--   the cutoff and the deploy un-nulled; those degrade to a `protocol-version`
+--   refusal on resend (client resyncs — recoverable), never data loss. This is the
+--   `recorded_at < fixed cutoff` marker; real-MySQL verification of BOTH the upgrade
+--   path (whole-envelope rows nulled) and the adoption path (live canonical rows
+--   preserved) is routed to the integration gate (PR #163).
 --
 -- Usage:
 --   mysql -u <user> -p <database> < migrations/upgrades/2026-08-07-ppt-collab-frame-payload-hash-canonical-ops.sql
@@ -63,6 +85,12 @@ BEGIN
   DECLARE v_last_frame  VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
   DECLARE v_batch_doc   VARCHAR(64) CHARACTER SET utf8mb4;
   DECLARE v_batch_frame VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+
+  -- Release boundary (P1-3): only rows recorded BEFORE this carry the retired
+  -- whole-envelope hash and may be nulled. Rows at/after it were written by the
+  -- canonical-hash relay (which did not exist before this date) and are preserved,
+  -- so the ledger-adoption path never nulls a live canonical hash.
+  DECLARE v_cutoff DATETIME(3) DEFAULT '2026-08-07 00:00:00.000';
 
   -- A window SELECT that finds no more rows raises NOT FOUND (SQLSTATE 02000),
   -- which is NOT a SQLEXCEPTION and so does not trip the rollback handler below.
@@ -131,12 +159,14 @@ BEGIN
       UPDATE ppt_collab_frame
          SET payload_hash = NULL
        WHERE payload_hash IS NOT NULL
+         AND recorded_at < v_cutoff
          AND (doc_id < v_batch_doc
               OR (doc_id = v_batch_doc AND frame_id <= v_batch_frame));
     ELSE
       UPDATE ppt_collab_frame
          SET payload_hash = NULL
        WHERE payload_hash IS NOT NULL
+         AND recorded_at < v_cutoff
          AND (doc_id > v_last_doc
               OR (doc_id = v_last_doc AND frame_id > v_last_frame))
          AND (doc_id < v_batch_doc

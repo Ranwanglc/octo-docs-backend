@@ -327,9 +327,43 @@ function isNonEmptyString(v: unknown): v is string {
   return typeof v === 'string' && v.length > 0
 }
 
-/** A positive safe integer (Bento's `stamp` starts `l`/`s` at 1). */
-function isPosSafeInt(v: unknown): v is number {
-  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 1
+/**
+ * The actor-id charset the relay accepts on the wire (XIN-1772 P0-2). The
+ * server-side snapshot reducer runs under a RESERVED actor (`@relay`, see
+ * {@link ../relay/snapshotter.ts SNAPSHOT_REDUCER_ACTOR}) that the vendored
+ * engine's `applyOne` SKIPS as "own, pre-applied". Real client ids are drawn from
+ * `[a-z0-9-]` and can never mint the reserved `@`-namespace; enforcing that charset
+ * at the trust boundary is what makes the "no client can mint the reducer actor"
+ * comment TRUE rather than a convention. Without it a client could send `a:"@relay"`
+ * — the frame validates, persists, acks, and live peers apply it, but the
+ * snapshotter (actor `@relay`) skips it, saves a state that never saw it, advances
+ * the covered seq past it, and prunes it: an acked-durable write silently destroyed.
+ * A concrete length bound (a client id is a short opaque token, never unbounded)
+ * also keeps `a` from bloating persisted frames / the dedup ledger.
+ */
+export const ACTOR_ID_PATTERN = /^[a-z0-9-]{1,64}$/
+
+/**
+ * Upper bound for a Bento op's Lamport clock `l` (XIN-1772 P0-2). The engine does
+ * `lamport = max(lamport, op.l)` on apply and mints local ops with `lamport++`, so
+ * a single frame carrying `l = Number.MAX_SAFE_INTEGER` pins the room clock at the
+ * ceiling: `stamp()`'s `++` can no longer advance it, every subsequent op ties on
+ * Lamport, and LWW degrades to bare actor-id tiebreaks — persisted into the durable
+ * state. Bounding `l` FAR below `MAX_SAFE_INTEGER` leaves an astronomically large
+ * runway for a real editing session (2^45 ≈ 3.5e13 ops) while refusing the poison
+ * value on the wire. `s` (per-actor sequence) shares the same ceiling for the same
+ * reason — a crafted huge `s` manufactures an unfillable per-actor gap.
+ */
+export const MAX_OP_CLOCK = 2 ** 45
+
+/** True for a wire-legal client actor id: `[a-z0-9-]`, non-reserved, bounded. */
+export function isValidActorId(v: unknown): v is string {
+  return typeof v === 'string' && ACTOR_ID_PATTERN.test(v)
+}
+
+/** A positive safe integer within the op-clock bound (Bento's `stamp` starts at 1). */
+function isBoundedOpClock(v: unknown): v is number {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 1 && v <= MAX_OP_CLOCK
 }
 
 /** A Bento register stamp `[lamport, actor]`. */
@@ -355,8 +389,13 @@ export function isBentoOp(op: unknown): boolean {
   if (typeof op !== 'object' || op === null) return false
   const o = op as Record<string, unknown>
   if (typeof o.op !== 'string' || !OP_KIND_SET.has(o.op)) return false
-  // OpBase: every op carries actor + per-actor seq + lamport.
-  if (!isNonEmptyString(o.a) || !isPosSafeInt(o.s) || !isPosSafeInt(o.l)) return false
+  // OpBase: every op carries actor + per-actor seq + lamport. `a` must be a
+  // wire-legal client actor id (charset-restricted, non-reserved — a client can
+  // NEVER mint the snapshot reducer's `@`-namespace actor); `s` and `l` must be
+  // positive safe integers within the op-clock bound so a crafted huge value can
+  // neither poison the Lamport clock nor manufacture an unfillable per-actor gap
+  // (XIN-1772 P0-2).
+  if (!isValidActorId(o.a) || !isBoundedOpClock(o.s) || !isBoundedOpClock(o.l)) return false
   switch (o.op) {
     case 'set':
       // node id is implicit @doc when neither el nor sl is present; `k` is required.

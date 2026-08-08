@@ -80,6 +80,47 @@ function authorFixture(name: string, steps: Array<(deck: BentoDoc) => void>, sna
   return { name, genesis, frames, expected, snapshotAt: Math.min(snapshotAt, frames.length) }
 }
 
+/**
+ * A step in a MULTI-ACTOR fixture: which actor authored it and how it mutates the
+ * (shared, converged) deck. Two actors (`u-a`, `u-b`) each mint ops from their own
+ * engine and observe each other's, so the persisted log INTERLEAVES two actors'
+ * per-actor `s` sequences — the exact shape the single-actor `u-author` fixtures
+ * never produce (XIN-1772: that blind spot is why the squad's golden-based review
+ * missed the per-actor-`s`-gap snapshotter defect).
+ */
+interface MultiActorStep {
+  actor: 'A' | 'B'
+  mutate: (deck: BentoDoc) => void
+}
+
+/**
+ * Author a two-actor fixture. Each actor keeps its own working doc; every minted
+ * op-set is cross-applied to the other engine so both converge, exactly as two live
+ * peers on the relay would. The result is a single room-ordered log carrying BOTH
+ * actors' ops with independent, contiguous per-actor `s` runs.
+ */
+function authorMultiActorFixture(name: string, steps: MultiActorStep[], snapshotAt: number): GoldenFixture {
+  const genesis = genesisDeck()
+  const engines = { A: new SyncState('u-a'), B: new SyncState('u-b') }
+  engines.A.adopt(genesis)
+  engines.B.adopt(genesis)
+  const docs = { A: clone(genesis), B: clone(genesis) }
+  const frames: GoldenFrame[] = []
+  for (const step of steps) {
+    const self = step.actor
+    const other = self === 'A' ? 'B' : 'A'
+    const before = clone(docs[self])
+    step.mutate(docs[self])
+    const ops = engines[self].diff(before, docs[self], { text: true })
+    if (ops.length === 0) continue
+    // The peer observes the ops (converging its own doc + engine state).
+    engines[other].apply(docs[other], ops)
+    frames.push({ q: frames.length + 1, frameId: `${name}-f${frames.length + 1}`, ops })
+  }
+  const expected = reduceFrames(genesis, null, frames.map((f) => ({ seq: f.q, ops: f.ops })))
+  return { name, genesis, frames, expected, snapshotAt: Math.min(snapshotAt, frames.length) }
+}
+
 /** Build the shared golden fixture set. Deterministic — no clocks / randomness. */
 export function buildGoldenFixtures(): GoldenFixture[] {
   return [
@@ -120,6 +161,24 @@ export function buildGoldenFixtures(): GoldenFixture[] {
         (d) => { (d.slides[0].elements[0] as Record<string, unknown>).html = '<p>hello brave world</p>' },
         (d) => { (d.slides[0].elements[0] as Record<string, unknown>).html = '<p>hello brave new world</p>' },
         (d) => { (d.slides[0].elements[0] as Record<string, unknown>).html = '<p>hello new world</p>' },
+      ],
+      2,
+    ),
+    // MULTI-ACTOR (XIN-1772): two actors interleave, including a cross-actor
+    // dependency (B sets a prop on the slide A inserted). Exercises the reducer with
+    // independent per-actor `s` runs the single-actor fixtures cannot express.
+    authorMultiActorFixture(
+      'two-actor-interleaved',
+      [
+        { actor: 'A', mutate: (d) => { d.title = 'Deck by A' } },
+        {
+          actor: 'B',
+          mutate: (d) => {
+            d.slides.push({ id: 's2', background: '#eeeeee', transition: 'fade', notes: '', elements: [el('e2', '<p>from B</p>')] } as BentoSlide)
+          },
+        },
+        { actor: 'A', mutate: (d) => { d.slides[1].background = '#123456' } }, // A edits B's slide
+        { actor: 'B', mutate: (d) => { (d.slides[0].elements[0] as Record<string, unknown>).html = '<p>hello world edited by B</p>' } },
       ],
       2,
     ),

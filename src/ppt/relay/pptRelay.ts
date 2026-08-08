@@ -328,6 +328,16 @@ interface Conn {
    * reauth; on fire (still pending) the socket is closed.
    */
   reauthGraceTimer?: NodeJS.Timeout
+  /**
+   * The Bento actor id this connection authors under, PINNED on its first `ops`
+   * frame (XIN-1772 P0-2). `op.a` is otherwise fully client-chosen, so binding it
+   * to the socket for the socket's lifetime is what stops an authenticated editor
+   * from attributing ops to a co-editor's actor (bumping the victim's version
+   * vector so the victim's genuine op is later dropped as a duplicate — co-editor
+   * censorship) or from minting a per-actor `s` gap under a foreign actor. Undefined
+   * until the first ops frame establishes it.
+   */
+  actor?: string
 }
 
 function send(socket: WebSocket, frame: ServerFrame): void {
@@ -1899,6 +1909,28 @@ export class PptRelay {
     }
     if (frame.ops.length > this.limits.maxOpsPerFrame) {
       this.refuse(conn, 'too-large', { k, frameId, message: 'op count exceeds per-frame limit' })
+      return
+    }
+    // Actor binding (XIN-1772 P0-2). Every op in a frame is authored by ONE actor,
+    // and across a connection's lifetime by the SAME actor — the one pinned on its
+    // first ops frame. `opsAreValid` has already charset-restricted each `op.a` (no
+    // client can mint the reserved `@relay` reducer actor); this closes the second
+    // half of the trust boundary: an authenticated editor cannot attribute ops to a
+    // co-editor's actor (bumping the victim's `vv` so the victim's next genuine op
+    // is dropped as a duplicate — censorship) nor manufacture a per-actor `s` gap
+    // under a foreign actor. Both are refused as a protocol error, before any
+    // persistence. A reconnect mints a fresh connection and re-pins on its first
+    // frame, so an idempotent resend after a reconnect is unaffected.
+    const frameOps = frame.ops as Array<{ a?: unknown }>
+    const frameActor = frameOps[0]!.a
+    if (typeof frameActor !== 'string' || !frameOps.every((op) => op.a === frameActor)) {
+      this.refuse(conn, 'protocol-version', { k, frameId, message: 'all ops in a frame must share one actor' })
+      return
+    }
+    if (conn.actor === undefined) {
+      conn.actor = frameActor
+    } else if (conn.actor !== frameActor) {
+      this.refuse(conn, 'protocol-version', { k, frameId, message: 'ops actor does not match the connection actor' })
       return
     }
     // P1-I: the IDENTITY gate runs on EVERY ops frame BEFORE the ledger read, so

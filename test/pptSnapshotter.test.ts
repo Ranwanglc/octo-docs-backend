@@ -8,11 +8,21 @@
 import { describe, it, expect } from 'vitest'
 import { InMemoryPptRelayStore } from '../src/ppt/relay/store.js'
 import { PptSnapshotter, reduceFrames, assertSyncVersionAligned, SNAPSHOT_REDUCER_ACTOR } from '../src/ppt/relay/snapshotter.js'
-import { SYNC_V } from '../src/ppt/sync/slidesSync.js'
+import { SYNC_V, SyncState } from '../src/ppt/sync/slidesSync.js'
 import { BENTO_SYNC_V, type BentoDoc } from '../src/ppt/bentoDoc.js'
 import { buildGoldenFixtures, genesisDeck, type GoldenFrame } from './fixtures/bentoGolden.js'
 
 const DOC = 'doc-snap'
+
+/** Deep structural clone (docs/ops are plain JSON by contract). */
+function clone<T>(v: T): T {
+  return JSON.parse(JSON.stringify(v)) as T
+}
+
+/** Read an arbitrary string prop off the first element (for the gap-scenario asserts). */
+function firstElProp(doc: unknown, key: string): unknown {
+  return (doc as { slides: Array<{ elements: Array<Record<string, unknown>> }> }).slides[0]!.elements[0]![key]
+}
 
 /** Persist the fixture's genesis as the base doc via a baseDocProvider seam. */
 function baseDocProviderFor(doc: BentoDoc) {
@@ -208,5 +218,170 @@ describe('reduceFrames: reserved reducer actor', () => {
     expect(SNAPSHOT_REDUCER_ACTOR.startsWith('@')).toBe(true)
     // The title set op (from u-author) took effect — proving the op was applied.
     expect((out.doc as unknown as { title: string }).title).toBe('Renamed deck')
+  })
+})
+
+// XIN-1772 P0-1: a persisted tail with a per-actor `s` GAP — actor u-b's s=2 op
+// commits while its s=1 op was refused/never persisted (the relay validates each
+// frame's `s` only as a bounded positive int, so a higher-`s` frame can land before a
+// lower one). The vendored engine BUFFERS an op whose `s > seen+1` and never applies
+// it, and `toJSON` serializes NEITHER `gap` NOR `pending`. On the buggy head
+// (71661ef) the snapshotter folds the tail up to the room high-water (a state WITHOUT
+// the buffered mutation), saves, and prunes the op row — so the acked-durable s=2
+// write is destroyed from BOTH the persisted state AND the op log. Multi-actor by
+// construction (u-a applies while u-b is gapped): the single-actor golden fixtures
+// cannot express this, which is why the golden-based review missed it.
+describe('PptSnapshotter.advance: per-actor s gap is never both dropped-from-state and pruned (XIN-1772 P0-1)', () => {
+  function mintGapScenario() {
+    const genesis = genesisDeck()
+    // u-a: one normal, applyable op (a title set).
+    const A = new SyncState('u-a')
+    A.adopt(genesis)
+    const a0 = clone(genesis)
+    const a1 = clone(a0)
+    ;(a1 as unknown as { title: string }).title = 'Renamed by A'
+    const aOps = A.diff(a0, a1, { text: true })
+    // u-b: s=1 (a `stroke` set) then s=2 (a DIFFERENT observable `fill` set). Only s=2
+    // is persisted below → a per-actor gap at the snapshot boundary.
+    const B = new SyncState('u-b')
+    B.adopt(genesis)
+    const b0 = clone(genesis)
+    const b1 = clone(b0)
+    ;(b1.slides[0]!.elements[0] as Record<string, unknown>).stroke = 'thin'
+    const bOps1 = B.diff(b0, b1, { text: true })
+    const b2 = clone(b1)
+    ;(b2.slides[0]!.elements[0] as Record<string, unknown>).fill = 'BLUE-S2'
+    const bOps2 = B.diff(b1, b2, { text: true })
+    expect(aOps.length).toBeGreaterThan(0)
+    expect(bOps1.length).toBeGreaterThan(0)
+    expect(bOps2.length).toBeGreaterThan(0)
+    return { genesis, aOps, bOps1, bOps2 }
+  }
+
+  it('never prunes a buffered per-actor-gap op nor claims to cover it in state', async () => {
+    const { genesis, aOps, bOps2 } = mintGapScenario()
+    const store = new InMemoryPptRelayStore()
+    // Persist u-a s=1 (applies) at seq 1, and u-b s=2 (a gap) at seq 2. u-b's s=1 is
+    // NEVER persisted, so the reducer buffers the s=2 op unapplied.
+    await store.appendOp(DOC, 'a-1', { t: 'ops', pv: 2, k: 1, frameId: 'a-1', epoch: 0, ops: aOps })
+    await store.appendOp(DOC, 'b-2', { t: 'ops', pv: 2, k: 2, frameId: 'b-2', epoch: 0, ops: bOps2 })
+    expect((await store.opsSince(DOC, 0)).map((o) => o.seq)).toEqual([1, 2])
+
+    const res = await new PptSnapshotter(store).advance(DOC, baseDocProviderFor(genesis))
+
+    // The buffered gap op's row (seq 2) is NEVER pruned — it is the only durable proof
+    // of the s=2 write, kept for a later fill.
+    expect((await store.opsSince(DOC, 0)).map((o) => o.seq)).toContain(2)
+    // And no snapshot claims to cover seq >= 2 while omitting the mutation from state.
+    const snap = await store.getSnapshot(DOC)
+    const coversGap = (snap?.coveredSeq ?? 0) >= 2
+    const stateHasMutation = snap ? firstElProp(snap.doc, 'fill') === 'BLUE-S2' : false
+    expect(coversGap && !stateHasMutation).toBe(false)
+    // The applied prefix (u-a's title, seq 1) may still be compacted forward.
+    if (res && snap) {
+      expect(snap.coveredSeq).toBeLessThan(2)
+      expect((snap.doc as unknown as { title: string }).title).toBe('Renamed by A')
+    }
+  })
+
+  it('applies the gap op once its missing lower-s op is later persisted (recoverable, no loss)', async () => {
+    const { genesis, aOps, bOps1, bOps2 } = mintGapScenario()
+    const store = new InMemoryPptRelayStore()
+    await store.appendOp(DOC, 'a-1', { t: 'ops', pv: 2, k: 1, frameId: 'a-1', epoch: 0, ops: aOps })
+    await store.appendOp(DOC, 'b-2', { t: 'ops', pv: 2, k: 2, frameId: 'b-2', epoch: 0, ops: bOps2 })
+    const snapshotter = new PptSnapshotter(store)
+    await snapshotter.advance(DOC, baseDocProviderFor(genesis))
+    // The missing u-b s=1 finally lands (seq 3) — the gap can now fill.
+    await store.appendOp(DOC, 'b-1', { t: 'ops', pv: 2, k: 3, frameId: 'b-1', epoch: 0, ops: bOps1 })
+    const res = await snapshotter.advance(DOC, baseDocProviderFor(genesis))
+
+    expect(res).not.toBeNull()
+    const snap = await store.getSnapshot(DOC)
+    // Both u-b writes are now materialized in the persisted state — nothing was lost.
+    expect(firstElProp(snap!.doc, 'fill')).toBe('BLUE-S2')
+    expect(firstElProp(snap!.doc, 'stroke')).toBe('thin')
+    expect(snap!.coveredSeq).toBe(3)
+  })
+})
+
+// XIN-1772 P1-1: `state === null` is not the only un-reducible boundary. A persisted
+// state at a DIFFERENT SYNC_V restores as an EMPTY engine (crdt.ts fromJSON returns a
+// bare engine on version mismatch), so reducing the tail against it silently produces
+// the same fresh-adopt divergence as the doc-only case, then prunes the tail that
+// proves it wrong. The fix refuses to advance such a boundary, exactly like a legacy
+// doc-only row.
+describe('PptSnapshotter.advance: refuses a version-drifted persisted state (XIN-1772 P1-1)', () => {
+  it('treats a snapshot state at v !== SYNC_V like a legacy boundary (no advance, no tail prune)', async () => {
+    const store = new InMemoryPptRelayStore()
+    const fx = buildGoldenFixtures()[3]! // text-rga-edits
+    const N = fx.snapshotAt
+    const head = fx.frames.filter((f) => f.q <= N)
+    const tailFrames = fx.frames.filter((f) => f.q > N)
+    expect(tailFrames.length).toBeGreaterThan(0)
+    await seedFrames(store, head)
+    const headReduction = reduceFrames(fx.genesis, null, head.map((f) => ({ seq: f.q, ops: f.ops })))
+    // A state row written by a DIFFERENT engine build: version does not match SYNC_V.
+    const drifted = { ...headReduction.state, v: SYNC_V + 1 }
+    await store.saveSnapshot({ docId: DOC, coveredSeq: N, doc: headReduction.doc, state: drifted })
+    await store.pruneOpsThrough(DOC, N)
+    await seedFrames(store, tailFrames)
+    const tailBefore = (await store.opsSince(DOC, N)).map((o) => o.seq)
+    const snapBefore = await store.getSnapshot(DOC)
+
+    const res = await new PptSnapshotter(store).advance(DOC, baseDocProviderFor(fx.genesis))
+
+    expect(res).toBeNull()
+    const snapAfter = await store.getSnapshot(DOC)
+    expect(snapAfter!.snapshotVersion).toBe(snapBefore!.snapshotVersion)
+    expect(snapAfter!.coveredSeq).toBe(N)
+    expect((snapAfter!.state as { v: number }).v).toBe(SYNC_V + 1) // untouched, not compacted
+    expect((await store.opsSince(DOC, N)).map((o) => o.seq)).toEqual(tailBefore) // tail intact
+  })
+})
+
+// XIN-1772 P1-2: `advance()` is the only reclaim path and had two permanent-null
+// modes that could brick a room read-only at its byte cap. Both now re-attempt an
+// idempotent prune of the already-covered prefix.
+describe('PptSnapshotter.advance: idempotent prune re-attempt (XIN-1772 P1-2)', () => {
+  it('mode 1: re-prunes a covered prefix left behind by a save-committed/prune-failed split', async () => {
+    const store = new InMemoryPptRelayStore()
+    const fx = buildGoldenFixtures()[0]!
+    await seedFrames(store, fx.frames)
+    const N = fx.frames.length
+    const reduction = reduceFrames(fx.genesis, null, fx.frames.map((f) => ({ seq: f.q, ops: f.ops })))
+    // The snapshot save committed at coveredSeq=N, but its SEPARATE prune transaction
+    // failed / the process died before it ran — ops <= N are still on disk and highWater
+    // has not moved, so the raw `highWater <= coveredSeq` short-circuit would skip the
+    // prune forever (room fills → read-only deadlock).
+    await store.saveSnapshot({ docId: DOC, coveredSeq: N, doc: reduction.doc, state: reduction.state })
+    expect((await store.opsSince(DOC, 0)).length).toBe(N)
+    expect(await store.currentSeq(DOC)).toBe(N)
+
+    const res = await new PptSnapshotter(store).advance(DOC, baseDocProviderFor(fx.genesis))
+
+    expect(res).not.toBeNull()
+    expect(res!.freedBytes).toBeGreaterThan(0)
+    expect(await store.opsSince(DOC, 0)).toHaveLength(0)
+  })
+
+  it('mode 2: reclaims the covered prefix of a legacy doc-only row instead of bricking it', async () => {
+    const store = new InMemoryPptRelayStore()
+    const fx = buildGoldenFixtures()[1]! // insert-slide-and-elements
+    await seedFrames(store, fx.frames)
+    const N = fx.snapshotAt
+    const headReduction = reduceFrames(fx.genesis, null, fx.frames.filter((f) => f.q <= N).map((f) => ({ seq: f.q, ops: f.ops })))
+    // Legacy doc-only snapshot (state null) at coveredSeq=N whose covered ops (<=N) were
+    // NOT pruned. They are subsumed by the durable doc, so they are safe to reclaim even
+    // though the tail above N cannot be folded in without a real state.
+    await store.saveSnapshot({ docId: DOC, coveredSeq: N, doc: headReduction.doc, state: null })
+    const tailBefore = (await store.opsSince(DOC, N)).map((o) => o.seq)
+    expect(tailBefore.length).toBeGreaterThan(0)
+
+    await new PptSnapshotter(store).advance(DOC, baseDocProviderFor(fx.genesis))
+
+    // Covered prefix (<=N) reclaimed; the un-reducible tail above N is untouched.
+    expect((await store.opsSince(DOC, 0)).every((o) => o.seq > N)).toBe(true)
+    expect((await store.opsSince(DOC, N)).map((o) => o.seq)).toEqual(tailBefore)
+    expect((await store.getSnapshot(DOC))!.state).toBeNull() // still doc-only, not corrupted
   })
 })

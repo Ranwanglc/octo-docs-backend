@@ -371,6 +371,47 @@ describe('PPT relay: protocol version (PPT-WS-004)', () => {
   })
 })
 
+// XIN-1772 P0-2: op metadata is validated at the trust boundary. `op.a` is otherwise
+// fully client-chosen, so the relay both charset-restricts it (no client can mint the
+// reserved `@relay` reducer actor) AND binds it to the connection (an editor cannot
+// attribute ops to a co-editor's actor to censor them, nor mint a per-actor gap under
+// a foreign actor).
+describe('PPT relay: op actor binding (XIN-1772 P0-2)', () => {
+  it('refuses a frame minting the reserved reducer actor and never persists it', async () => {
+    const h = await setup()
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'reserved', epoch: 0, ops: [{ op: 'set', a: '@relay', s: 1, l: 1, k: 'x', v: 1 }] })
+    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+  })
+
+  it('pins the connection actor on its first ops frame and refuses a later foreign actor', async () => {
+    const h = await setup()
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+
+    // First frame establishes the connection actor `u-x` and is acked.
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'f1', epoch: 0, ops: [{ op: 'set', a: 'u-x', s: 1, l: 1, k: 'x', v: 1 }] })
+    expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+
+    // A later frame attributing ops to a DIFFERENT actor (co-editor censorship) is refused.
+    w.send({ t: 'ops', pv: 2, k: 2, frameId: 'f2', epoch: 0, ops: [{ op: 'set', a: 'u-victim', s: 5, l: 5, k: 'x', v: 2 }] })
+    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
+
+    // A frame mixing two actors is refused too.
+    w.send({ t: 'ops', pv: 2, k: 3, frameId: 'f3', epoch: 0, ops: [
+      { op: 'set', a: 'u-x', s: 2, l: 2, k: 'x', v: 3 },
+      { op: 'set', a: 'u-other', s: 1, l: 3, k: 'y', v: 4 },
+    ] })
+    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
+
+    // Only the first (legitimate) frame ever persisted.
+    expect(await h.store.currentSeq(DOC)).toBe(1)
+  })
+})
+
 describe('PPT relay: refused retry classification (PPT-WS-006)', () => {
   it('classifies every refused code; rate-limited is retryable with retryInMs', async () => {
     const h = await setup({ limits: { maxOpsPerFrame: 2, maxFramesPerWindow: 3, maxRoomFrameBytes: 100_000_000 } })

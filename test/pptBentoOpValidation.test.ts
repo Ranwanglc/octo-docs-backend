@@ -5,7 +5,8 @@
  * reducer. Envelope validation stays separate from the CRDT reducer's semantics.
  */
 import { describe, it, expect } from 'vitest'
-import { opsAreValid, isBentoOp } from '../src/ppt/relay/frames.js'
+import { opsAreValid, isBentoOp, isValidActorId, MAX_OP_CLOCK } from '../src/ppt/relay/frames.js'
+import { SNAPSHOT_REDUCER_ACTOR } from '../src/ppt/relay/snapshotter.js'
 
 describe('opsAreValid / isBentoOp: Bento Op shape', () => {
   it('accepts every well-formed Bento op kind', () => {
@@ -48,5 +49,49 @@ describe('opsAreValid / isBentoOp: Bento Op shape', () => {
     expect(opsAreValid('nope')).toBe(false)
     expect(opsAreValid([null])).toBe(false)
     expect(opsAreValid([{ op: 'frobnicate', a: 'u1', s: 1, l: 1 }])).toBe(false)
+  })
+})
+
+// XIN-1772 P0-2: op metadata is validated at the trust boundary, not by convention.
+// On the buggy head (71661ef) `op.a` was any non-empty string and `op.l`/`op.s` were
+// bounded only by Number.isSafeInteger, so a client could mint the reserved reducer
+// actor, poison the Lamport clock, or manufacture an unfillable per-actor gap.
+describe('isBentoOp: op metadata trust-boundary validation (XIN-1772 P0-2)', () => {
+  it('rejects the reserved snapshot-reducer actor namespace (a:"@relay")', () => {
+    // The reducer actor is `@relay`; the vendored engine SKIPS an op whose actor
+    // equals its own, so a client-minted `@relay` op is applied by live peers but
+    // silently dropped by the snapshotter, then pruned — an acked-durable write lost.
+    expect(SNAPSHOT_REDUCER_ACTOR).toBe('@relay')
+    expect(isBentoOp({ op: 'set', a: '@relay', s: 1, l: 1, k: 'x', v: 1 })).toBe(false)
+    expect(opsAreValid([{ op: 'set', a: '@relay', s: 1, l: 1, k: 'x', v: 1 }])).toBe(false)
+    // The whole `@`-prefixed namespace is reserved, not just the exact string.
+    expect(isBentoOp({ op: 'set', a: '@anything', s: 1, l: 1, k: 'x', v: 1 })).toBe(false)
+    expect(isValidActorId('@relay')).toBe(false)
+  })
+
+  it('charset-restricts the actor id to [a-z0-9-]', () => {
+    expect(isValidActorId('u-author')).toBe(true)
+    expect(isValidActorId('u1')).toBe(true)
+    // Anything outside the client-id charset is refused on the wire.
+    expect(isValidActorId('UPPER')).toBe(false)
+    expect(isValidActorId('has space')).toBe(false)
+    expect(isValidActorId('has_underscore')).toBe(false)
+    expect(isValidActorId('emoji😀')).toBe(false)
+    expect(isValidActorId('')).toBe(false)
+    expect(isValidActorId('a'.repeat(65))).toBe(false)
+  })
+
+  it('bounds the Lamport clock (op.l) far below MAX_SAFE_INTEGER', () => {
+    // A single op with l = MAX_SAFE_INTEGER would pin the room's Lamport clock so
+    // `stamp()`'s ++ can no longer advance it, degrading LWW to actor-id tiebreaks.
+    expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: Number.MAX_SAFE_INTEGER, k: 'x', v: 1 })).toBe(false)
+    expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: MAX_OP_CLOCK + 1, k: 'x', v: 1 })).toBe(false)
+    // The bound itself is still a legal value; a real session never approaches it.
+    expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: MAX_OP_CLOCK, k: 'x', v: 1 })).toBe(true)
+  })
+
+  it('bounds the per-actor sequence (op.s) the same way (no crafted unfillable gap)', () => {
+    expect(isBentoOp({ op: 'set', a: 'u1', s: Number.MAX_SAFE_INTEGER, l: 1, k: 'x', v: 1 })).toBe(false)
+    expect(isBentoOp({ op: 'set', a: 'u1', s: MAX_OP_CLOCK + 1, l: 1, k: 'x', v: 1 })).toBe(false)
   })
 })
