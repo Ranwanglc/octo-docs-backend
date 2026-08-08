@@ -2230,41 +2230,216 @@ describe('PPT relay: round-16 fixes (XIN-1748)', () => {
       role: 'reader',
       roleEpoch: 0,
       spaceMember: false,
+      reauthGeneration: 0,
       frameTimes: [],
       ephemeralFrameTimes: [],
       caughtUp: true,
       replayInFlight: false,
-      // Both field names so this one test runs on head 5fb58629 (boolean
-      // `flushingLiveBuffer`) AND on the fix head (depth counter `flushDepth`).
-      flushingLiveBuffer: false,
       flushDepth: 0,
       replayPending: null,
       liveBuffer: [op(10), op(11)],
       observedHighWater: 9,
-      observedHoles: new Set<number>(), // present so the test fails on the ORDERING assertion under head 5fb58629's markObservedSeq, not an incidental crash
+      coverageFloor: 0,
       liveBufferBytes: 0,
       auth: { readAllowed: true, invalidated: false },
       inboundChain: Promise.resolve(),
       inboundDepth: 0,
       outboundChain: Promise.resolve(),
+      drainChain: Promise.resolve(),
     }
     const asAny = relay as unknown as {
       drainLiveBuffer: (c: unknown) => Promise<void>
       deliver: (c: unknown, f: unknown) => Promise<void>
     }
-    // Drain #1 swaps out [10,11] and awaits the gated send of op 10; drain #2 finds an
-    // empty buffer and returns at once. As a boolean, #2's `finally` cleared the flag
-    // while #1 was still awaiting, so op 12 delivered mid-drain bypassed the buffer and
-    // landed between 10 and 11 (10,12,11). As a depth counter the gate stays busy until
-    // BOTH return, so op 12 is buffered and drained last → 10,11,12.
+    // Re-pinned (XIN-1739 P1-2): drain #1 swaps out [10,11] and awaits the gated
+    // send of op 10; op 12 is then delivered mid-drain and BUFFERED; only THEN does
+    // drain #2 enter — finding a NON-EMPTY buffer ([12]). A bare depth counter does
+    // not serialise the drainers, so on head 7133d0e drain #2 swaps [12] and enqueues
+    // op 12 on the outbound chain AHEAD of op 11 (drain #1 is still awaiting op 10's
+    // gated send and has not reached 11), yielding 10,12,11 — permanent divergence
+    // for the non-idempotent RGA. Serialising every drain body through one promise
+    // chain keeps drain #1's swap+sends atomic w.r.t. drain #2, so the tail buffer is
+    // drained in receipt order → strictly increasing 10,11,12.
     const drain1 = asAny.drainLiveBuffer(peer)
-    const drain2 = asAny.drainLiveBuffer(peer)
     await sleep(20)
     const deliverP = asAny.deliver(peer, op(12)) // arrives mid-drain → must be buffered
+    await sleep(20)
+    const drain2 = asAny.drainLiveBuffer(peer) // enters with a NON-empty buffer ([12])
     await sleep(20)
     fakeSocket.bufferedAmount = 0 // release the drain
     await Promise.all([drain1, drain2, deliverP])
     expect(sent.map((m) => (m as { q?: number }).q)).toEqual([10, 11, 12])
     relay.close()
+  })
+})
+
+/**
+ * XIN-1754 round-18 blockers: the observation watermark is advanced by events that
+ * are not genuine observations, letting a snapshot then prune ops no one received
+ * (P0-1 / P1); an in-place reauth undone by the expiry callback it replaced (P1-1);
+ * a sticky pendingReauth after a transient epoch read (P1-3); a deep-nested ops
+ * frame that escapes every guard as a silent drop (P2). Each FAILS on head 7133d0e
+ * and PASSES on the fix. (The drain-order P1-2 regression re-pins the round-16 P1-1
+ * test above so drain B finds a NON-empty buffer.)
+ */
+describe('PPT relay: round-18 fixes (XIN-1754)', () => {
+  /** Sign a fresh single-use ticket (mirrors the ordering-model block's helper). */
+  const freshTicket = (o: { uid: string; role: Role; spaceMember: boolean; epoch?: number; ttl?: number }): string =>
+    jwt.sign(
+      { uid: o.uid, docId: DOC, documentName: DOCNAME, role: o.role, permission_epoch: o.epoch ?? 0, space_member: o.spaceMember, jti: randomUUID() },
+      config.collabToken.secret,
+      { algorithm: 'HS256', audience: PPT_RELAY_TICKET_AUD, expiresIn: o.ttl ?? 30 },
+    )
+
+  /** A store whose ledger fast path (`frameIdentity`) is unavailable, so a resend
+   * falls through to `appendOp` — which still dedups authoritatively. */
+  class LedgerFastPathDownStore extends InMemoryPptRelayStore {
+    async frameIdentity(): Promise<never> {
+      throw new Error('ledger fast path unavailable')
+    }
+  }
+
+  it('P0-1: a writer caught-up via a CLAIMED cursor cannot snap-prune ops it never observed', async () => {
+    const h = await setup()
+    // The room already holds durable peer ops 1..3, no snapshot.
+    await h.store.appendOp(DOC, 'g1', OPS_FRAME(1, 'g1'))
+    await h.store.appendOp(DOC, 'g2', OPS_FRAME(2, 'g2'))
+    await h.store.appendOp(DOC, 'g3', OPS_FRAME(3, 'g3'))
+    const c = await h.connect({ uid: 'u_claim', role: 'writer' })
+    // Claim since = room high-water (3): replay streams NOTHING; the socket is marked
+    // caught up with observedHighWater 0 and a coverage floor of 3.
+    const { replay } = await helloReady(c, 3)
+    expect(replay.filter((m) => m.ctl === 'op')).toHaveLength(0)
+    // One fresh op → seq 4. On 7133d0e the ack inflates observedHighWater to 4.
+    c.send(OPS_FRAME(1, 'g4'))
+    expect((await c.recvUntil((m) => m.ctl === 'ack')).at(-1)).toMatchObject({ ctl: 'ack', q: 4 })
+    // A snap covering its own seq 4 would prune ops 1..3 it never observed. On 7133d0e
+    // it was ACCEPTED and pruned the whole op log; the fix binds prune authority to
+    // the delivery floor and REFUSES it.
+    c.send({ t: 'snap', pv: 2, k: 9, epoch: 0, q: 4, doc: deck('claim') })
+    expect((await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')).at(-1)).toMatchObject({
+      ctl: 'refused',
+      code: 'snapshot-conflict',
+    })
+    // The durable op prefix survives.
+    expect((await h.store.opsSince(DOC, 0)).map((o) => o.seq)).toEqual([1, 2, 3, 4])
+  })
+
+  it('P0-1b: a slow-duplicate resend (ledger fast path unavailable) does NOT advance the observation watermark', async () => {
+    const store = new LedgerFastPathDownStore()
+    const h = await setup({ store })
+    const c = await h.connect({ uid: 'u_dup', role: 'writer' })
+    await helloReady(c) // caught up on an empty room → observedHighWater 0
+    // Peers durably commit ops 1..3 this socket never observed.
+    await store.appendOp(DOC, 'a1', OPS_FRAME(1, 'a1'))
+    await store.appendOp(DOC, 'a2', OPS_FRAME(2, 'a2'))
+    await store.appendOp(DOC, 'a3', OPS_FRAME(3, 'a3'))
+    // c resends frame 'a3' (already durable at seq 3). frameIdentity throws → the
+    // resend falls through to appendOp → duplicate:true at seq 3. On 7133d0e the
+    // post-append markObservedSeq advanced observedHighWater to 3 for this duplicate.
+    c.send(OPS_FRAME(1, 'a3'))
+    expect((await c.recvUntil((m) => m.ctl === 'ack')).at(-1)).toMatchObject({ ctl: 'ack', q: 3 })
+    // A duplicate re-ack is not an observation: a snap covering 3 is refused, and a
+    // re-hello from 0 still replays the un-observed tail 1..3 (not clamped away).
+    c.send({ t: 'snap', pv: 2, k: 5, epoch: 0, q: 3, doc: deck('dup') })
+    expect((await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')).at(-1)).toMatchObject({
+      ctl: 'refused',
+      code: 'snapshot-conflict',
+    })
+    c.send({ t: 'hello', pv: 2, since: 0 })
+    const replay = await c.recvUntil((m) => m.ctl === 'ready')
+    expect(replay.filter((m) => m.ctl === 'op').map((m) => m.q)).toEqual([1, 2, 3])
+  })
+
+  it('P1-1: a completed in-place reauth is NOT undone by the replaced share-expiry callback', async () => {
+    let releaseDirect: () => void = () => {}
+    const directGate = new Promise<void>((res) => {
+      releaseDirect = res
+    })
+    let directCalls = 0
+    const h = await setup({
+      // Writer only via the space-membership claim; the direct-role resolve the
+      // expiry callback runs blocks on `directGate` the FIRST time, simulating a
+      // slow lookup that outlives the in-place reauth.
+      roleProvider: async ({ spaceMember }) => {
+        if (spaceMember) return 'writer'
+        directCalls++
+        if (directCalls === 1) await directGate
+        return 'none'
+      },
+      limits: { reauthGraceMs: 5000, authRefreshMs: 100000 },
+    })
+    const first = freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true, ttl: 1 })
+    const c = await h.connect({ uid: 'u_share', role: 'writer', ticket: first })
+    await helloReady(c)
+    // Let the ~1s share-expiry timer fire and enter expireShareMembership, which
+    // blocks in the (gated) direct-role resolve.
+    await sleep(1300)
+    // Present a fresh ticket at the SAME epoch → handleReauth trusts the ticket role
+    // (no roleProvider await), succeeds, bumps the reauth generation, re-arms expiry.
+    c.send({ t: 'reauth', pv: 2, ticket: freshTicket({ uid: 'u_share', role: 'writer', spaceMember: true, ttl: 30 }) })
+    await sleep(80)
+    // Release the stalled callback. On 7133d0e it resumes, re-checks only liveness,
+    // sees direct='none' < writer, and shoves the FRESHLY reauthorized socket back
+    // into pendingReauth + fail-closed grace. The generation guard makes it bail.
+    releaseDirect()
+    await sleep(80)
+    // The socket keeps writer authority in place: a snap acks (not refused/closed).
+    c.send({ t: 'snap', pv: 2, k: 9, epoch: 0, q: 0, doc: deck('reauth') })
+    expect((await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')).at(-1)).toMatchObject({
+      ctl: 'ack',
+      k: 9,
+    })
+  })
+
+  it('P1-3: a transient epoch-read failure during an epoch bump does not permanently disable a direct writer', async () => {
+    let failNextEpochRead = false
+    const h = await setup({
+      roleProvider: async () => 'writer', // a DIRECT writer, never downgraded
+      epochProvider: async () => {
+        if (failNextEpochRead) {
+          failNextEpochRead = false
+          throw new Error('transient epoch read failure')
+        }
+        return 0
+      },
+      limits: { authRefreshMs: 100000 },
+    })
+    const c = await h.connect({ uid: 'u_dw', role: 'writer' })
+    await helloReady(c)
+    // The epoch bump's epoch read fails transiently, then recovers on the next read.
+    failNextEpochRead = true
+    await h.relay.applyEpochBump(DOCNAME)
+    // On 7133d0e the bump set a sticky pendingReauth (pendingReauth:!epochOk) with no
+    // clearer, leaving the socket neither usable nor closed. The fix leaves the
+    // re-resolved role authoritative, so the next write is acked once the read recovers.
+    c.send(OPS_FRAME(1, 'w1'))
+    expect((await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')).at(-1)).toMatchObject({
+      ctl: 'ack',
+      q: 1,
+    })
+  })
+
+  it('P2: a deeply-nested ops frame gets a refusal verdict, never a silent drop', async () => {
+    const h = await setup()
+    const c = await h.connect({ uid: 'u_deep', role: 'writer' })
+    await helloReady(c)
+    // A ~3000-deep nested value: JSON.parse accepts it (well under the byte cap) but
+    // it is far above the canonical-hash depth limit. On 7133d0e canonicalStringify
+    // overflowed the native stack; the RangeError escaped handleOps and was swallowed
+    // by the serialized-chain tail → the client got NEITHER an ack NOR a refusal.
+    const depth = 3000
+    const raw =
+      '{"t":"ops","pv":2,"k":1,"frameId":"deep","epoch":0,"ops":[{"kind":"set","key":"s1e1","prop":"x","value":' +
+      '{"n":'.repeat(depth) +
+      '0' +
+      '}'.repeat(depth) +
+      '}]}'
+    // Send the raw JSON string directly (do not re-stringify a JS object client-side).
+    c.ws.send(raw)
+    expect((await c.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')).at(-1)).toMatchObject({
+      ctl: 'refused',
+      code: 'protocol-version',
+    })
   })
 })

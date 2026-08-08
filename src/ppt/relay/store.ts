@@ -52,17 +52,56 @@ export class DuplicateFramePayloadError extends Error {
 }
 
 /**
+ * Thrown when {@link canonicalStringify} / {@link canonicalPayloadHash} hits a
+ * payload nested deeper than {@link MAX_CANONICAL_DEPTH} (XIN-1739 P2). It converts
+ * an unbounded native recursion — which a ~5000-deep `ops` frame (well under every
+ * byte cap) would drive into a `RangeError: Maximum call stack size exceeded` that
+ * escapes the relay's handler and is swallowed by the serialized-chain tail,
+ * leaving the client with NEITHER an ack NOR a refusal — into a controlled, early,
+ * TYPED throw the relay maps to a `protocol-version` refusal, so every frame still
+ * gets a verdict.
+ */
+export class CanonicalDepthError extends Error {
+  readonly canonicalDepthExceeded = true as const
+  constructor() {
+    super('payload nesting exceeds the canonical-hash depth limit')
+    this.name = 'CanonicalDepthError'
+  }
+}
+
+export function isCanonicalDepthError(err: unknown): err is CanonicalDepthError {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { canonicalDepthExceeded?: unknown }).canonicalDepthExceeded === true
+  )
+}
+
+/**
+ * Max structural nesting {@link canonicalStringify} will descend before throwing
+ * {@link CanonicalDepthError}. Legitimate `ops` payloads (slide element props and
+ * their values) are only a handful of levels deep, so this cap is orders of
+ * magnitude above any real frame yet far below the native-recursion stack limit —
+ * a pathological deep-nest frame is refused, never crashes the handler (XIN-1739 P2).
+ */
+export const MAX_CANONICAL_DEPTH = 500
+
+/**
  * Stable, key-order-independent JSON serialization: object keys are emitted in
  * sorted order at every depth so two structurally-equal payloads that differ
  * only in key order (or were re-serialized by a different client build) hash
  * identically. Arrays keep their order (op order is semantic).
+ *
+ * Descends at most {@link MAX_CANONICAL_DEPTH} levels; a deeper payload throws
+ * {@link CanonicalDepthError} rather than overflowing the stack (XIN-1739 P2).
  */
-export function canonicalStringify(value: unknown): string {
+export function canonicalStringify(value: unknown, depth = 0): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null'
-  if (Array.isArray(value)) return `[${value.map(canonicalStringify).join(',')}]`
+  if (depth >= MAX_CANONICAL_DEPTH) throw new CanonicalDepthError()
+  if (Array.isArray(value)) return `[${value.map((v) => canonicalStringify(v, depth + 1)).join(',')}]`
   const obj = value as Record<string, unknown>
   const keys = Object.keys(obj).sort()
-  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalStringify(obj[k])}`).join(',')}}`
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalStringify(obj[k], depth + 1)}`).join(',')}}`
 }
 
 /**

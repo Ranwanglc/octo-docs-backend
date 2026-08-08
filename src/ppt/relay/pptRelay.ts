@@ -42,6 +42,7 @@ import {
 } from './frames.js'
 import {
   canonicalPayloadHash,
+  isCanonicalDepthError,
   isDuplicateFramePayloadError,
   isRetryableStorageError,
   RetryableStorageError,
@@ -202,6 +203,15 @@ interface Conn {
   name?: string
   /** Space-membership claim minted at issuance (fed to role re-resolution). */
   spaceMember: boolean
+  /**
+   * Monotonic counter bumped on every successful in-place `reauth` (XIN-1739 P1-1).
+   * A share-expiry callback ({@link expireShareMembership}) captures this value
+   * BEFORE its `roleProvider` await and bails if it changed while awaiting: a fresh
+   * `reauth` that completed in the meantime already replaced the connection's
+   * authority and re-armed the expiry timer, so the stalled OLD callback must not
+   * resume and shove the freshly re-authorized socket back into `pendingReauth`.
+   */
+  reauthGeneration: number
   /** Timestamps of recently persisted frames, for the sliding-window rate limit. */
   frameTimes: number[]
   /**
@@ -262,6 +272,25 @@ interface Conn {
    * forever (P1-1).
    */
   observedHighWater: number
+  /**
+   * The lowest room seq below which this connection's document state is NOT backed
+   * by an actual relay delivery — it was TRUSTED from the client's `hello.since`
+   * claim rather than replayed to the socket (XIN-1739 P0-1/P1 prune-gate bypass).
+   *
+   * Set on every SUCCESSFUL replay to the delivered snapshot's `coveredSeq` (the
+   * connection received a full base doc through it) if a snapshot was delivered,
+   * else the clamped `effectiveSince` (the replay's lower bound — ops at or below it
+   * were never streamed, only claimed). It is the connection's ACTUAL delivery floor
+   * and is the authority a `snap` prune is bound to: a `snap` may only prune the op
+   * prefix when everything below this floor is ALREADY subsumed by a durable snapshot
+   * (`coverageFloor <= existing snapshot coveredSeq`). This closes the path where a
+   * writer `hello`s with `since = room high-water` (receiving NO ops), is marked
+   * caught-up, writes one fresh op that inflates `observedHighWater`, then `snap`s
+   * covering it and prunes durable ops it never observed. `Infinity` until the first
+   * successful replay establishes a floor (no snap can pass before then anyway — the
+   * `caughtUp` gate refuses it).
+   */
+  coverageFloor: number
   /** Approximate bytes held in liveBuffer. */
   liveBufferBytes: number
   /** Cached read authority used by no-I/O push delivery. */
@@ -272,6 +301,21 @@ interface Conn {
   inboundDepth: number
   /** Per-connection outbound ordering chain. */
   outboundChain: Promise<void>
+  /**
+   * Per-connection catch-up drain chain (XIN-1739 P1-2). The three drain entry
+   * points — the replay cutover, a `handleReauth` success, an `applyEpochBump` that
+   * cleared pendingReauth — are SERIALIZED through this one promise so a second
+   * drain never starts until the first has fully flushed. A depth counter alone
+   * (`flushDepth`) marks the connection busy but does NOT stop two drains from each
+   * swapping out a slice of the live buffer and interleaving their sends on the
+   * outbound chain (the `10,12,11` reorder): drain A sends 10 and awaits, a live op
+   * 12 buffers, drain B swaps `[12]` and enqueues 12 AHEAD of A's still-unsent 11.
+   * Chaining every drain body behind the prior one keeps each drain's buffer swap +
+   * sends atomic w.r.t. the next drain, so the outbound order stays strictly
+   * increasing. `flushDepth` is retained purely as the BUSY signal the
+   * deliver/requestReplay/handleSnap gates read.
+   */
+  drainChain: Promise<void>
   /** Periodic read-auth refresh timer. */
   authTimer?: NodeJS.Timeout
   /** Fail-closed timer for sockets whose ticket carried a space-membership claim. */
@@ -595,6 +639,7 @@ export class PptRelay {
       roleEpoch: liveEpoch,
       name: claims.name,
       spaceMember,
+      reauthGeneration: 0,
       frameTimes: [],
       ephemeralFrameTimes: [],
       caughtUp: false,
@@ -603,11 +648,13 @@ export class PptRelay {
       replayPending: null,
       liveBuffer: [],
       observedHighWater: 0,
+      coverageFloor: Infinity,
       liveBufferBytes: 0,
       auth: { readAllowed: roleAtLeast(role, 'reader'), invalidated: false },
       inboundChain: Promise.resolve(),
       inboundDepth: 0,
       outboundChain: Promise.resolve(),
+      drainChain: Promise.resolve(),
     }
     this.addToRoom(conn)
     this.armAuthRefresh(conn)
@@ -817,19 +864,43 @@ export class PptRelay {
    * mid-drain is buffered (not delivered ahead of it) and no concurrent replay
    * starts (XIN-1739 P1-2). Used by the non-replay flush paths (an epoch bump that
    * cleared `pendingReauth`, or a successful in-place `reauth`) where the connection
-   * is already `caughtUp`; the replay cutover does its own inline drain. The gate is
-   * a DEPTH COUNTER (P1-1): incrementing on entry and decrementing in `finally`
-   * keeps the connection BUSY for the whole overlap even if two drains run at once,
-   * so a fast inner drain finding an already-swapped-out buffer cannot clear the
-   * gate out from under a slower one still awaiting a `gatedSend`.
+   * is already `caughtUp`; the replay cutover uses {@link cutoverDrain}.
+   *
+   * SERIALIZED through {@link Conn.drainChain}: the whole body — the buffer swap and
+   * every send — runs behind any prior drain, so two overlapping drains cannot each
+   * swap out a slice of the buffer and interleave their sends on the outbound chain
+   * (the `10,12,11` reorder a bare depth counter left open, XIN-1739 P1-2). The
+   * `flushDepth` counter is incremented SYNCHRONOUSLY on entry (before the chain
+   * await) and decremented when this drain's flush finishes, so the
+   * deliver/requestReplay/handleSnap gates read the connection as BUSY for the whole
+   * queued+running overlap even though only one drain flushes at a time.
    */
-  private async drainLiveBuffer(conn: Conn): Promise<void> {
+  private drainLiveBuffer(conn: Conn): Promise<void> {
+    return this.chainedDrain(conn)
+  }
+
+  /**
+   * Serialize `flushLiveBuffer` (plus, for the replay cutover, the `caughtUp`
+   * flip) behind any prior drain on this connection. `flushDepth` is raised
+   * synchronously so the busy gates see the drain the instant it is requested, not
+   * only once it reaches the head of the chain.
+   */
+  private chainedDrain(conn: Conn, markCaughtUp = false): Promise<void> {
     conn.flushDepth++
-    try {
-      await this.flushLiveBuffer(conn)
-    } finally {
-      conn.flushDepth--
+    const body = async (): Promise<void> => {
+      try {
+        await this.flushLiveBuffer(conn)
+        // Set `caughtUp` synchronously right after the buffer empties (no await
+        // between), so no broadcast can slip in unbuffered before the flag flips
+        // (XIN-1739 P1-2 cutover invariant).
+        if (markCaughtUp) conn.caughtUp = true
+      } finally {
+        conn.flushDepth--
+      }
     }
+    const run = conn.drainChain.then(body, body)
+    conn.drainChain = run.catch(() => {})
+    return run
   }
 
   /**
@@ -1059,6 +1130,13 @@ export class PptRelay {
 
   private async expireShareMembership(conn: Conn): Promise<void> {
     if (!conn.spaceMember || conn.socket.readyState !== WebSocket.OPEN || !this.rooms.get(conn.docId)?.has(conn)) return
+    // Capture the reauth generation BEFORE the roleProvider await (XIN-1739 P1-1):
+    // an in-place `reauth` that completes while we await replaces the connection's
+    // authority and re-arms this timer, so a resume that ignored it would clobber a
+    // freshly re-authorized socket back into pendingReauth. The callback that ran
+    // this method already nulled `shareExpiryTimer`, so `handleReauth`'s clearTimeout
+    // cannot cancel this in-flight body — the generation guard is what stops it.
+    const generation = conn.reauthGeneration
     let directRole: ResolvedRole = 'none'
     if (this.roleProvider) {
       try {
@@ -1072,6 +1150,9 @@ export class PptRelay {
         directRole = 'none'
       }
     }
+    // A reauth (or another expiry cycle) intervened while awaiting → this callback
+    // is stale; bail without touching the connection's now-fresh authority.
+    if (conn.reauthGeneration !== generation) return
     if (!conn.spaceMember || conn.socket.readyState !== WebSocket.OPEN || !this.rooms.get(conn.docId)?.has(conn)) return
     if (roleRank(directRole) >= roleRank(conn.role)) {
       // Direct role covers the connection independent of the expired membership
@@ -1190,6 +1271,10 @@ export class PptRelay {
     conn.role = role
     conn.roleEpoch = liveEpoch
     conn.spaceMember = freshSpaceMember
+    // Bump the reauth generation so any share-expiry callback still awaiting its
+    // roleProvider (armed against the OLD ticket) bails on resume instead of shoving
+    // this freshly re-authorized socket back into pendingReauth (XIN-1739 P1-1).
+    conn.reauthGeneration++
     if (conn.shareExpiryTimer) {
       clearTimeout(conn.shareExpiryTimer)
       conn.shareExpiryTimer = undefined
@@ -1305,17 +1390,11 @@ export class PptRelay {
     // connection caught up. While a drain is in flight (`flushDepth > 0`), `deliver`
     // buffers new broadcasts and `requestReplay` coalesces, so live delivery can
     // never bypass the buffer mid-drain and reorder ops (the `10,12,11` defect).
-    // `flushLiveBuffer` returns only when the buffer is empty, and `caughtUp` is set
-    // synchronously right after — no await between — so no broadcast can slip in
-    // unbuffered. The gate is a depth counter, not a boolean, so a concurrent drain
-    // (P1-1) keeps the connection busy for the whole overlap.
-    conn.flushDepth++
-    try {
-      await this.flushLiveBuffer(conn)
-      conn.caughtUp = true
-    } finally {
-      conn.flushDepth--
-    }
+    // The drain is SERIALIZED through `drainChain` (so a concurrent reauth/epoch
+    // drain cannot interleave its sends) and sets `caughtUp` synchronously the
+    // instant the buffer empties — no await between — so no broadcast slips in
+    // unbuffered.
+    await this.chainedDrain(conn, /* markCaughtUp */ true)
     // A replay requested DURING the drain was coalesced (flushing counted as busy);
     // run it now so the freshly caught-up socket does not sit on a stale cursor.
     const next = this.takePendingReplay(conn)
@@ -1399,6 +1478,13 @@ export class PptRelay {
         let fromSeq = effectiveSince
         let readySeq = effectiveSince
         let delivered = conn.observedHighWater
+        // Track whether a snapshot was actually DELIVERED to this socket, and at
+        // what coverage: it sets the connection's prune-authority floor below
+        // (XIN-1739 P0-1/P1). A delivered snapshot means the socket received a full
+        // base doc through its `coveredSeq`; without one, everything at or below the
+        // clamped `effectiveSince` was TRUSTED from the client's `hello.since` claim,
+        // never streamed here.
+        let deliveredSnapshotCovered: number | null = null
         // Only send the snapshot to a peer behind it; an already-synced peer is not
         // forced to reapply it (PPT-COLLAB-003).
         if (snapshot && effectiveSince < snapshot.coveredSeq) {
@@ -1406,6 +1492,7 @@ export class PptRelay {
           await this.gatedSend(conn, { ctl: 'snapshot', snapshotVersion: snapshot.snapshotVersion, doc: snapshot.doc })
           fromSeq = snapshot.coveredSeq
           readySeq = snapshot.coveredSeq
+          deliveredSnapshotCovered = snapshot.coveredSeq
           // A snapshot covers all real ops through its coveredSeq; gaps in that
           // interval are legal no-op holes. Advance the high-water to coverage
           // (XIN-1739 P1-1).
@@ -1428,6 +1515,15 @@ export class PptRelay {
           }
         }
         conn.observedHighWater = Math.max(conn.observedHighWater, delivered)
+        // Record this replay's ACTUAL delivery floor (XIN-1739 P0-1/P1): a delivered
+        // snapshot means the socket received a full base doc through its coveredSeq;
+        // otherwise ops at or below the clamped `effectiveSince` were only CLAIMED by
+        // the client's `hello.since`, never streamed. `handleSnap` binds prune
+        // authority to this floor so a claimed cursor + one own write can never
+        // authorize pruning ops the connection never observed. Latest replay wins:
+        // a re-`hello` from a higher claimed cursor re-introduces an un-received gap,
+        // while a re-`hello` from `since=0` that streams the whole log lowers it.
+        conn.coverageFloor = deliveredSnapshotCovered ?? effectiveSince
         if (ready) {
           // Fallback is the connection's last-known LIVE epoch (validated at
           // handshake), NOT the snapshot version — stamping a snapshot counter as an
@@ -1786,7 +1882,24 @@ export class PptRelay {
     // dedups authoritatively). A genuinely NEW frame (`known === null`) still hits
     // `guardMutation` below.
     let known: { seq: number; payloadHash: string | null } | null = null
-    const payloadHash = canonicalPayloadHash(frame)
+    // Hash the canonical ops payload up front (the dedup identity). Bound the
+    // recursion: a pathologically deep-nested payload (~5000 levels, still under
+    // every byte cap) would otherwise drive `canonicalStringify` into a native
+    // `RangeError: Maximum call stack size exceeded` that escapes this handler and
+    // is swallowed by the `runSerialized` chain tail — the client gets NEITHER an
+    // `ack` NOR a `refused`, violating the "every frame gets a verdict" contract, and
+    // retries without consuming a rate slot. Convert it to a `protocol-version`
+    // refusal so the frame is answered (XIN-1739 P2).
+    let payloadHash: string
+    try {
+      payloadHash = canonicalPayloadHash(frame)
+    } catch (err) {
+      if (isCanonicalDepthError(err)) {
+        this.refuse(conn, 'protocol-version', { k, frameId, message: 'ops payload nesting exceeds limit' })
+        return
+      }
+      throw err
+    }
     try {
       if (this.store.frameIdentity) {
         known = await this.store.frameIdentity(conn.docId, frameId)
@@ -1902,8 +2015,28 @@ export class PptRelay {
     } catch {
       /* keep the ack: the op is durable regardless of the snapshot read */
     }
-    // Ack the sender ONLY after the durable write.
-    this.markObservedSeq(conn, seq)
+    // Advance the observation high-water for this authored write ONLY when it is a
+    // genuine observation of the room prefix (XIN-1739 P0-1). Three conditions must
+    // all hold, else the watermark would be advanced past ops this connection never
+    // received — poisoning the replay clamp, the live-buffer dedup, and the snapshot
+    // prune gate that all key off it:
+    //   · `!duplicate` — a slow-duplicate resend that fell through to `appendOp`
+    //     (the ledger fast-path missed it) is a re-ack of an already-durable frame,
+    //     NOT evidence the prefix below it was observed (XIN-1739 P0-1b), exactly the
+    //     invariant `reackDuplicate` documents for the pre-gate re-ack paths.
+    //   · `caughtUp` — a fresh authored write from a not-yet-caught-up socket (a
+    //     client that pipelined `hello since=0` with a pending local write) would
+    //     otherwise set its own newly-allocated seq as the replay floor and skip the
+    //     whole op log (XIN-1739 P0-1a).
+    //   · `flushDepth === 0` — a caught-up author writing WHILE a drain is in flight
+    //     (an epoch-bump / reauth cutover) would advance past peer ops still sitting
+    //     in `liveBuffer`, which `flushLiveBuffer`'s dedup then silently discards
+    //     (XIN-1739 P0-1c). During a drain the delivered prefix is in flux, so an own
+    //     write is not yet a safe observation.
+    // A caught-up author with no drain pending HAS received every lower real op in
+    // room order before its own ack, so advancing then is correct and lets it
+    // snapshot its own latest write.
+    if (!duplicate && conn.caughtUp && conn.flushDepth === 0) this.markObservedSeq(conn, seq)
     void this.gatedSend(conn, { ctl: 'ack', k: frame.k ?? 0, q: seq, snapshotVersion })
     // Broadcast to peers only for a first-seen frame (no echo, no double-apply).
     if (!duplicate) this.broadcast(conn, { ctl: 'op', q: seq, frame })
@@ -1948,7 +2081,26 @@ export class PptRelay {
     // snapshot q=3 even if seq 2 is a burned compatibility hole — prune stays safe
     // because there is no durable op row for the hole and all real ops <= covered
     // were delivered by the single room order before any higher real op (XIN-1739).
-    if (covered < 0 || covered > currentSeq || covered > conn.observedHighWater || (existing && covered < existing.coveredSeq)) {
+    //
+    // Prune authority is ALSO bound to the connection's ACTUAL delivery floor
+    // (XIN-1739 P0-1/P1): `observedHighWater` alone can be inflated by a caught-up
+    // socket's own fresh write even though it reached "caught up" via a CLAIMED
+    // `hello.since` cursor and never received the ops below that cursor. Such a
+    // prune would delete a durable op prefix no one on this socket ever observed.
+    // Refuse unless everything below `coverageFloor` is already subsumed by a
+    // DURABLE snapshot (`coverageFloor <= existing.coveredSeq`) — i.e. there are no
+    // un-delivered, un-snapshotted ops the prune could destroy. A from-scratch
+    // socket that streamed the whole log has `coverageFloor = 0` and passes; a
+    // claimed-cursor socket has `coverageFloor = its claimed since` and is refused
+    // until it genuinely replays that prefix or a snapshot already covers it.
+    const existingCovered = existing?.coveredSeq ?? 0
+    if (
+      covered < 0 ||
+      covered > currentSeq ||
+      covered > conn.observedHighWater ||
+      (existing && covered < existing.coveredSeq) ||
+      conn.coverageFloor > existingCovered
+    ) {
       this.refuse(conn, 'snapshot-conflict', { k, message: 'snapshot covered seq conflicts with the op log' })
       return
     }
@@ -2085,9 +2237,23 @@ export class PptRelay {
         // stamp when we actually have the authoritative epoch — otherwise leave
         // roleEpoch stale so the per-frame guard re-resolves later.
         if (epochOk) conn.roleEpoch = newEpoch
-        conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false, pendingReauth: !epochOk }
+        // Do NOT set a sticky pendingReauth when the epoch read merely FAILED
+        // (XIN-1739 P1-3). `recheckRole` above already re-resolved this connection's
+        // authority from the live `roleProvider` (fresh share_scope/share_role, and a
+        // load-bearing frozen membership claim would have taken the close-membership
+        // branch), so a non-`none` outcome means the socket IS currently authorized —
+        // only the epoch VERSION stamp is missing. Leaving `roleEpoch` stale (above)
+        // makes `guardMutation` / `refreshReadAuth` re-resolve and re-check the epoch
+        // per frame once the transient failure clears, so mutations stay fail-closed
+        // (a frame at the wrong epoch is `stale-epoch`) WITHOUT permanently disabling
+        // an otherwise-authorized socket. The previous `pendingReauth: !epochOk` had
+        // NO clearer on this path (refreshReadAuth/refreshRoleDownOnly preserve it,
+        // armReauthGrace was never called here, and no client sends `reauth`
+        // unprompted), so a single transient epoch-read blip left the socket neither
+        // usable (reads suppressed, writes `forbidden-role`) nor closed — forever.
+        conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
         if (downgraded) void this.gatedSend(conn, { ctl: 'role-changed', role: conn.role, epoch: newEpoch })
-        if (conn.auth.pendingReauth !== true && roleAtLeast(conn.role, 'reader') && conn.caughtUp) void this.drainLiveBuffer(conn)
+        if (roleAtLeast(conn.role, 'reader') && conn.caughtUp) void this.drainLiveBuffer(conn)
       }
     }
   }

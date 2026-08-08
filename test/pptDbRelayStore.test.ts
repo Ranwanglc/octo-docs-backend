@@ -714,4 +714,3 @@ describe('DbPptRelayStore — RC round-12 (XIN-1736)', () => {
     await cursor.close()
   })
 })
-
