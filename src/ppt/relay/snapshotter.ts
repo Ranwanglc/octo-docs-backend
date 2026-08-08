@@ -145,8 +145,10 @@ export class PptSnapshotter {
    *  4. ONLY THEN prune `seq <= authoritative-coveredSeq` and report reclaimed bytes.
    *
    * Returns null (a no-op) when there is nothing to advance (no tail above the
-   * current coverage) or when no base doc is available yet (no durable snapshot and
-   * `baseDocProvider` yields nothing — a genesis deck the relay cannot source).
+   * current coverage), when no base doc is available yet (no durable snapshot and
+   * `baseDocProvider` yields nothing — a genesis deck the relay cannot source), or
+   * when the existing snapshot is a legacy doc-only row (`state === null`) whose
+   * Bento SyncState cannot be faithfully reduced (XIN-1770 — see the guard below).
    * A storage failure propagates to the caller, which classifies it (retryable →
    * `storage-retry`) — the snapshot is never acked as done when its write failed.
    */
@@ -155,6 +157,25 @@ export class PptSnapshotter {
     baseDocProvider: ((docId: string) => Promise<BentoDoc | null>) | undefined,
   ): Promise<SnapshotRunResult | null> {
     const existing = await this.store.getSnapshot(docId)
+    // Legacy doc-only boundary guard (XIN-1770). A snapshot row persisted before
+    // Part B added the state column carries `state === null`: its doc is durable
+    // but the Bento SyncState it was reduced to is not. We CANNOT advance past such
+    // a boundary. Reducing the tail here would pass `existing.state ?? null` = null
+    // into `reduceFrames`, which treats the already-materialized doc as a
+    // never-synced genesis and re-`adopt`s it — minting FRESH Bento RGA/text
+    // generations that the tail's `txt`/`ins`/`ord`/`del` ops (minted against the
+    // ORIGINAL generation state) no longer address, so those ops silently no-op and
+    // the compacted doc diverges from the full-log reduction. The ops that built
+    // this boundary (`seq <= coveredSeq`) were pruned before the migration, so the
+    // state cannot be deterministically reconstructed from the durable log either.
+    // Advancing would therefore compact the boundary into a CORRUPT snapshot and
+    // then prune the tail that proves it wrong — silent upgrade-boundary data loss.
+    // Refuse: never compact + prune a boundary whose SyncState we cannot faithfully
+    // reduce. The relay keeps replaying this row doc-only (frames.ts wire contract)
+    // until a future full-log/state backfill rewrites it with a real state; the op
+    // log is simply not pruned in the meantime (a forced trigger degrades to
+    // `room-full`, a safe non-lossy fallback — never a lossy prune).
+    if (existing && existing.state === null) return null
     const highWater = await this.store.currentSeq(docId)
     const coveredSeq = existing?.coveredSeq ?? 0
     // Nothing above the current coverage to fold in → no work.

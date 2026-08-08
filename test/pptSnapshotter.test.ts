@@ -139,6 +139,63 @@ describe('PptSnapshotter.advance: durable-before-prune + room-byte reclaim', () 
     expect(store.pruned).toBe(false)
     expect(await store.opsSince(DOC, 0)).toHaveLength(fx.frames.length)
   })
+
+  // XIN-1770 regression: a LEGACY doc-only snapshot (`state === null`, written
+  // before Part B added the state column) must NEVER be compacted + pruned by the
+  // snapshotter. reduceFrames would re-`adopt` the materialized doc as a genesis,
+  // minting fresh Bento RGA/text generations the tail's `txt` op no longer
+  // addresses — silently dropping the edit and producing a doc that diverges from
+  // the full-log reduction (`<p>hello brave new world</p>` instead of
+  // `<p>hello new world</p>`), then pruning the tail op that proves it wrong.
+  // On the buggy head (5072810b) `advance` returns a non-null result and prunes;
+  // the fix refuses (returns null) and leaves the boundary + tail intact.
+  it('refuses to advance/prune a legacy doc-only snapshot (state===null) and never loses the txt tail', async () => {
+    const store = new InMemoryPptRelayStore()
+    const fx = buildGoldenFixtures()[3]! // text-rga-edits: hello world -> ... -> hello new world
+    const N = fx.snapshotAt // 2
+    const head = fx.frames.filter((f) => f.q <= N)
+    const tailFrames = fx.frames.filter((f) => f.q > N)
+    expect(tailFrames.length).toBeGreaterThan(0)
+
+    // Materialize the head-only reduction, then persist it as a LEGACY row: doc
+    // present, state deliberately NULL — exactly the shape the upgrade migration
+    // leaves a pre-Part-B row in. Seeding the head first advances the store's room
+    // seq to N so the tail lands at seq > coveredSeq (the head ops are then pruned,
+    // mirroring a boundary whose covered ops were GC'd pre-migration).
+    await seedFrames(store, head)
+    const headReduction = reduceFrames(fx.genesis, null, head.map((f) => ({ seq: f.q, ops: f.ops })))
+    const htmlOf = (doc: unknown): string =>
+      ((doc as { slides: Array<{ elements: Array<{ html?: string }> }> }).slides[0].elements[0].html ?? '')
+    expect(htmlOf(headReduction.doc)).toBe('<p>hello brave new world</p>')
+    await store.saveSnapshot({ docId: DOC, coveredSeq: N, doc: headReduction.doc, state: null })
+    await store.pruneOpsThrough(DOC, N)
+
+    // The head ops were pruned; only the tail remains durable, at seq > N.
+    await seedFrames(store, tailFrames)
+    const tailSeqBefore = (await store.opsSince(DOC, N)).map((o) => o.seq)
+    expect(tailSeqBefore.length).toBe(tailFrames.length)
+
+    const snapBefore = await store.getSnapshot(DOC)
+    const snapshotter = new PptSnapshotter(store)
+    const res = await snapshotter.advance(DOC, baseDocProviderFor(fx.genesis))
+
+    // (a) The snapshotter REFUSES to advance the un-reconstructable boundary.
+    expect(res).toBeNull()
+
+    // The legacy snapshot is untouched — no corrupt doc, no version bump, still
+    // doc-only. Critically it was NOT rewritten to the divergent
+    // `<p>hello brave new world</p>` a fresh-adopt reduction would have produced.
+    const snapAfter = await store.getSnapshot(DOC)
+    expect(snapAfter!.snapshotVersion).toBe(snapBefore!.snapshotVersion)
+    expect(snapAfter!.coveredSeq).toBe(N)
+    expect(snapAfter!.state).toBeNull()
+    expect(snapAfter!.doc).toEqual(snapBefore!.doc)
+
+    // The txt tail op is NEVER pruned — the boundary the snapshot could not
+    // faithfully reduce keeps its ops so a doc-only replay stays correct.
+    const tailSeqAfter = (await store.opsSince(DOC, N)).map((o) => o.seq)
+    expect(tailSeqAfter).toEqual(tailSeqBefore)
+  })
 })
 
 describe('reduceFrames: reserved reducer actor', () => {
