@@ -44,15 +44,61 @@ export const SNAPSHOT_REDUCER_ACTOR = '@relay'
  * `reduceProving` then never advances the covered watermark past it, so `coveredSeq`
  * pins at its old value, nothing prunes, `roomBytes` climbs to the hard cap, and the
  * room bricks read-only with a PERMANENT `room-full`. This bound trades that
- * permanent brick for a bounded, audited drop: once the frozen tail exceeds this many
- * seqs the buffered op is provably not going to be filled by anything already durable
- * (the whole tail was reduced and it is still parked), so the snapshotter persists the
+ * permanent brick for a bounded, audited drop: once the frozen tail grows past this
+ * many seqs the buffered op is not fillable by anything ALREADY durable (the whole
+ * tail was just reduced and it is still parked), so the snapshotter persists the
  * whole-tail materialized `(doc, state)` — which excludes the buffered ops — and
- * prunes through it, logging what was dropped. Sized far above any legitimate
- * cross-actor out-of-order window (a peer's `ins` for a referenced element lands
- * within a handful of ops in room order), so a genuine transient buffer is never aged.
+ * prunes through it, escalating what was dropped on the operational channel.
+ *
+ * RESIDUAL, stated honestly (XIN-1800 P1-2): "not fillable by anything ALREADY
+ * durable" is NOT "not fillable by a FUTURE durable op". The engine buffers a missing
+ * dependency in `pending`/`gap` precisely so a later op can drain it (crdt.ts). A
+ * dropped op whose dependency arrives LATER — e.g. a peer's offline `ins` for the
+ * referenced element, flushed after this drop — will be applied by live peers that
+ * still hold it but never by the server or a future joiner, a silent divergence this
+ * bound does NOT detect. The drop is therefore a bounded, best-effort HEURISTIC, not a
+ * proof of unfillability; it is strictly better than a permanent brick but the
+ * residual is real. The lag is sized far above any legitimate cross-actor out-of-order
+ * window (a peer's `ins` for a referenced element lands within a handful of ops in
+ * room order), so a genuine transient buffer is never aged — but a truly delayed
+ * dependency past the cap is dropped, which is why the drop is escalated for
+ * reconciliation/alerting (see {@link AgedOpDropHandler}).
  */
 export const DEFAULT_MAX_BUFFERED_OP_LAG = 4096
+
+/**
+ * One permanently-buffered op aged out of a room to unfreeze GC (XIN-1800 P1-2).
+ * `a`/`s` identify the dropped op's actor + per-actor sequence so a downstream
+ * handler can persist it for later reconciliation or alert on the divergence.
+ */
+export interface AgedOpDrop {
+  a: string
+  s: number
+}
+
+/**
+ * Operational escalation for aged-out ops (XIN-1800 P1-2). The aging path can drop an
+ * op that a FUTURE durable op would have filled (see {@link DEFAULT_MAX_BUFFERED_OP_LAG}
+ * residual), diverging the server from live peers with no in-band signal — so the drop
+ * must reach an operational surface, NOT just `console.warn`. Production wires this to
+ * structured logging + a metric/alert and MAY additionally persist the `(a,s)` pairs
+ * durably for reconciliation; the snapshotter stays storage-agnostic by taking this
+ * callback rather than owning an audit table. Called synchronously inside the room
+ * chain AFTER the compacting snapshot + prune committed; a throw is swallowed so a
+ * logging/alerting failure can never abort GC (the room must not re-brick because the
+ * alert sink was down).
+ */
+export type AgedOpDropHandler = (event: {
+  docId: string
+  /** Room seq the compacting snapshot was persisted at. */
+  targetSeq: number
+  /** Frozen-tail lag (seqs) that crossed the cap and triggered the drop. */
+  bufferedLag: number
+  /** The lag cap the tail exceeded. */
+  lagCap: number
+  /** The dropped ops' `(actor, s)` identities. */
+  dropped: AgedOpDrop[]
+}) => void
 
 /**
  * Assert the vendored engine's sync version matches the backend's `BENTO_SYNC_V`
@@ -219,6 +265,27 @@ export interface SnapshotRunResult {
 }
 
 /**
+ * The default {@link AgedOpDropHandler}: escalate to `console.warn` so the drop is at
+ * least recorded when a deployment wires no richer sink. Production overrides this
+ * with a structured-log + metric handler (XIN-1800 P1-2).
+ */
+export function defaultAgedOpDropHandler(event: {
+  docId: string
+  targetSeq: number
+  bufferedLag: number
+  lagCap: number
+  dropped: AgedOpDrop[]
+}): void {
+  // eslint-disable-next-line no-console
+  console.warn(
+    `[ppt-relay] doc ${event.docId}: aged out ${event.dropped.length} permanently-buffered op(s) to unfreeze GC ` +
+      `(XIN-1792 P1-3 / XIN-1800 P1-2; frozen tail=${event.bufferedLag} seqs crossed lag cap ${event.lagCap} at ` +
+      `seq ${event.targetSeq}); these ops may still be filled by a FUTURE durable dependency on live peers — ` +
+      `reconcile/alert: dropped=${JSON.stringify(event.dropped)}`,
+  )
+}
+
+/**
  * The server-side snapshotter. Constructed once per {@link PptRelay}; every method
  * is invoked from inside the relay's per-room chain, so its store reads and writes
  * are atomic w.r.t. appends and other snapshot jobs on the same room.
@@ -228,6 +295,13 @@ export class PptSnapshotter {
     private readonly store: PptRelayStore,
     /** Seq lag above which a permanently-buffered op is aged out (XIN-1792 P1-3). */
     private readonly maxBufferedOpLag: number = DEFAULT_MAX_BUFFERED_OP_LAG,
+    /**
+     * Operational escalation for aged-out ops (XIN-1800 P1-2). Defaults to a
+     * `console.warn` so a deployment that does not wire an alert sink still records
+     * the drop; production passes a handler that emits a structured log + metric and
+     * MAY persist the `(a,s)` pairs for reconciliation. A throw here is swallowed.
+     */
+    private readonly onAgedOpDrop: AgedOpDropHandler = defaultAgedOpDropHandler,
   ) {
     assertSyncVersionAligned()
   }
@@ -346,27 +420,33 @@ export class PptSnapshotter {
       // prefix. BUT a GHOST-TARGET op (a wire-legal `set`/`txt`/`ord` against an
       // element no `ins` in the durable log ever creates) parks in `pending` FOREVER,
       // so this branch would otherwise pin `coveredSeq` forever and brick the room
-      // read-only at `room-full` (XIN-1792 P1-3). Once the frozen tail has grown past
-      // `maxBufferedOpLag` seqs the buffered op is provably not fillable from anything
-      // durable — the whole tail was just reduced and it is still parked — so AGE it
-      // out: persist the whole-tail materialized `(doc, state)` (which excludes the
-      // buffered ops) at `targetSeq` and prune through it, recording an audit log of
-      // what was dropped. This bounds a permanent brick to a bounded, audited drop of
-      // an op that could never materialize.
+      // read-only at `room-full` (XIN-1792 P1-3). Once the frozen tail has grown to or
+      // past `maxBufferedOpLag` seqs the buffered op is not fillable by anything
+      // ALREADY durable — the whole tail was just reduced and it is still parked — so
+      // AGE it out: persist the whole-tail materialized `(doc, state)` (which excludes
+      // the buffered ops) at `targetSeq` and prune through it, ESCALATING what was
+      // dropped on the operational channel. This bounds a permanent brick to a bounded
+      // drop. RESIDUAL (XIN-1800 P1-2): "not fillable by anything ALREADY durable" is
+      // NOT "unfillable by a FUTURE durable op" — a delayed dependency arriving after
+      // the drop is applied by live peers but never the server, a silent divergence
+      // this heuristic does not detect. That is why the drop is escalated, not merely
+      // `console.warn`-ed, so a handler can persist the `(a,s)` pairs / alert.
       const bufferedLag = highWater - coveredSeq
       if (probe.engine.bufferedOps.length > 0 && bufferedLag >= this.maxBufferedOpLag) {
-        const dropped = probe.engine.bufferedOps
-        // eslint-disable-next-line no-console
-        console.warn(
-          `[ppt-relay] doc ${docId}: aging out ${dropped.length} permanently-buffered op(s) to unfreeze GC ` +
-            `(XIN-1792 P1-3; frozen tail=${bufferedLag} seqs > lag cap ${this.maxBufferedOpLag}); dropped=` +
-            JSON.stringify(dropped),
-        )
+        const dropped: AgedOpDrop[] = probe.engine.bufferedOps.map((o) => ({ a: o.a, s: o.s }))
         const doc = probe.doc
         const state = probe.engine.toJSON()
         const saved = await this.store.saveSnapshot({ docId, coveredSeq: targetSeq, doc, state })
         const prunableSeq = saved.coveredSeq ?? targetSeq
         const freedBytes = await this.store.pruneOpsThrough(docId, prunableSeq)
+        // Escalate AFTER the compacting snapshot + prune committed, so the room is
+        // already unfrozen even if the sink throws (swallowed — GC must never re-brick
+        // because the alert channel was down).
+        try {
+          this.onAgedOpDrop({ docId, targetSeq: prunableSeq, bufferedLag, lagCap: this.maxBufferedOpLag, dropped })
+        } catch {
+          /* an operational-escalation failure must not abort GC */
+        }
         return { snapshotVersion: saved.snapshotVersion, coveredSeq: saved.coveredSeq ?? targetSeq, prunedThroughSeq: prunableSeq, freedBytes }
       }
       return this.reattemptPrune(docId, coveredSeq)

@@ -586,6 +586,193 @@ describe('PPT relay: op-metadata bounds are relative, not absolute (XIN-1783 P1-
   })
 })
 
+// ────────────────────────────────────────────────────────────────────────────
+// XIN-1800 P0-1: the server-minted actor is STABLE across reconnects (derived from
+// (uid, docId, clientSessionId)), so `nextS` — the per-actor sequence — must be
+// SEEDED from durable state on reconnect, not reset to 1 per socket. Reset-to-1
+// paired with a stable actor either PERMANENTLY refuses every post-reconnect write
+// (the client kept its engine and sends s=last+1, but the gate expects 1) or, on a
+// fresh-engine restart at s=1, SILENTLY persists a duplicate (actor,s) the reducer
+// drops. Both branches were reproduced by yujiawei at c1ed326; both are closed by
+// re-deriving nextS from the durable per-actor high-water (the twin of the room clock).
+describe('PPT relay: nextS is seeded from durable state across a reconnect (XIN-1800 P0-1)', () => {
+  it('Branch A: a reconnecting session that KEEPS its engine continues its per-actor s (s=2 ACCEPTED, not refused)', async () => {
+    const h = await setup()
+    const actor = 'u-w-actor'
+    const w1 = await h.connect({ uid: 'u_w', role: 'writer', actor })
+    await helloReady(w1)
+    w1.send({ t: 'ops', pv: 2, k: 1, frameId: 'r1', epoch: 0, ops: [{ op: 'set', a: actor, s: 1, l: 1, k: 'x', v: 1 }] })
+    expect(await w1.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    // Evict the room so `nextS` is NOT carried in process memory: it must re-seed from
+    // the durable per-actor high-water on the next join (the whole point of P0-1).
+    w1.close()
+    await waitFor(async () => (h.relay.roomSize(DOC) === 0 ? true : null))
+    // Reconnect under the SAME stable actor; the client kept its engine, so its next
+    // op is s=2. Pre-fix (nextS reset to 1) this was refused `protocol-version` and the
+    // session's writes were dead. Post-fix it is accepted.
+    const w2 = await h.connect({ uid: 'u_w', role: 'writer', actor })
+    await helloReady(w2)
+    w2.send({ t: 'ops', pv: 2, k: 1, frameId: 'r2', epoch: 0, ops: [{ op: 'set', a: actor, s: 2, l: 2, k: 'x', v: 2 }] })
+    expect(await w2.recv()).toMatchObject({ ctl: 'ack', q: 2 })
+    // Two distinct durable frames — no silent loss, no permanent refusal.
+    expect(await h.store.currentSeq(DOC)).toBe(2)
+  })
+
+  it('Branch B: a reconnecting session that RESTARTS s at 1 is VISIBLY refused, never silently persisted as a duplicate (actor,s)', async () => {
+    const h = await setup()
+    const actor = 'u-w-actor'
+    const w1 = await h.connect({ uid: 'u_w', role: 'writer', actor })
+    await helloReady(w1)
+    w1.send({ t: 'ops', pv: 2, k: 1, frameId: 'b1', epoch: 0, ops: [{ op: 'set', a: actor, s: 1, l: 1, k: 'title', v: 'first' }] })
+    expect(await w1.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    w1.close()
+    await waitFor(async () => (h.relay.roomSize(DOC) === 0 ? true : null))
+    // A rebuilt-engine reconnect restarts s at 1 under a NEW frameId (NOT a dedup
+    // resend, so it does not short-circuit on the ledger). Pre-fix this was ACKed and
+    // the reducer silently dropped it as a duplicate (actor,s=1) — the post-reconnect
+    // edit was durable but lost everywhere. Post-fix nextS re-seeds to 2, so the stale
+    // s=1 is a VISIBLE `protocol-version` refusal and no second (actor,s=1) row lands.
+    const w2 = await h.connect({ uid: 'u_w', role: 'writer', actor })
+    await helloReady(w2)
+    w2.send({ t: 'ops', pv: 2, k: 1, frameId: 'b2', epoch: 0, ops: [{ op: 'set', a: actor, s: 1, l: 2, k: 'title', v: 'second' }] })
+    expect(await w2.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
+    expect(await h.store.currentSeq(DOC)).toBe(1)
+  })
+
+  it('P2-1: a reauth ticket carrying a DIFFERENT actor is refused (4403), not silently kept', async () => {
+    const h = await setup()
+    const w = await h.connect({ uid: 'u_w', role: 'writer', actor: 'u-w-actor' })
+    await helloReady(w)
+    // A reauth minted under a DIFFERENT clientSessionId carries a different actor. The
+    // uid pin already blocks cross-user migration; adopting a different actor silently
+    // would leave the connection authoring under the OLD actor while the client (which
+    // reads its actor from the token response) switches to the new one — every op then
+    // permanently refused with no diagnostic. Fail closed instead.
+    const ticket = h.ticketFor({ uid: 'u_w', role: 'writer', actor: 'u-w-actor-2' })
+    w.send({ t: 'reauth', pv: 2, ticket })
+    expect((await w.closed).code).toBe(4403)
+  })
+
+  it('concurrent-socket variant: two LIVE sockets sharing one actor do NOT both accept s=1 — the second is refused, not silently dropped', async () => {
+    const h = await setup()
+    const actor = 'u-shared-actor'
+    const a = await h.connect({ uid: 'u_w', role: 'writer', actor })
+    const b = await h.connect({ uid: 'u_w', role: 'writer', actor })
+    await helloReady(a)
+    await helloReady(b)
+    // Socket A authors s=1 and it commits durably.
+    a.send({ t: 'ops', pv: 2, k: 1, frameId: 'a1', epoch: 0, ops: [{ op: 'set', a: actor, s: 1, l: 1, k: 'x', v: 1 }] })
+    expect(await a.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    // Socket B (same actor, still live) then authors its OWN s=1 under a distinct
+    // frameId. Pre-fix both sockets reset nextS to 1 and the second was ACKed then
+    // dropped by every reducer as a duplicate (actor,s=1). Post-fix B re-derives nextS
+    // from the room's durable per-actor high-water (now 1), so its stale s=1 is a
+    // VISIBLE refusal and no second (actor,s=1) row lands.
+    b.send({ t: 'ops', pv: 2, k: 1, frameId: 'b1', epoch: 0, ops: [{ op: 'set', a: actor, s: 1, l: 2, k: 'x', v: 2 }] })
+    // B also receives A's committed op as a peer broadcast; skip past it to B's verdict.
+    const out = await b.recvUntil((m) => m.ctl === 'refused' || m.ctl === 'ack')
+    expect(out[out.length - 1]).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
+    expect(await h.store.currentSeq(DOC)).toBe(1)
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// XIN-1800 P1-3: three fixes that shipped without coverage — the terminal-state gate
+// on the authorization path, the outbound backlog cap, and the committed-ack that
+// bypasses the read-push freeze. Match the inbound-cap / no-silent-drop test rigor.
+describe('PPT relay: previously-untested fixes get coverage (XIN-1800 P1-3)', () => {
+  it('terminalRefusal: a resend of an already-durable frame against a since-DELETED doc is refused doc-deleted, NOT re-acked (XIN-1792 P1-4)', async () => {
+    // The behaviour change hiding in `terminalRefusal`: the terminal/identity gate runs
+    // BEFORE the known-duplicate re-ack lookup, so once the doc is deleted even a resend
+    // of a committed frame is refused `doc-deleted` (permanent) where it previously
+    // re-acked. Withdrawn authority wins over idempotency.
+    const h = await setup({ limits: { authRefreshMs: 60_000, docStatusCacheTtlMs: 0 } })
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+    w.send(OPS_FRAME(1, 'resend-after-del'))
+    expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    // The doc is deleted; the client, unaware, resends the SAME frameId (lost-ack retry).
+    h.setDocStatus('deleted')
+    w.send(OPS_FRAME(1, 'resend-after-del'))
+    const out = await w.recvUntil((m) => m.ctl === 'refused' || m.ctl === 'ack')
+    expect(out[out.length - 1]).toMatchObject({ ctl: 'refused', code: 'doc-deleted' })
+    // No second row was minted (frameId dedup) and the doc-deleted refusal is permanent.
+    expect(await h.store.currentSeq(DOC)).toBe(1)
+  })
+
+  it('terminalRefusal: returns the terminal-state refusal code for every terminal branch, null otherwise', async () => {
+    const relay = new PptRelay({ store: new InMemoryPptRelayStore(), epochProvider: async () => 0 })
+    const tr = (auth: Record<string, unknown>): string | null =>
+      (relay as unknown as { terminalRefusal: (c: unknown) => string | null }).terminalRefusal({ auth })
+    // A terminalClose naming a refused code surfaces THAT code (e.g. doc-deleted)…
+    expect(tr({ readAllowed: false, invalidated: false, terminalClose: { code: 4404, reason: 'x', refused: 'doc-deleted' } })).toBe('doc-deleted')
+    // …a terminalClose with no named code falls back to forbidden-role…
+    expect(tr({ readAllowed: false, invalidated: false, terminalClose: { code: 4403, reason: 'x' } })).toBe('forbidden-role')
+    // …an invalidated auth is forbidden-role…
+    expect(tr({ readAllowed: true, invalidated: true })).toBe('forbidden-role')
+    // …a plain read-not-allowed (not pending reauth) is forbidden-role…
+    expect(tr({ readAllowed: false, invalidated: false })).toBe('forbidden-role')
+    // …a pending-reauth grace state is NOT terminal (its own gate handles it)…
+    expect(tr({ readAllowed: false, invalidated: false, pendingReauth: true })).toBeNull()
+    // …and a healthy connection is null.
+    expect(tr({ readAllowed: true, invalidated: false })).toBeNull()
+    relay.close()
+  })
+
+  it('maxOutboundQueue: enqueueOutbound closes the peer 4410 and removes it once the outbound backlog hits the cap (XIN-1792 P1-5)', async () => {
+    const relay = new PptRelay({ store: new InMemoryPptRelayStore(), epochProvider: async () => 0, limits: { maxOutboundQueue: 2 } })
+    const closed: Array<{ code: number; reason: string }> = []
+    const fakeSocket = {
+      readyState: WebSocket.OPEN,
+      bufferedAmount: 0,
+      send: vi.fn(),
+      close: (code: number, reason: string) => {
+        closed.push({ code, reason })
+        fakeSocket.readyState = WebSocket.CLOSING
+      },
+    }
+    // A connection already AT the cap (a non-reading peer with a saturated chain).
+    const conn = { socket: fakeSocket, docId: DOC, outboundDepth: 2, outboundChain: Promise.resolve() }
+    ;(relay as unknown as { rooms: Map<string, Set<unknown>> }).rooms.set(DOC, new Set([conn]))
+    const enqueueOutbound = (relay as unknown as { enqueueOutbound: (c: unknown, t: () => void) => Promise<void> }).enqueueOutbound.bind(relay)
+    await enqueueOutbound(conn, () => fakeSocket.send('should-not-run'))
+    // The overflow closes 4410 directly (not via closeConn, which would re-enter the cap)
+    // and does NOT run the task or grow the depth.
+    expect(closed).toEqual([{ code: 4410, reason: 'outbound backlog exceeded' }])
+    expect(fakeSocket.send).not.toHaveBeenCalled()
+    expect(conn.outboundDepth).toBe(2)
+    expect((relay as unknown as { rooms: Map<string, unknown> }).rooms.has(DOC)).toBe(false)
+    relay.close()
+  })
+
+  it('sendCommittedAck: delivers a durably-committed write ack PAST a read-push freeze (pendingReauth) (XIN-1792 P1-6)', async () => {
+    const relay = new PptRelay({ store: new InMemoryPptRelayStore(), epochProvider: async () => 0 })
+    const sent: unknown[] = []
+    const fakeSocket = {
+      readyState: WebSocket.OPEN,
+      bufferedAmount: 0,
+      send: (raw: string) => sent.push(JSON.parse(raw)),
+      close: vi.fn(),
+    }
+    // canPushRead is FALSE here (pendingReauth), so a gated peer push would be
+    // suppressed — but the author's ack of its OWN already-committed frame must still
+    // be delivered, else the author believes a durable write failed (the P1-6 false
+    // negative). sendCommittedAck deliberately bypasses the read-push gate.
+    const conn = {
+      socket: fakeSocket,
+      docId: DOC,
+      outboundDepth: 0,
+      outboundChain: Promise.resolve(),
+      auth: { readAllowed: true, invalidated: false, pendingReauth: true },
+    }
+    expect((relay as unknown as { canPushRead: (c: unknown) => boolean }).canPushRead(conn)).toBe(false)
+    ;(relay as unknown as { sendCommittedAck: (c: unknown, a: unknown) => void }).sendCommittedAck(conn, { ctl: 'ack', k: 1, q: 1, snapshotVersion: 0 })
+    await sleep(10)
+    expect(sent).toEqual([{ ctl: 'ack', k: 1, q: 1, snapshotVersion: 0 }])
+    relay.close()
+  })
+})
+
 describe('PPT relay: refused retry classification (PPT-WS-006)', () => {
   it('classifies every refused code; rate-limited is retryable with retryInMs', async () => {
     const h = await setup({ limits: { maxOpsPerFrame: 2, maxFramesPerWindow: 3, maxRoomFrameBytes: 100_000_000 } })

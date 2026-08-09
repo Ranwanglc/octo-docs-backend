@@ -22,7 +22,7 @@ The service is a single process that exposes **two** listeners:
 > explicit shared transport or affinity design; until then, deploy exactly one
 > backend replica for PPT collaboration.
 
-> **PPT collab relay — client wire contract (R4-B1, XIN-1792).** A client of the
+> **PPT collab relay — client wire contract (R4-B1, XIN-1792 / XIN-1800).** A client of the
 > Bento relay MUST honor the following, all enforced server-side (a violation is a
 > PERMANENT `protocol-version` refusal unless noted):
 >
@@ -40,12 +40,31 @@ The service is a single process that exposes **two** listeners:
 > - **Byte-identical idempotent resend.** Re-send a queued frame with the SAME
 >   `frameId` and the SAME ops (including `a`/`s`/`l`). A reused `frameId` carrying
 >   different ops is refused.
-> - **Per-actor `s` contiguity.** Under the server-minted actor, a frame's ops' `s`
->   values must be exactly `nextS, nextS+1, …` (starting at 1 for a fresh session). A
->   skip/reorder/repeat is refused.
+> - **Per-actor `s` contiguity, CONTINUED across reconnects (XIN-1800 P0-1).** Under the
+>   server-minted actor a frame's ops' `s` values must be exactly `nextS, nextS+1, …`
+>   The server derives `nextS` from what the actor has DURABLY written (the snapshot's
+>   version vector folded with the un-snapshotted tail), NOT from a per-connection reset.
+>   Concretely, the `s` a reconnecting session must send is:
+>   - **A brand-new session** (a `clientSessionId` that has never written): its first
+>     `s` is **1**.
+>   - **A reconnecting session that KEEPS its engine** (the required behaviour above):
+>     it CONTINUES its sequence — the next `s` is one past the last `s` its engine
+>     minted, i.e. `(engine.vv[actor]) + 1`. Because the server re-seeds `nextS` from
+>     the durable high-water, that continuation (e.g. `s=2` after a single durable
+>     `s=1`) is ACCEPTED, not refused.
+>   - Do NOT rebuild the engine and restart `s` at 1 after a reconnect: the server
+>     already holds `s=1` for the actor, so a restarted `s=1` is a stale, non-contiguous
+>     value and is refused `protocol-version` (a signal to fully resync/reload) — it is
+>     never silently accepted as a duplicate. Keeping the engine is the supported path.
+>   A skip/reorder/repeat within a session is likewise refused.
 > - **Relative clock bound.** An op's `l` (and a `txt` op's seed `sd[0]`) must be
 >   within `OP_CLOCK_SLACK` (2^20) of the room's live Lamport clock; a value far above
 >   it is refused.
+> - **`reauth` keeps the actor (XIN-1800 P2-1).** An in-place `reauth` ticket must carry
+>   the SAME actor as the live connection (same `clientSessionId`). A reauth minted under
+>   a different session id — hence a different actor — is refused (socket closed `4403`)
+>   rather than silently keeping the old actor; mint the reauth ticket with the same
+>   `clientSessionId` the connection was established with.
 >
 > `COLLAB_TOKEN_SECRET` signs the relay token, signs the one-time ticket, AND is the
 > HMAC key for the minted actor — one secret, three uses (the asymmetric-key TODO now

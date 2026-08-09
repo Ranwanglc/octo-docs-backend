@@ -88,6 +88,18 @@ export const pptLiveSnapshotRepo = {
    * state atomic so a late joiner never mixes a doc at seq N with state at seq M).
    * The caller reads the authoritative post-write `(snapshot_version, covered_seq)`
    * back on the same connection.
+   *
+   * ACCEPTED GROWTH (XIN-1800 P2-5): `state_json` embeds the Bento version vector
+   * `vv` — one entry per actor that ever landed an op. Actors are minted per
+   * `(uid, docId, clientSessionId)`, so a user opening N distinct client sessions on
+   * one deck accrues N permanent `vv` entries with no cap or retirement. This is
+   * bounded GROWTH, not a DoS: each entry is a short `actor:number` pair (~40 bytes),
+   * a heavily-collaborated deck reaches only hundreds, and the `state_bytes` column is
+   * already charged against the room byte budget. A per-`(uid, docId)` actor cap or a
+   * `vv`-retirement pass would bound it further but risks dropping a live replica's
+   * seq (re-introducing the very silent-loss class XIN-1800 P0-1 fixes), so it is
+   * deliberately NOT added here; documented as accepted growth per the reviewer's
+   * either/or. Revisit if a deck's `vv` is observed growing without bound in practice.
    */
   async upsertAdvanceTx(
     tx: Tx,

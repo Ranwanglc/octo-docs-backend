@@ -14,7 +14,11 @@
  *    write, and only THEN broadcast to peers (sender never echoes its own op);
  *  - `(docId, frameId)` is unique — a resent frame re-acks its original seq and
  *    is not rebroadcast, and this re-ack precedes the epoch/role gate so a resend
- *    after a lost ack still acknowledges an already-durable write;
+ *    after a lost ack still acknowledges an already-durable write. EXCEPTION: a
+ *    connection already driven into a TERMINAL auth state (revoked, or its doc
+ *    deleted) is refused at the top of the gate BEFORE the re-ack lookup, so a resend
+ *    against a since-deleted doc is refused `doc-deleted` (permanent) rather than
+ *    re-acked — the withdrawn authority wins over idempotency (XIN-1792 P1-4);
  *  - a `snap` advances the snapshot version atomically, then prunes covered ops;
  *  - refusals classify retry: the retryable set is `rate-limited` + `storage-retry`
  *    (both carry a bounded `retryInMs` backoff hint); every other refusal is
@@ -51,7 +55,7 @@ import {
   type PptRelayStore,
   type ReplayCursor,
 } from './store.js'
-import { PptSnapshotter, type SnapshotRunResult } from './snapshotter.js'
+import { PptSnapshotter, type SnapshotRunResult, type AgedOpDropHandler } from './snapshotter.js'
 import {
   verifyPptRelayTicket,
   InMemoryTicketStore,
@@ -203,6 +207,14 @@ export interface PptRelayDeps {
    * corruption. Once a snapshot exists the snapshotter reduces onto it, not this.
    */
   baseDocProvider?: (docId: string) => Promise<BentoDoc | null>
+  /**
+   * Operational escalation for ops the server-side snapshotter ages out to unfreeze
+   * GC (XIN-1800 P1-2). Wired straight through to {@link PptSnapshotter}. Production
+   * routes it to structured logging + a metric/alert and MAY persist the dropped
+   * `(a,s)` pairs for reconciliation; omitted, the snapshotter's `console.warn`
+   * default records the drop so it is never silent.
+   */
+  onAgedOpDrop?: AgedOpDropHandler
   protocolVersion?: number
   limits?: Partial<RelayLimits>
 }
@@ -362,14 +374,27 @@ interface Conn {
   actorBound: boolean
   /**
    * The next per-actor sequence `s` this connection may mint under its server-minted
-   * actor (XIN-1789 P1-1). Starts at 1 (a fresh session's Bento `SyncState` mints `s`
-   * from 1) and advances by the op count of each ACCEPTED frame. A frame whose ops'
-   * `s` values are not exactly `nextS, nextS+1, …` (a skip, reorder, or repeat) is
-   * refused at the trust boundary, so one wire-legal non-contiguous `s` can no longer
-   * manufacture an unfillable per-actor gap that freezes room GC. Enforced only when
-   * {@link actorBound}.
+   * actor (XIN-1789 P1-1). SEEDED from durable room state on the connection's first
+   * new frame — `(durable per-actor high-water) + 1` — NOT reset to 1 per socket
+   * (XIN-1800 P0-1). The actor is stable across reconnects (derived from
+   * `(uid, docId, clientSessionId)`), so a client that keeps its engine continues its
+   * `s` sequence past a reconnect; seeding `nextS` from what the room durably holds is
+   * the per-actor twin of the room-clock seed and is what makes that continuation
+   * accepted instead of refused (or, on a fresh-engine restart at `s=1`, VISIBLY
+   * refused rather than silently persisting a duplicate `(actor,s)` the reducer drops).
+   * Advances by the op count of each ACCEPTED frame. A frame whose ops' `s` values are
+   * not exactly `nextS, nextS+1, …` (a skip, reorder, or repeat) is refused at the
+   * trust boundary, so one wire-legal non-contiguous `s` can no longer manufacture an
+   * unfillable per-actor gap that freezes room GC. Enforced only when {@link actorBound}.
    */
   nextS: number
+  /**
+   * True once {@link nextS} has been seeded from durable room state (XIN-1800 P0-1).
+   * The seed is lazy — it runs on the first NEW (`known === null`) frame, after
+   * {@link ensureRoomLamport} has folded the durable tail into the per-actor
+   * high-water — so a socket that only ever re-acks or reads never triggers it.
+   */
+  nextSSeeded: boolean
 }
 
 function send(socket: WebSocket, frame: ServerFrame): void {
@@ -512,6 +537,18 @@ export class PptRelay {
   /** Rooms whose {@link roomLamport} has been seeded from durable snapshot state. */
   private readonly roomLamportSeeded = new Set<string>()
   /**
+   * Per-room, per-actor highest durably-accepted `s` (XIN-1800 P0-1). The per-actor
+   * twin of {@link roomLamport}: seeded from durable state (the snapshot's version
+   * vector plus the un-snapshotted tail) in the SAME pass as the room clock, then
+   * advanced by each accepted server-minted frame. A reconnecting session re-derives
+   * its {@link Conn.nextS} from this map instead of resetting to 1, so a client that
+   * keeps one replica identity across a reconnect continues its `s` sequence — and a
+   * fresh-engine restart at a stale `s` is VISIBLY refused rather than silently
+   * persisting a duplicate `(actor,s)` the reducer would drop. Dropped alongside
+   * {@link roomLamport} when the last socket leaves (re-seeded on the next join).
+   */
+  private readonly roomActorSeq = new Map<string, Map<string, number>>()
+  /**
    * Per-room serialization chain for seq-allocating frames (`ops`/`snap`).
    * `onMessage` is fire-and-forget (`void`), so without this two concurrent
    * writers could allocate seq 1 and 2 but broadcast 2 before 1 — peers would
@@ -545,7 +582,11 @@ export class PptRelay {
     this.pv = deps.protocolVersion ?? config.ppt.relay.protocolVersion
     this.limits = { ...defaultLimits(), ...(deps.limits ?? {}) }
     this.replaySemaphore = new Semaphore(this.limits.maxInFlightReplays)
-    this.snapshotter = new PptSnapshotter(this.store)
+    this.snapshotter = new PptSnapshotter(
+      this.store,
+      undefined,
+      deps.onAgedOpDrop,
+    )
     this.baseDocProvider = deps.baseDocProvider
     // noServer: the relay owns no listener of its own — it is attached to B's
     // existing HTTP server (no second service).
@@ -748,6 +789,7 @@ export class PptRelay {
       ...(claims.actor !== undefined ? { actor: claims.actor } : {}),
       actorBound: claims.actor !== undefined,
       nextS: 1,
+      nextSSeeded: false,
     }
     this.addToRoom(conn)
     this.armAuthRefresh(conn)
@@ -814,6 +856,9 @@ export class PptRelay {
       // snapshot state on the next join (XIN-1789 P1-2).
       this.roomLamport.delete(conn.docId)
       this.roomLamportSeeded.delete(conn.docId)
+      // And the per-actor `s` high-water (seeded in the same pass as the clock);
+      // it re-seeds from durable state on the next join (XIN-1800 P0-1).
+      this.roomActorSeq.delete(conn.docId)
       // Evict the room's doc-status cache entry too, so a churn of short-lived
       // rooms cannot grow the cache unbounded (XIN-1736 P2-b). It re-populates on
       // the next join within its short TTL.
@@ -882,6 +927,15 @@ export class PptRelay {
    * queued close. The ack carries only the author's frame counter + assigned seq (no
    * peer data), so delivering it past the freeze leaks nothing. Routed through
    * {@link enqueueOutbound} so it still honors the outbound ordering + backlog cap.
+   *
+   * AT THE OUTBOUND CAP the ack is dropped (XIN-1800 P2-2): `enqueueOutbound`'s
+   * overflow branch closes the socket `4410` (resync) and returns WITHOUT running the
+   * task, so a committed write's ack can be swallowed when the outbound backlog is
+   * saturated. This is NOT the P1-6 false-negative divergence returning — the `4410`
+   * close makes the client reconnect, and on reconnect the frame is a known-duplicate
+   * that re-acks via the pre-gate re-ack path (`frameSeq`/`frameIdentity`), so the
+   * author still learns the write is durable. It self-heals; it is called out here so
+   * the "always delivered past the freeze" wording is not read as unconditional.
    */
   private sendCommittedAck(conn: Conn, ack: AckCtl): void {
     void this.enqueueOutbound(conn, () => send(conn.socket, ack))
@@ -1413,6 +1467,19 @@ export class PptRelay {
     // connection's authority, never migrate the socket to another user or doc.
     if (claims.uid !== conn.uid || claims.docId !== conn.docId || claims.documentName !== conn.documentName) {
       return this.failReauth(conn, 'reauth identity mismatch')
+    }
+    // The server-minted actor is now part of identity (XIN-1800 P2-1). A reauth ticket
+    // minted under a DIFFERENT clientSessionId carries a different actor; adopting it
+    // silently would leave the connection authoring under its OLD actor while the
+    // client (which reads its actor from the token response) switches to the new one —
+    // every subsequent op then permanently refused `protocol-version` with no
+    // diagnostic. The uid pin above already blocks cross-user migration, so this is a
+    // correctness/diagnosability gate, not a cross-user hole: refuse a reauth that
+    // would change a bound connection's actor rather than diverge silently. A legacy
+    // (non-actorBound) connection is unaffected — its actor is first-frame-pinned, not
+    // carried in the ticket.
+    if (conn.actorBound && claims.actor !== conn.actor) {
+      return this.failReauth(conn, 'reauth actor mismatch')
     }
     let fresh: boolean
     try {
@@ -2021,6 +2088,12 @@ export class PptRelay {
    * {@link handleOps}). A generous {@link OP_CLOCK_SLACK} absorbs the gap between the
    * seeded clock and any un-serialized offline work.
    *
+   * The SAME pass also seeds {@link roomActorSeq} — the per-actor `s` high-water —
+   * from the snapshot's version vector (the per-actor contiguous seq the snapshot
+   * covers) folded with the max `s` each actor carries in the un-snapshotted tail
+   * (XIN-1800 P0-1). The room clock and the per-actor sequence are twin durable
+   * watermarks read from the same tail, so they are seeded together in one scan.
+   *
    * Seeding from the SNAPSHOT ALONE was insufficient: the room clock is dropped when
    * the last socket leaves ({@link removeFromRoom}) and a frame may legitimately sit
    * up to `OP_CLOCK_SLACK` above the snapshot's clock, so after a room empties and
@@ -2030,31 +2103,73 @@ export class PptRelay {
    * seed makes the bound track what the room has actually observed. The snapshot /
    * tail reads failing is RETRYABLE: the caller must not admit a frame against an
    * unknown clock.
+   *
+   * The tail scan is BYTE-BOUNDED (XIN-1800 P1-1): when the store exposes the
+   * byte-aware {@link ReplayCursor} it pages the tail through it (its `pageBytes`
+   * budget caps how much op JSON is materialized per page), and the caller in
+   * {@link handleOps} runs this behind the per-connection rate gate, so a cheap flood
+   * of new frames can neither drive an unbounded read nor bypass the limiter. See the
+   * resolution comment for why the O(1) persisted high-water yujiawei preferred is
+   * DEFERRED this round (it needs a snapshot-row/append-transaction schema change; the
+   * bounded scan + rate gate removes the operational DoS without that risk).
    */
   private async ensureRoomLamport(docId: string): Promise<number> {
     if (!this.roomLamportSeeded.has(docId)) {
       let seed = 0
+      const actorSeq = new Map<string, number>()
+      // Fold one op's per-actor `s` into the actor high-water (XIN-1800 P0-1).
+      const foldActor = (raw: unknown): void => {
+        if (typeof raw !== 'object' || raw === null) return
+        const o = raw as { a?: unknown; s?: unknown }
+        if (typeof o.a === 'string' && typeof o.s === 'number' && o.s > (actorSeq.get(o.a) ?? 0)) {
+          actorSeq.set(o.a, o.s)
+        }
+      }
+      const foldFrame = (frame: unknown): void => {
+        const ops = Array.isArray((frame as { ops?: unknown })?.ops) ? (frame as { ops: unknown[] }).ops : []
+        const clock = maxFrameClock(ops)
+        if (clock > seed) seed = clock
+        for (const raw of ops) foldActor(raw)
+      }
       try {
-        const snap = await this.store.getSnapshot(docId)
-        seed = snap?.state?.lamport ?? 0
-        // The snapshot clock only covers ops <= coveredSeq; ops above it (the
-        // un-snapshotted tail) may carry a higher `l`/`sd[0]` that the room already
-        // accepted. Page the tail and fold its max clock into the seed so a rejoin
-        // after a room eviction never regresses below what clients hold (P1-2).
-        let cursor = snap?.coveredSeq ?? 0
-        for (;;) {
-          const page = await this.store.opsSince(docId, cursor, this.limits.replayPageSize)
-          if (page.length === 0) break
-          for (const op of page) {
-            const ops = Array.isArray((op.frame as { ops?: unknown })?.ops)
-              ? (op.frame as { ops: unknown[] }).ops
-              : []
-            const clock = maxFrameClock(ops)
-            if (clock > seed) seed = clock
+        // Prefer the store's byte-aware replay cursor: it reads the snapshot + high-water
+        // from one consistent point and pages the un-snapshotted tail bounded by
+        // `replayPageBytes`, so one page can never materialize the whole tail in memory
+        // (XIN-1800 P1-1). Fall back to the bounded-row `opsSince` loop for a store
+        // without `openReplay`.
+        if (this.store.openReplay) {
+          const cursor = await this.store.openReplay(docId, 0, {
+            pageRows: this.limits.replayPageSize,
+            pageBytes: this.limits.replayPageBytes,
+          })
+          try {
+            seed = cursor.snapshot?.state?.lamport ?? 0
+            for (const [a, s] of Object.entries(cursor.snapshot?.state?.vv ?? {})) {
+              if (typeof s === 'number' && s > (actorSeq.get(a) ?? 0)) actorSeq.set(a, s)
+            }
+            for (;;) {
+              const page = await cursor.nextPage()
+              if (page.length === 0) break
+              for (const op of page) foldFrame(op.frame)
+            }
+          } finally {
+            await cursor.close()
           }
-          const last = page[page.length - 1]!.seq
-          if (last <= cursor) break
-          cursor = last
+        } else {
+          const snap = await this.store.getSnapshot(docId)
+          seed = snap?.state?.lamport ?? 0
+          for (const [a, s] of Object.entries(snap?.state?.vv ?? {})) {
+            if (typeof s === 'number' && s > (actorSeq.get(a) ?? 0)) actorSeq.set(a, s)
+          }
+          let cursor = snap?.coveredSeq ?? 0
+          for (;;) {
+            const page = await this.store.opsSince(docId, cursor, this.limits.replayPageSize)
+            if (page.length === 0) break
+            for (const op of page) foldFrame(op.frame)
+            const last = page[page.length - 1]!.seq
+            if (last <= cursor) break
+            cursor = last
+          }
         }
       } catch (err) {
         throw new RetryableStorageError('room clock seed read failed', { cause: err })
@@ -2062,6 +2177,11 @@ export class PptRelay {
       // Do not clobber a clock already advanced by frames that landed during the seed
       // read (the room chain serializes appends, but the seed read itself awaits).
       this.roomLamport.set(docId, Math.max(seed, this.roomLamport.get(docId) ?? 0))
+      // Merge the seeded per-actor high-water without regressing any value a concurrent
+      // accepted frame already advanced during the seed read.
+      const existing = this.roomActorSeq.get(docId) ?? new Map<string, number>()
+      for (const [a, s] of actorSeq) if (s > (existing.get(a) ?? 0)) existing.set(a, s)
+      this.roomActorSeq.set(docId, existing)
       this.roomLamportSeeded.add(docId)
     }
     return this.roomLamport.get(docId) ?? 0
@@ -2241,6 +2361,19 @@ export class PptRelay {
     // `DuplicateFramePayloadError` there — no gate is bypassed, only reordered after the
     // dedup that owns it.
     if (known === null) {
+      // Rate-gate a genuinely NEW frame BEFORE the durable room-clock / per-actor-seq
+      // seed read (XIN-1800 P1-1). `ensureRoomLamport` pages the durable tail on the
+      // first new frame in a room; leaving it ahead of the limiter let the cheapest
+      // client action drive that read on the per-room chain in the REST process with
+      // the rate limiter never consulted. A pure re-ack (`known !== null`) returns
+      // above and is deliberately never rate-limited (idempotent-resend contract), so
+      // gating here — the first point a NEW mutation is known — sheds a flood before it
+      // can seed or persist, mirroring the inbound-queue shed.
+      const retryInMs = this.rateLimited(conn.frameTimes)
+      if (retryInMs !== null) {
+        this.refuse(conn, 'rate-limited', { k, frameId, retryInMs })
+        return
+      }
       // Actor binding. When the credential carried a server-minted actor claim
       // (`actorBound`), the connection's actor is FIXED at issuance from the
       // authenticated uid: refuse any op whose `a` differs, so the client can neither
@@ -2286,6 +2419,19 @@ export class PptRelay {
       // (first-frame-pinned) actor's `s` sequence is not server-trusted, so it is not
       // gated here. `nextS` advances only after the write is durable (below).
       if (conn.actorBound) {
+        // Seed `nextS` from the durable per-actor high-water on first use (XIN-1800
+        // P0-1). `ensureRoomLamport` (awaited just above) folded the snapshot vv + the
+        // un-snapshotted tail into `roomActorSeq`, so a session that keeps its replica
+        // identity across a reconnect continues its sequence (next mint = high-water+1)
+        // instead of resetting to 1. Without this a reconnecting session either had
+        // every write PERMANENTLY refused (it sends `s = last+1` but the gate expects 1)
+        // or, on a fresh-engine restart at `s = 1`, silently persisted a duplicate
+        // `(actor,s)` the reducer drops — both reproduced by yujiawei at c1ed326.
+        if (!conn.nextSSeeded) {
+          const durableS = this.roomActorSeq.get(conn.docId)?.get(conn.actor as string) ?? 0
+          conn.nextS = durableS + 1
+          conn.nextSSeeded = true
+        }
         const sValues = (frame.ops as Array<{ s?: unknown }>).map((op) => op.s)
         const contiguous = sValues.every((s, i) => s === conn.nextS + i)
         if (!contiguous) {
@@ -2344,11 +2490,11 @@ export class PptRelay {
         return
       }
     }
-    const retryInMs = this.rateLimited(conn.frameTimes)
-    if (retryInMs !== null) {
-      this.refuse(conn, 'rate-limited', { k, frameId, retryInMs })
-      return
-    }
+    // NOTE: the rate gate now runs at the TOP of the `known === null` block above,
+    // ahead of the durable seed read (XIN-1800 P1-1). Only a genuinely NEW mutation
+    // consumes a rate slot; a known-frameId duplicate (including an unverifiable
+    // NULL-hash row) is a re-ack and — per the idempotent-resend contract — is never
+    // rate-limited, so there is no second rate check here.
 
     // Persist DURABLY before acking (§7.3). A duplicate frameId re-acks its
     // original seq and is NOT rebroadcast (idempotent resend).
@@ -2380,7 +2526,19 @@ export class PptRelay {
       const current = this.roomLamport.get(conn.docId) ?? 0
       const advanced = Math.max(current, maxFrameClock(frame.ops))
       if (advanced > current) this.roomLamport.set(conn.docId, advanced)
-      if (conn.actorBound) conn.nextS += frame.ops.length
+      if (conn.actorBound && conn.actor !== undefined) {
+        conn.nextS += frame.ops.length
+        // Advance the room's durable per-actor high-water too (XIN-1800 P0-1), so a
+        // LATER socket under the same stable actor (a reconnect, or a concurrent
+        // second socket) re-derives its `nextS` past this commit — a stale `s` from a
+        // rebuilt engine is then VISIBLY refused, never silently persisted as a
+        // duplicate `(actor,s)`. Ops are contiguous from the old `nextS`, so the
+        // highest `s` this frame carried is the new `nextS - 1`.
+        const lastS = conn.nextS - 1
+        const perActor = this.roomActorSeq.get(conn.docId) ?? new Map<string, number>()
+        if (lastS > (perActor.get(conn.actor) ?? 0)) perActor.set(conn.actor, lastS)
+        this.roomActorSeq.set(conn.docId, perActor)
+      }
     }
 
     // Post-commit: the write is DURABLE, so the sender MUST get an ack (never a

@@ -441,4 +441,37 @@ describe('PptSnapshotter.advance: ghost-target GC-freeze aging (XIN-1792 P1-3)',
       warn.mockRestore()
     }
   })
+
+  it('XIN-1800 P1-2: escalates the aged-out op(s) to the operational handler with the dropped (a,s) pairs', async () => {
+    const store = new InMemoryPptRelayStore()
+    await seedGhost(store)
+    const events: Array<{ docId: string; targetSeq: number; bufferedLag: number; lagCap: number; dropped: Array<{ a: string; s: number }> }> = []
+    // A production handler (structured log + metric/alert; may persist the pairs for
+    // reconciliation) replaces the bare console.warn — the drop is not fillable by
+    // anything ALREADY durable but MAY be filled by a FUTURE op on live peers, so it
+    // must reach an operational surface, not just the console.
+    const snapshotter = new PptSnapshotter(store, /* maxBufferedOpLag */ 2, (e) => events.push(e))
+    const res = await snapshotter.advance(DOC, baseDocProviderFor(genesisDeck()))
+    expect(res).not.toBeNull()
+    expect(events).toHaveLength(1)
+    expect(events[0]!.docId).toBe(DOC)
+    expect(events[0]!.lagCap).toBe(2)
+    expect(events[0]!.targetSeq).toBe(2)
+    // The ghost-target `set` (actor u1, s=1) is the dropped op reported for reconciliation.
+    expect(events[0]!.dropped).toEqual([{ a: 'u1', s: 1 }])
+  })
+
+  it('XIN-1800 P1-2: a throwing escalation handler never aborts GC (room still unfreezes)', async () => {
+    const store = new InMemoryPptRelayStore()
+    await seedGhost(store)
+    const snapshotter = new PptSnapshotter(store, /* maxBufferedOpLag */ 2, () => {
+      throw new Error('alert sink down')
+    })
+    // The compacting snapshot + prune commit BEFORE the escalation, and a throw there
+    // is swallowed — GC must not re-brick because the alert channel was down.
+    const res = await snapshotter.advance(DOC, baseDocProviderFor(genesisDeck()))
+    expect(res).not.toBeNull()
+    expect(res!.coveredSeq).toBe(2)
+    expect(await store.opsSince(DOC, 0)).toEqual([])
+  })
 })

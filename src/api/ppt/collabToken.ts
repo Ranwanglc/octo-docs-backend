@@ -49,8 +49,9 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
   // Bento actor from `(uid, docId, clientSessionId)` so the actor is STABLE across
   // reconnects rather than a fresh random per issuance. A CRDT actor identifies a
   // replica, so a churning actor discards unsent work on every blip (P0-2) — a stable
-  // client session id is what pins it. Required and bounded (it is an opaque token,
-  // never unbounded); its content is otherwise unconstrained (mixed into an HMAC).
+  // client session id is what pins it. Required, length-bounded, and charset-bounded
+  // to an opaque URL-safe token (it is mixed into a NUL-delimited HMAC input, so a
+  // control byte would make that input ambiguous — XIN-1800 P2-4).
   const sessionRaw = body.clientSessionId
   if (typeof sessionRaw !== 'string' || sessionRaw.trim() === '') {
     throw new PptApiError('VALIDATION_ERROR', 'clientSessionId is required', {
@@ -60,6 +61,18 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
   const clientSessionId = sessionRaw.trim()
   if (clientSessionId.length > 200) {
     throw new PptApiError('VALIDATION_ERROR', 'clientSessionId exceeds 200 chars', {
+      details: { field: 'clientSessionId' },
+    })
+  }
+  // Charset-bound it to an opaque token (XIN-1800 P2-4). `mintCollabActor` mixes it
+  // into a NUL-DELIMITED HMAC input (`uid\0docId\0session`); a session id carrying a
+  // NUL byte (or other control bytes) would make that input ambiguous. Restricting to
+  // an opaque URL-safe charset removes the ambiguity in one check. Not exploitable as
+  // written — `uid` is authenticated so cross-user forgery is out, and actors are
+  // per-room so a same-user cross-doc collision is harmless — but the constraint costs
+  // nothing and closes the question. Clients already use random URL-safe ids here.
+  if (!/^[A-Za-z0-9._~-]+$/.test(clientSessionId)) {
+    throw new PptApiError('VALIDATION_ERROR', 'clientSessionId must be an opaque URL-safe token', {
       details: { field: 'clientSessionId' },
     })
   }
