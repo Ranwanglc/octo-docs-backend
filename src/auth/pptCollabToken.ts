@@ -114,6 +114,19 @@ export interface PptCollabTokenResult {
    * actor-less token.
    */
   actor?: string
+  /**
+   * A pre-connect HINT for the per-actor sequence `s` the session should mint its
+   * first `ops` frame from (XIN-1807 P0-1). Computed at issuance as `(the snapshot's
+   * covered per-actor high-water for this actor) + 1`, i.e. `1` for a fresh actor with
+   * no durable ops. It is a LOWER BOUND, deliberately NOT authoritative: it is derived
+   * from the durable SNAPSHOT alone and cannot see ops still in the un-snapshotted tail
+   * (computing the tail-inclusive value at REST would mean the per-join durable-tail
+   * scan P1-1 warns against). The AUTHORITATIVE value is the relay `ready.nextS`, which
+   * the client MUST adopt on connect; this token field only lets a client pre-seed a
+   * fresh replica before the socket is open. Omitted when the token binds no
+   * server-minted actor. See {@link ../ppt/relay/frames.ts ReadyCtl.nextS}.
+   */
+  nextS?: number
 }
 
 export interface IssuePptCollabInput {
@@ -133,6 +146,12 @@ export interface IssuePptCollabInput {
    * pin a deterministic actor to assert the binding.
    */
   actor?: string
+  /**
+   * A pre-connect lower-bound hint for the actor's next per-actor sequence `s`
+   * (XIN-1807 P0-1). Passed through verbatim to {@link PptCollabTokenResult.nextS};
+   * see that field for the authoritative-value contract. Omitted => no hint delivered.
+   */
+  nextS?: number
 }
 
 /**
@@ -225,6 +244,11 @@ export function issuePptCollabToken(input: IssuePptCollabInput): PptCollabTokenR
   // every `ops` frame permanently refused. Seeded here alongside the token, and
   // re-delivered on the relay `ready` frame.
   if (actor !== undefined) result.actor = actor
+  // Deliver the pre-connect per-actor `s` hint (XIN-1807 P0-1). A LOWER BOUND from
+  // durable snapshot state, superseded by the authoritative `ready.nextS` on connect —
+  // only carried when an actor is bound (a legacy actor-less token has no per-actor
+  // gate). A caller that did not compute one leaves it omitted.
+  if (actor !== undefined && input.nextS !== undefined) result.nextS = input.nextS
   return result
 }
 

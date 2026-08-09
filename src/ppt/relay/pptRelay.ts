@@ -546,6 +546,13 @@ export class PptRelay {
    * fresh-engine restart at a stale `s` is VISIBLY refused rather than silently
    * persisting a duplicate `(actor,s)` the reducer would drop. Dropped alongside
    * {@link roomLamport} when the last socket leaves (re-seeded on the next join).
+   *
+   * GROWTH (XIN-1807 P2-6): this is the in-process twin of the accepted `state_json.vv`
+   * growth — one entry per actor that has EVER written to a live room, bounded by the
+   * distinct-actor count while the room is resident and reclaimed entirely when the room
+   * empties. A retirement pass is deliberately not run here for the same reason the
+   * `vv` column keeps every actor: dropping an actor's high-water could reintroduce the
+   * silent duplicate-`(actor,s)` class this map exists to close.
    */
   private readonly roomActorSeq = new Map<string, Map<string, number>>()
   /**
@@ -1228,7 +1235,7 @@ export class PptRelay {
   private refuse(
     conn: Conn,
     code: RefusedCode,
-    opts: { k?: number; frameId?: string; message?: string; retryInMs?: number } = {},
+    opts: { k?: number; frameId?: string; message?: string; retryInMs?: number; nextS?: number } = {},
   ): void {
     const retryable = isRetryable(code)
     // Both retryable codes carry a bounded backoff hint. `rate-limited` supplies
@@ -1245,6 +1252,10 @@ export class PptRelay {
       ...(opts.k !== undefined ? { k: opts.k } : {}),
       ...(opts.frameId !== undefined ? { frameId: opts.frameId } : {}),
       ...(opts.message !== undefined ? { message: opts.message } : {}),
+      // The expected per-actor `s` on a contiguity `protocol-version` refusal, so an
+      // out-of-sync client recovers IN BAND rather than being permanently refused
+      // (XIN-1807 P0-1). Only the contiguity gate passes it.
+      ...(opts.nextS !== undefined ? { nextS: opts.nextS } : {}),
     })
   }
 
@@ -1795,6 +1806,22 @@ export class PptRelay {
             /* keep replay usable with the last-known epoch; mutation re-checks */
           }
           if (!this.canPushRead(conn)) return false
+          // Seed + publish the per-actor `s` the client MUST author from (XIN-1807
+          // P0-1). Best-effort: a seed-read failure omits `nextS` rather than failing
+          // the whole replay — reads/presence stay serviceable and the client recovers
+          // via the in-band refusal `nextS` on its first write. When present, it equals
+          // the value the contiguity gate will enforce for this connection.
+          let nextS: number | undefined
+          try {
+            // `replay()` already holds a replay permit, so the seed cursor reuses it
+            // (holdsReplayPermit=true) rather than acquiring a second — a single-slot
+            // config would otherwise self-deadlock (XIN-1807 P1-1). PEEK (do not pin):
+            // the ops gate seeds authoritatively on the first frame, so a concurrent
+            // same-actor commit after this `ready` is still refused, not silently duped.
+            nextS = await this.peekNextS(conn, true)
+          } catch {
+            nextS = undefined
+          }
           await this.gatedSend(conn, {
             ctl: 'ready',
             q: readySeq,
@@ -1805,6 +1832,10 @@ export class PptRelay {
             // P0-1). `ready` is the robust surface: it survives a reauth and reaches
             // the client on every (re)join without re-fetching the token.
             ...(conn.actor !== undefined ? { actor: conn.actor } : {}),
+            // Deliver the per-actor sequence the client must continue from (XIN-1807
+            // P0-1) — derived from durable state a rebuilt client cannot otherwise
+            // observe. Present only for a server-minted actor whose seed read succeeded.
+            ...(nextS !== undefined ? { nextS } : {}),
           })
         }
         return true
@@ -2104,16 +2135,21 @@ export class PptRelay {
    * tail reads failing is RETRYABLE: the caller must not admit a frame against an
    * unknown clock.
    *
-   * The tail scan is BYTE-BOUNDED (XIN-1800 P1-1): when the store exposes the
-   * byte-aware {@link ReplayCursor} it pages the tail through it (its `pageBytes`
-   * budget caps how much op JSON is materialized per page), and the caller in
-   * {@link handleOps} runs this behind the per-connection rate gate, so a cheap flood
-   * of new frames can neither drive an unbounded read nor bypass the limiter. See the
-   * resolution comment for why the O(1) persisted high-water yujiawei preferred is
-   * DEFERRED this round (it needs a snapshot-row/append-transaction schema change; the
-   * bounded scan + rate gate removes the operational DoS without that risk).
+   * The tail scan is genuinely BYTE-BOUNDED (XIN-1807 P1-1): the store's byte-aware
+   * {@link ReplayCursor} now picks each page's `seq` cutoff from a cheap size pre-scan
+   * so a page materializes at most ~`pageBytes` of op JSON — the previous read fetched
+   * `pageRows` FULL rows and only trimmed what it emitted, so a room of large frames
+   * materialized its whole tail (bounded only by the 64 MiB soft-snapshot threshold) on
+   * the REST heap. The seed cursor is also opened UNDER A REPLAY PERMIT (below) so its
+   * concurrency shares the same `maxInFlightReplays` budget as `replay()` rather than
+   * being bounded only by the number of distinct rooms, and the caller in
+   * {@link handleOps} runs this behind the per-connection rate gate, so a cheap flood of
+   * new frames can neither drive an unbounded read, spawn unbounded concurrent scans,
+   * nor bypass the limiter. The O(1) persisted per-actor/clock high-water yujiawei
+   * preferred stays DEFERRED (it needs a snapshot-row/append-transaction schema change);
+   * the byte-bounded scan + permit + rate gate removes the operational DoS without it.
    */
-  private async ensureRoomLamport(docId: string): Promise<number> {
+  private async ensureRoomLamport(docId: string, holdsReplayPermit = false): Promise<number> {
     if (!this.roomLamportSeeded.has(docId)) {
       let seed = 0
       const actorSeq = new Map<string, number>()
@@ -2131,18 +2167,43 @@ export class PptRelay {
         if (clock > seed) seed = clock
         for (const raw of ops) foldActor(raw)
       }
+      // P2-1 (XIN-1807): a snapshot that COVERS ops (`coveredSeq > 0`) but carries NO
+      // persisted `state` (a pre-Part-B row, or one written by an earlier build) cannot
+      // seed the per-actor high-water or the room clock — its covered ops may be pruned,
+      // so seeding from the empty view would REGRESS both watermarks below what the room
+      // durably advanced, permanently refusing every reconnecting session (the mirror of
+      // P0-1). Fail CLOSED (retryable) rather than seed from a partial view.
+      const requireSeedableSnapshot = (snap: { coveredSeq: number; state: unknown } | null | undefined): void => {
+        if (snap && snap.coveredSeq > 0 && (snap.state === null || snap.state === undefined)) {
+          throw new RetryableStorageError('covered-but-stateless snapshot: refusing to seed room clock from a partial view')
+        }
+      }
+      let release: (() => void) | null = null
       try {
         // Prefer the store's byte-aware replay cursor: it reads the snapshot + high-water
         // from one consistent point and pages the un-snapshotted tail bounded by
         // `replayPageBytes`, so one page can never materialize the whole tail in memory
-        // (XIN-1800 P1-1). Fall back to the bounded-row `opsSince` loop for a store
+        // (XIN-1807 P1-1). Fall back to the bounded-row `opsSince` loop for a store
         // without `openReplay`.
         if (this.store.openReplay) {
+          // Acquire a replay permit around the durable-tail seed cursor so it shares the
+          // SAME in-flight bound as `replay()` (XIN-1807 P1-1). Both open the same kind of
+          // cursor; without a permit here the number of concurrent durable-tail scans was
+          // bounded only by the count of distinct rooms, not by `maxInFlightReplays`. A
+          // permit-acquire timeout throws a retryable storage error (below), so the frame
+          // is refused `storage-retry` rather than blocking unboundedly. When the caller
+          // ALREADY holds a replay permit (the `replay()` -> `seedConnNextS` path), we must
+          // NOT re-acquire — a single-slot config would self-deadlock — so the seed cursor
+          // reuses the caller's permit instead.
+          if (!holdsReplayPermit) {
+            release = await this.replaySemaphore.acquire(this.limits.replayAcquireTimeoutMs)
+          }
           const cursor = await this.store.openReplay(docId, 0, {
             pageRows: this.limits.replayPageSize,
             pageBytes: this.limits.replayPageBytes,
           })
           try {
+            requireSeedableSnapshot(cursor.snapshot)
             seed = cursor.snapshot?.state?.lamport ?? 0
             for (const [a, s] of Object.entries(cursor.snapshot?.state?.vv ?? {})) {
               if (typeof s === 'number' && s > (actorSeq.get(a) ?? 0)) actorSeq.set(a, s)
@@ -2157,6 +2218,7 @@ export class PptRelay {
           }
         } else {
           const snap = await this.store.getSnapshot(docId)
+          requireSeedableSnapshot(snap)
           seed = snap?.state?.lamport ?? 0
           for (const [a, s] of Object.entries(snap?.state?.vv ?? {})) {
             if (typeof s === 'number' && s > (actorSeq.get(a) ?? 0)) actorSeq.set(a, s)
@@ -2173,6 +2235,10 @@ export class PptRelay {
         }
       } catch (err) {
         throw new RetryableStorageError('room clock seed read failed', { cause: err })
+      } finally {
+        // Release the replay permit acquired around the seed cursor (XIN-1807 P1-1),
+        // whether the scan completed, threw, or the snapshot was rejected fail-closed.
+        release?.()
       }
       // Do not clobber a clock already advanced by frames that landed during the seed
       // read (the room chain serializes appends, but the seed read itself awaits).
@@ -2185,6 +2251,53 @@ export class PptRelay {
       this.roomLamportSeeded.add(docId)
     }
     return this.roomLamport.get(docId) ?? 0
+  }
+
+  /**
+   * Seed a server-minted-actor connection's per-actor `s` gate from durable room state
+   * and return the next `s` it MUST mint — the value published in `ready.nextS` and
+   * enforced by the contiguity gate (XIN-1807 P0-1). Idempotent per connection
+   * (`nextSSeeded`), so the `ready`-time seed here and the ops-gate's first-frame seed
+   * agree: what `ready` advertises is exactly what the gate then checks. Awaits
+   * {@link ensureRoomLamport} (idempotent per room), which folds the snapshot version
+   * vector + the un-snapshotted durable tail into {@link roomActorSeq}, then reads this
+   * actor's durable high-water. Returns undefined for a legacy connection (no
+   * server-minted actor => no per-actor gate, so nothing to publish). A seed-read
+   * failure propagates as a retryable storage error; the `ready` publisher catches it
+   * (a seed read that failed must not break an otherwise-serviceable replay — the
+   * client then recovers via the in-band refusal `nextS`), while the ops gate maps it
+   * to `storage-retry`.
+   */
+  private async seedConnNextS(conn: Conn, holdsReplayPermit = false): Promise<number | undefined> {
+    if (!conn.actorBound || conn.actor === undefined) return undefined
+    if (!conn.nextSSeeded) {
+      await this.ensureRoomLamport(conn.docId, holdsReplayPermit)
+      const durableS = this.roomActorSeq.get(conn.docId)?.get(conn.actor) ?? 0
+      conn.nextS = durableS + 1
+      conn.nextSSeeded = true
+    }
+    return conn.nextS
+  }
+
+  /**
+   * Compute the per-actor `s` to ADVERTISE in `ready.nextS` WITHOUT pinning the
+   * connection's gate state (XIN-1807 P0-1). A pure read of the durable per-actor
+   * high-water + 1 (via the idempotent {@link ensureRoomLamport} seed). Deliberately
+   * does NOT set {@link Conn.nextSSeeded}: the ops gate re-seeds authoritatively on the
+   * first frame ({@link seedConnNextS}), so a concurrent SAME-actor commit landing
+   * between this `ready` and that frame is still caught — the frame is refused with the
+   * corrected `nextS` rather than silently persisting a duplicate `(actor,s)`. Pinning
+   * here instead would let two live sockets under one actor both be handed, and then
+   * ENFORCE, `s=1`. Returns the already-seeded value when the gate has run, or undefined
+   * for a legacy connection (no per-actor gate). Throws (retryable) only via
+   * `ensureRoomLamport`; the `ready` publisher swallows that and omits `nextS`.
+   */
+  private async peekNextS(conn: Conn, holdsReplayPermit = false): Promise<number | undefined> {
+    if (!conn.actorBound || conn.actor === undefined) return undefined
+    if (conn.nextSSeeded) return conn.nextS
+    await this.ensureRoomLamport(conn.docId, holdsReplayPermit)
+    const durableS = this.roomActorSeq.get(conn.docId)?.get(conn.actor) ?? 0
+    return durableS + 1
   }
   /**
    * Emit the positive `ack` for a pure re-ack of an already-durable DUPLICATE
@@ -2420,22 +2533,26 @@ export class PptRelay {
       // gated here. `nextS` advances only after the write is durable (below).
       if (conn.actorBound) {
         // Seed `nextS` from the durable per-actor high-water on first use (XIN-1800
-        // P0-1). `ensureRoomLamport` (awaited just above) folded the snapshot vv + the
-        // un-snapshotted tail into `roomActorSeq`, so a session that keeps its replica
-        // identity across a reconnect continues its sequence (next mint = high-water+1)
-        // instead of resetting to 1. Without this a reconnecting session either had
-        // every write PERMANENTLY refused (it sends `s = last+1` but the gate expects 1)
-        // or, on a fresh-engine restart at `s = 1`, silently persisted a duplicate
-        // `(actor,s)` the reducer drops — both reproduced by yujiawei at c1ed326.
-        if (!conn.nextSSeeded) {
-          const durableS = this.roomActorSeq.get(conn.docId)?.get(conn.actor as string) ?? 0
-          conn.nextS = durableS + 1
-          conn.nextSSeeded = true
-        }
+        // P0-1 / XIN-1807 P0-1). `roomActorSeq` was folded from the snapshot vv + the
+        // un-snapshotted tail by `ensureRoomLamport` (awaited just above, and again
+        // idempotently inside the helper), so a session that keeps its replica identity
+        // across a reconnect continues its sequence (next mint = high-water+1) instead
+        // of resetting to 1. The SAME helper seeds `ready.nextS` at (re)join, so the
+        // value the client was handed is exactly the value enforced here. Without this a
+        // reconnecting session either had every write PERMANENTLY refused (it sends `s =
+        // last+1` but the gate expects 1) or, on a fresh-engine restart at `s = 1`,
+        // silently persisted a duplicate `(actor,s)` the reducer drops — both reproduced
+        // by yujiawei.
+        await this.seedConnNextS(conn)
         const sValues = (frame.ops as Array<{ s?: unknown }>).map((op) => op.s)
         const contiguous = sValues.every((s, i) => s === conn.nextS + i)
         if (!contiguous) {
-          this.refuse(conn, 'protocol-version', { k, frameId, message: 'op sequence is not contiguous for this actor' })
+          // Attach the expected `nextS` so a client that rebuilt its engine and
+          // restarted `s` too low recovers IN BAND — re-seeds from `nextS - 1` and
+          // resends — instead of being permanently refused with no recoverable
+          // signal (XIN-1807 P0-1). `ready.nextS` already publishes this on (re)join;
+          // the refusal is the recovery surface if a client still lands off it.
+          this.refuse(conn, 'protocol-version', { k, frameId, message: 'op sequence is not contiguous for this actor', nextS: conn.nextS })
           return
         }
       }

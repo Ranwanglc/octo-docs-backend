@@ -139,6 +139,33 @@ export const pptCollabOpRepo = {
   },
 
   /**
+   * The stored frame BYTE SIZES (`seq` + `frame_bytes`) for `seq > sinceSeq`, ascending,
+   * INSIDE the caller's transaction — WITHOUT the frame JSON. A cheap size pre-scan the
+   * byte-bounded replay page uses to pick a `seq` cutoff that keeps a page's materialized
+   * op JSON within a byte budget (XIN-1807 P1-1), so the tail scan no longer fetches
+   * `pageRows` FULL rows into memory and only trims what it emits. `frame_bytes` is
+   * `NOT NULL` (written by {@link insertTx} at append time), and reading only integers
+   * keeps this pre-scan's own materialization negligible regardless of frame size. Same
+   * `limit` (row cap) / `maxSeq` (inclusive upper bound) semantics as {@link sinceTx}.
+   */
+  async frameSizesSinceTx(
+    tx: Tx,
+    docId: string,
+    sinceSeq: number,
+    limit: number,
+    maxSeq?: number,
+  ): Promise<{ seq: number; frameBytes: number }[]> {
+    const cap = maxSeq !== undefined ? ' AND seq <= ?' : ''
+    const capArgs = maxSeq !== undefined ? [maxSeq] : []
+    const rows = await tx.query<{ seq: number; frame_bytes: number | null }>(
+      `SELECT seq, frame_bytes FROM ppt_collab_op
+        WHERE doc_id = ? AND seq > ?${cap} ORDER BY seq ASC LIMIT ${limitClause(limit)}`,
+      [docId, sinceSeq, ...capArgs],
+    )
+    return rows.map((r) => ({ seq: Number(r.seq), frameBytes: Number(r.frame_bytes ?? 0) }))
+  },
+
+  /**
    * Seq of the row already stored for `(doc_id, frame_id)` under a LOCKING read,
    * or null if unseen. Used on the op-table duplicate-key retry path (P1-1 b): a
    * pre-upgrade op row can exist for a frame that has no dedup-ledger row, so on an

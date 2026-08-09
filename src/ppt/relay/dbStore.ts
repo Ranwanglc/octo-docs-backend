@@ -296,7 +296,7 @@ export class DbPptRelayStore implements PptRelayStore {
           // snapshot (P1-B), and the transaction is committed before we return
           // (so it is not held across the caller's client I/O, P1-H).
           const batch = await withStoreRetry('openReplay.page', () =>
-            this.readReplayPage(docId, cursor, headCovered, limits.pageRows, head.highWater),
+            this.readReplayPage(docId, cursor, headCovered, limits.pageRows, limits.pageBytes, head.highWater),
           )
           if (batch.rows.length === 0) {
             eof = true
@@ -343,12 +343,23 @@ export class DbPptRelayStore implements PptRelayStore {
    * concurrent snapshot has advanced `covered_seq` past `cursor`, ops in
    * `(cursor, covered]` may have been physically pruned, so the reader must
    * restart from the new snapshot rather than skip them (P1-4 / P1-B).
+   *
+   * The page is genuinely BYTE-BOUNDED (XIN-1807 P1-1): a cheap size pre-scan
+   * (`frameSizesSinceTx`, integers only) picks a `seq` cutoff that keeps the
+   * materialized op JSON within `pageBytes`, and only then are the frame bodies up to
+   * that cutoff fetched. So a page never reads more than ~one byte budget of frame JSON
+   * into memory regardless of frame size — the previous read fetched `pageRows` FULL
+   * rows and merely trimmed what it emitted, so a room of large frames materialized its
+   * whole tail (bounded only by the 64 MiB soft-snapshot threshold) on the REST heap. At
+   * least one row is always returned when any remain (a single frame may itself exceed
+   * the budget) so the cursor always advances.
    */
   private async readReplayPage(
     docId: string,
     cursor: number,
     headCovered: number,
     pageRows: number,
+    pageBytes: number,
     highWater: number,
   ): Promise<{ rows: PersistedOp[] }> {
     return this.inConsistentSnapshot(async (tx) => {
@@ -368,7 +379,19 @@ export class DbPptRelayStore implements PptRelayStore {
       // actively-written room the cursor would never drain and `ready` would never
       // fire (XIN-1783 P1-4). Post-head ops reach the client through the live
       // buffer / cutover path instead.
-      const rows = await pptCollabOpRepo.sinceTx(tx, docId, cursor, pageRows, highWater)
+      const sizes = await pptCollabOpRepo.frameSizesSinceTx(tx, docId, cursor, pageRows, highWater)
+      if (sizes.length === 0) return { rows: [] }
+      // Walk the running byte total to a cutoff seq within the budget; always keep the
+      // first row so the cursor advances even when one frame alone exceeds `pageBytes`.
+      let cutoffSeq = sizes[0]!.seq
+      let acc = sizes[0]!.frameBytes
+      for (let i = 1; i < sizes.length; i++) {
+        const next = acc + sizes[i]!.frameBytes
+        if (next > pageBytes) break
+        acc = next
+        cutoffSeq = sizes[i]!.seq
+      }
+      const rows = await pptCollabOpRepo.sinceTx(tx, docId, cursor, pageRows, cutoffSeq)
       return { rows: rows.map((o) => ({ seq: o.seq, frameId: o.frameId, frame: o.frame, frameBytes: o.frameBytes })) }
     })
   }

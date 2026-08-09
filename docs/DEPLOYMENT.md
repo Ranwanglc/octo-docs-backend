@@ -33,6 +33,11 @@ The service is a single process that exposes **two** listeners:
 >   returns it as `data.actor` AND echoes it on the relay `ready` frame (`ready.actor`).
 >   The client MUST construct its engine under exactly that actor. Every `op.a` is
 >   checked against it; a mismatch is refused permanently.
+>   - **`clientSessionId` charset (XIN-1800 P2-4 / XIN-1807).** It is a REQUIRED,
+>     length-bounded (≤ 200 chars) opaque URL-safe token matching `^[A-Za-z0-9._~-]+$`.
+>     A value outside that charset — e.g. a raw base64 (`+`, `/`, `=`) or colon-delimited
+>     id — is a **`400 VALIDATION_ERROR`**, not a relay refusal. Generate a random
+>     URL-safe id (the unreserved URL charset).
 > - **Stable session actor across reconnects.** The same `clientSessionId` yields the
 >   same actor, so the client keeps ONE engine/replica identity across a reconnect and
 >   a byte-identical resend of a queued frame re-acks. A fresh random session id on
@@ -40,23 +45,26 @@ The service is a single process that exposes **two** listeners:
 > - **Byte-identical idempotent resend.** Re-send a queued frame with the SAME
 >   `frameId` and the SAME ops (including `a`/`s`/`l`). A reused `frameId` carrying
 >   different ops is refused.
-> - **Per-actor `s` contiguity, CONTINUED across reconnects (XIN-1800 P0-1).** Under the
->   server-minted actor a frame's ops' `s` values must be exactly `nextS, nextS+1, …`
->   The server derives `nextS` from what the actor has DURABLY written (the snapshot's
->   version vector folded with the un-snapshotted tail), NOT from a per-connection reset.
->   Concretely, the `s` a reconnecting session must send is:
->   - **A brand-new session** (a `clientSessionId` that has never written): its first
->     `s` is **1**.
->   - **A reconnecting session that KEEPS its engine** (the required behaviour above):
->     it CONTINUES its sequence — the next `s` is one past the last `s` its engine
->     minted, i.e. `(engine.vv[actor]) + 1`. Because the server re-seeds `nextS` from
->     the durable high-water, that continuation (e.g. `s=2` after a single durable
->     `s=1`) is ACCEPTED, not refused.
->   - Do NOT rebuild the engine and restart `s` at 1 after a reconnect: the server
->     already holds `s=1` for the actor, so a restarted `s=1` is a stale, non-contiguous
->     value and is refused `protocol-version` (a signal to fully resync/reload) — it is
->     never silently accepted as a duplicate. Keeping the engine is the supported path.
->   A skip/reorder/repeat within a session is likewise refused.
+> - **Per-actor `s` contiguity, CONTINUED across reconnects (XIN-1800 P0-1 / XIN-1807 P0-1).**
+>   Under the server-minted actor a frame's ops' `s` values must be exactly `nextS,
+>   nextS+1, …`. `nextS` is the actor's DURABLE per-actor high-water + 1 (the snapshot's
+>   version vector folded with the un-snapshotted tail), NOT a per-connection reset — and
+>   the server **PUBLISHES it** so the client never has to guess:
+>   - **`ready.nextS`** on every (re)join is the AUTHORITATIVE value. On connect, the
+>     client MUST adopt it: seed its replica's per-actor sequence so its next mint is
+>     exactly `ready.nextS` (i.e. treat the engine as having already minted `nextS - 1`).
+>   - **`data.nextS`** in the collab-token response is a pre-connect LOWER-BOUND hint
+>     (from the durable snapshot alone; it cannot see the un-snapshotted tail). Use it
+>     only to pre-seed a fresh replica before the socket opens; `ready.nextS` supersedes it.
+>   - A brand-new session (a `clientSessionId` that has never written) gets `nextS = 1`.
+>   - **After a page reload / new tab / crashed renderer** (the engine is GONE), rebuild
+>     the engine, then adopt `ready.nextS` and author from there. Do NOT restart `s` at 1:
+>     the actor already durably holds `s = 1 … k`, so a restarted `s = 1` is a stale,
+>     non-contiguous value and is refused `protocol-version`. That refusal now carries the
+>     expected `nextS` in its payload, so a client that landed off it can re-seed from
+>     `refused.nextS` and resend IN BAND — it is NOT a "reload again" signal (reloading
+>     rebuilds the engine and reproduces the mismatch unless you adopt the published
+>     `nextS`). A skip/reorder/repeat within a session is likewise refused.
 > - **Relative clock bound.** An op's `l` (and a `txt` op's seed `sd[0]`) must be
 >   within `OP_CLOCK_SLACK` (2^20) of the room's live Lamport clock; a value far above
 >   it is refused.
@@ -482,6 +490,24 @@ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/api/v1/docs   # -
 A `200` on `/healthz` together with a `401` on `/api/v1/docs` and both
 "listening" log lines is the green state. A REST endpoint hanging (no response →
 gateway 504) points back to the MySQL credential trap in §3.1.
+
+### 6.1 PPT relay — operator obligation: aged-op drop alert (XIN-1807 P1-2)
+
+The server-side snapshotter may, to unfreeze GC, drop a permanently-buffered op whose
+cross-actor dependency never became durable. This is bounded and strictly better than
+bricking the room, but the dropped op **may still exist on live peers**, so the drop is a
+potential server↔peer divergence with no other in-band signal. Production emits a
+structured **`console.error`** line carrying the stable event tag `ppt_relay_aged_op_drop`
+plus the dropped `(actor, s)` pairs.
+
+**You MUST wire a log-based alert on `ppt_relay_aged_op_drop`.** It should fire rarely or
+never in a healthy deployment; each occurrence is a data-integrity event to investigate.
+The logged `dropped` array (each `{a, s}`) is the record for reconciliation — capture it
+from your log pipeline. Example line:
+
+```
+[ppt-relay] aged-op drop (data-integrity divergence risk; alert + reconcile) {"event":"ppt_relay_aged_op_drop","docId":"…","targetSeq":42,"bufferedLag":5000,"lagCap":4096,"droppedCount":1,"dropped":[{"a":"…","s":7}]}
+```
 
 ---
 

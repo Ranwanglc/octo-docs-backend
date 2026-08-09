@@ -178,6 +178,25 @@ export interface ReadyCtl {
    * legacy connection that carries no server-minted actor (first-frame-pinned).
    */
   actor?: string
+  /**
+   * The next per-actor sequence `s` this connection MUST mint its first `ops` frame
+   * under (XIN-1807 P0-1). This is the AUTHORITATIVE value the relay's per-actor
+   * continuity gate enforces: `(the room's durable per-actor high-water for this
+   * connection's actor) + 1`, computed at (re)join from the same durable tail the
+   * gate seeds from. Published here because the value is derived from durable state
+   * the client CANNOT observe by any other means — a client whose engine survives the
+   * reconnect already holds it, but a client that REBUILDS its engine (page reload,
+   * new tab, crashed renderer) can only reconstruct from the replay, and the replay
+   * cannot reach it: the vendored engine takes its own `s` from the snapshot's version
+   * vector and SKIPS its own replayed ops, so a rebuilt engine lands on
+   * `snapshot.vv[actor] + 1` while the gate demands the tail-inclusive high-water + 1.
+   * A rebuilt client adopts THIS value (seeds its replica's per-actor sequence from
+   * `nextS - 1`) and authors from there, so its first post-reload write is accepted
+   * instead of permanently refused `protocol-version`. Omitted for a legacy connection
+   * (no server-minted actor, so no per-actor `s` gate applies), or when the durable
+   * seed read failed at join (the client falls back to the in-band refusal `nextS`).
+   */
+  nextS?: number
 }
 export interface AckCtl {
   ctl: 'ack'
@@ -196,6 +215,18 @@ export interface RefusedCtl {
   k?: number
   frameId?: string
   message?: string
+  /**
+   * The per-actor sequence `s` the relay expected, attached to a `protocol-version`
+   * refusal of an `ops` frame whose `s` was not contiguous for this actor (XIN-1807
+   * P0-1). `protocol-version` is a PERMANENT refusal, so without this an out-of-sync
+   * client (e.g. one that rebuilt its engine and restarted `s` too low) had no in-band
+   * way to learn the value the gate demands and every write stayed refused forever. A
+   * client that receives it re-seeds its replica's per-actor sequence from `nextS - 1`
+   * and resends, recovering IN BAND rather than being forced to rotate its session
+   * (which mints a different actor and discards unsent work). Present only on the
+   * contiguity refusal; absent on every other refusal.
+   */
+  nextS?: number
 }
 export interface RoleChangedCtl {
   ctl: 'role-changed'

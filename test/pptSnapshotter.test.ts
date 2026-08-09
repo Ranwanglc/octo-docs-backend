@@ -8,6 +8,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { InMemoryPptRelayStore } from '../src/ppt/relay/store.js'
 import { PptSnapshotter, reduceFrames, assertSyncVersionAligned, SNAPSHOT_REDUCER_ACTOR } from '../src/ppt/relay/snapshotter.js'
+import { productionAgedOpDropHandler } from '../src/ppt/relay/index.js'
 import { SYNC_V, SyncState } from '../src/ppt/sync/slidesSync.js'
 import { BENTO_SYNC_V, type BentoDoc } from '../src/ppt/bentoDoc.js'
 import { buildGoldenFixtures, genesisDeck, type GoldenFrame } from './fixtures/bentoGolden.js'
@@ -473,5 +474,38 @@ describe('PptSnapshotter.advance: ghost-target GC-freeze aging (XIN-1792 P1-3)',
     expect(res).not.toBeNull()
     expect(res!.coveredSeq).toBe(2)
     expect(await store.opsSince(DOC, 0)).toEqual([])
+  })
+
+  it('XIN-1807 P1-2: the PRODUCTION handler emits a structured, alertable ERROR line with the dropped pairs', async () => {
+    // The default handler is a bare console.warn; production must reach an operational
+    // surface (a silent server↔peer divergence otherwise has no signal). Assert the
+    // wired handler logs at ERROR severity with the stable `ppt_relay_aged_op_drop`
+    // event tag and the dropped `(a,s)` identities, so a log-based alert can fire and the
+    // pairs are on the record for reconciliation.
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      productionAgedOpDropHandler({
+        docId: DOC,
+        targetSeq: 2,
+        bufferedLag: 3,
+        lagCap: 2,
+        dropped: [{ a: 'u1', s: 1 }],
+      })
+      expect(spy).toHaveBeenCalledTimes(1)
+      const line = spy.mock.calls[0]!.join(' ')
+      expect(line).toContain('ppt_relay_aged_op_drop')
+      const json = JSON.parse(line.slice(line.indexOf('{'))) as {
+        event: string
+        docId: string
+        droppedCount: number
+        dropped: Array<{ a: string; s: number }>
+      }
+      expect(json.event).toBe('ppt_relay_aged_op_drop')
+      expect(json.docId).toBe(DOC)
+      expect(json.droppedCount).toBe(1)
+      expect(json.dropped).toEqual([{ a: 'u1', s: 1 }])
+    } finally {
+      spy.mockRestore()
+    }
   })
 })

@@ -14,6 +14,8 @@ import { isRetryable, STORAGE_RETRY_BACKOFF_MS } from '../src/ppt/relay/frames.j
 import { issuePptCollabToken, mintCollabActor, PPT_RELAY_TICKET_AUD } from '../src/auth/pptCollabToken.js'
 import type { ResolvedRole, Role } from '../src/permission/role.js'
 import type { BentoDoc } from '../src/ppt/bentoDoc.js'
+import { SyncState } from '../src/ppt/sync/slidesSync.js'
+import type { Op } from '../src/ppt/sync/crdt.js'
 
 /**
  * R4-B1 integration tests for the Bento-frame WS relay (§7.2 / §7.3 / §7.4),
@@ -27,6 +29,10 @@ import type { BentoDoc } from '../src/ppt/bentoDoc.js'
 
 const DOC = 'd_ppt1'
 const DOCNAME = 'octo:s_1:f_default:ppt:d_ppt1'
+
+function clone<T>(v: T): T {
+  return JSON.parse(JSON.stringify(v)) as T
+}
 
 function deck(title = 'Deck'): BentoDoc {
   return {
@@ -611,7 +617,11 @@ describe('PPT relay: nextS is seeded from durable state across a reconnect (XIN-
     // op is s=2. Pre-fix (nextS reset to 1) this was refused `protocol-version` and the
     // session's writes were dead. Post-fix it is accepted.
     const w2 = await h.connect({ uid: 'u_w', role: 'writer', actor })
-    await helloReady(w2)
+    const { ready } = await helloReady(w2)
+    // `ready` PUBLISHES the durable per-actor sequence the client must continue from
+    // (XIN-1807 P0-1) — the value the gate enforces, now observable on the wire. A
+    // rebuilt client reads it here instead of guessing; at 8be3f57 the field was absent.
+    expect(ready.nextS).toBe(2)
     w2.send({ t: 'ops', pv: 2, k: 1, frameId: 'r2', epoch: 0, ops: [{ op: 'set', a: actor, s: 2, l: 2, k: 'x', v: 2 }] })
     expect(await w2.recv()).toMatchObject({ ctl: 'ack', q: 2 })
     // Two distinct durable frames — no silent loss, no permanent refusal.
@@ -635,7 +645,10 @@ describe('PPT relay: nextS is seeded from durable state across a reconnect (XIN-
     const w2 = await h.connect({ uid: 'u_w', role: 'writer', actor })
     await helloReady(w2)
     w2.send({ t: 'ops', pv: 2, k: 1, frameId: 'b2', epoch: 0, ops: [{ op: 'set', a: actor, s: 1, l: 2, k: 'title', v: 'second' }] })
-    expect(await w2.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
+    // The refusal now carries the expected `nextS` (XIN-1807 P0-1) so a client that
+    // restarted `s` too low recovers IN BAND (re-seed from nextS-1, resend) instead of
+    // being permanently bricked. At 8be3f57 the refusal carried no such value.
+    expect(await w2.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version', nextS: 2 })
     expect(await h.store.currentSeq(DOC)).toBe(1)
   })
 
@@ -673,6 +686,57 @@ describe('PPT relay: nextS is seeded from durable state across a reconnect (XIN-
     const out = await b.recvUntil((m) => m.ctl === 'refused' || m.ctl === 'ack')
     expect(out[out.length - 1]).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
     expect(await h.store.currentSeq(DOC)).toBe(1)
+  })
+
+  it('P0-1 (XIN-1807): ready publishes nextS so a REBUILT client (real vendored engine) authors after reload — permanently refused at 8be3f57', async () => {
+    const h = await setup()
+    const actor = 'u-reload-actor'
+    // The live session authors s=1 under the REAL vendored engine; on a fresh deck (no
+    // snapshot yet) the op is entirely in the durable tail — the exact state yujiawei
+    // reproduced against, where the durable per-actor high-water is above the snapshot's.
+    const engine = new SyncState(actor)
+    const base = deck()
+    engine.adopt(base)
+    const edited = clone(base)
+    ;(edited as unknown as { title: string }).title = 'authored before reload'
+    const ops1 = engine.diff(base, edited, { text: true }) as unknown as Op[]
+    expect(ops1.length).toBeGreaterThan(0)
+    // A fresh engine mints its first op at s=1 — the only value a rebuilt replica can
+    // reconstruct from replay (see below).
+    expect(ops1.every((o) => o.a === actor && o.s === 1)).toBe(true)
+
+    const w1 = await h.connect({ uid: 'u_w', role: 'writer', actor })
+    await helloReady(w1)
+    w1.send({ t: 'ops', pv: 2, k: 1, frameId: 'reload-1', epoch: 0, ops: ops1 })
+    expect(await w1.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    w1.close()
+    await waitFor(async () => (h.relay.roomSize(DOC) === 0 ? true : null))
+
+    // Page reload / crashed renderer: the client REBUILDS its engine from the relay
+    // replay. Reconnect under the same stable actor and capture ready + the replayed ops.
+    const w2 = await h.connect({ uid: 'u_w', role: 'writer', actor })
+    const { ready, replay } = await helloReady(w2)
+
+    // Faithful rebuilt engine: apply the replayed op frames to a fresh replica. The
+    // vendored engine SKIPS its own replayed ops (`applyOne` returns early for
+    // `op.a === actor`), so `vv[actor]` stays 0 — the ONLY per-actor `s` a rebuilt client
+    // can derive from replay alone is 1, exactly the value the gate refuses.
+    const rebuilt = new SyncState(actor)
+    const workingDoc = clone(base)
+    rebuilt.adopt(workingDoc)
+    for (const m of replay) {
+      if (m.ctl === 'op') rebuilt.apply(workingDoc, (m.frame as { ops: Op[] }).ops)
+    }
+    expect(rebuilt.vv[actor] ?? 0).toBe(0)
+
+    // `ready` PUBLISHES the durable per-actor high-water + 1 = 2. At 8be3f57 this field
+    // was absent, so the rebuilt client could only send s=1 and was PERMANENTLY refused
+    // `protocol-version` with no in-band recovery. Now it adopts the published value and
+    // its first post-reload write is ACCEPTED and durable.
+    expect(ready.nextS).toBe(2)
+    w2.send({ t: 'ops', pv: 2, k: 1, frameId: 'reload-2', epoch: 0, ops: [{ op: 'set', a: actor, s: ready.nextS as number, l: 2, k: 'title', v: 'authored after reload' }] })
+    expect(await w2.recv()).toMatchObject({ ctl: 'ack', q: 2 })
+    expect(await h.store.currentSeq(DOC)).toBe(2)
   })
 })
 

@@ -116,6 +116,19 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
   const liveSnapshot = await pptLiveSnapshotRepo.get(docId)
   const snapshotVersion = liveSnapshot?.snapshotVersion ?? 0
 
+  // Server-minted actor for this session (XIN-1789 D1 / XIN-1792 P0-2), derived from
+  // the authenticated uid + a client-persisted session id so it is stable across
+  // reconnects and unforgeable.
+  const actor = mintCollabActor(uid, docId, clientSessionId)
+  // Pre-connect per-actor `s` hint (XIN-1807 P0-1): a LOWER BOUND from the durable
+  // snapshot's version vector — `1` for a fresh actor with no covered ops. It is NOT
+  // authoritative (it cannot see ops still in the un-snapshotted tail; the relay's
+  // `ready.nextS` is the value the client must adopt), so it only lets a client
+  // pre-seed a fresh replica before the socket opens. Computing the tail-inclusive
+  // value here would require the per-join durable-tail scan P1-1 warns against.
+  const coveredActorSeq = liveSnapshot?.state?.vv?.[actor]
+  const nextS = (typeof coveredActorSeq === 'number' && coveredActorSeq >= 0 ? coveredActorSeq : 0) + 1
+
   // Trusted display name (§4.7(b)): resolved from the octo directory at issuance,
   // best-effort — an unavailable name never blocks token issuance.
   let displayName = ''
@@ -147,7 +160,10 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
     // attributed to (XIN-1789 D1), and the actor is STABLE across reconnects for the
     // same clientSessionId (XIN-1792 P0-2). The actor is echoed back in the response
     // (`result.actor`, P0-1) so the client authors under it.
-    actor: mintCollabActor(uid, docId, clientSessionId),
+    actor,
+    // Pre-connect per-actor `s` lower-bound hint (XIN-1807 P0-1); the authoritative
+    // value is `ready.nextS`, which the client adopts on connect.
+    nextS,
     ...(displayName !== '' ? { name: displayName } : {}),
   })
   sendPptData(res, result)

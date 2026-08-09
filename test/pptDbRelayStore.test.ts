@@ -159,11 +159,27 @@ function makeDb() {
       room.set(seq, { seq, frameId, frameJson, frameBytes })
       return []
     }
-    if (sql.includes('SELECT seq, frame_id, frame_json FROM ppt_collab_op')) {
+    if (sql.includes('SELECT seq, frame_bytes FROM ppt_collab_op')) {
+      // Byte-size pre-scan for the byte-bounded replay page (XIN-1807 P1-1). This is the
+      // FIRST query readReplayPage issues, so the transient-lock injection fires here and
+      // `withStoreRetry` re-runs the whole page (the frame_json fetch below then succeeds).
       if (lockErrorsOnOpPageRead > 0) {
         lockErrorsOnOpPageRead--
         throw lockError()
       }
+      const [docId, since] = p as [string, number]
+      const limitMatch = /LIMIT\s+(\d+)\b/i.exec(sql)
+      const limit = limitMatch ? Number(limitMatch[1]) : undefined
+      const maxSeq = sql.includes('seq <= ?') ? (p[2] as number) : Number.POSITIVE_INFINITY
+      const room = ops.get(docId)
+      if (!room) return []
+      return [...room.values()]
+        .filter((r) => r.seq > since && r.seq <= maxSeq)
+        .sort((a, b) => a.seq - b.seq)
+        .slice(0, limit ?? Number.POSITIVE_INFINITY)
+        .map((r) => ({ seq: r.seq, frame_bytes: r.frameBytes }))
+    }
+    if (sql.includes('SELECT seq, frame_id, frame_json FROM ppt_collab_op')) {
       const [docId, since] = p as [string, number]
       // XIN-1748 P1-2: the page size is now INLINED into the SQL (`LIMIT <n>`), not
       // bound via `?`, matching this repo's settled remedy for the mysql2
@@ -707,12 +723,13 @@ describe('DbPptRelayStore — RC round-12 (XIN-1736)', () => {
     expect(await store.resolveNullHashReack(D, 'never')).toBeNull()
   })
 
-  it('P1-G: a byte-bounded replay advances the cursor past EVERY fetched row (no re-fetch of dropped rows)', async () => {
+  it('P1-G / XIN-1807 P1-1: a byte-bounded replay fetches each row body exactly once (no re-fetch, no whole-tail materialization)', async () => {
     const store = new DbPptRelayStore()
     for (const n of [1, 2, 3, 4]) await store.appendOp(D, `g${n}`, opsFrame('y'.repeat(60), { frameId: `g${n}` }))
-    // Large row cap, tiny byte cap: the pre-fix code fetched all rows, emitted one
-    // (byte-bounded), advanced the cursor only past it, and re-SELECTed the rest
-    // every page. The fix fetches once and emits byte-by-byte from the buffer.
+    // Large row cap, tiny byte cap: the byte bound is now enforced at FETCH time via a
+    // cheap size pre-scan (XIN-1807 P1-1), so a page never materializes the whole tail —
+    // it body-selects only the rows that fit the budget. Each row is fetched exactly
+    // once (the cursor advances past every fetched row), never re-SELECTed.
     const cursor = await store.openReplay(D, 0, { pageRows: 100, pageBytes: 1 })
     db.sqlLog.length = 0
     const seqs: number[] = []
@@ -723,8 +740,22 @@ describe('DbPptRelayStore — RC round-12 (XIN-1736)', () => {
     }
     await cursor.close()
     expect(seqs).toEqual([1, 2, 3, 4]) // each op delivered exactly once, in order
-    const opPageSelects = db.sqlLog.filter((s) => s.includes('SELECT seq, frame_id, frame_json FROM ppt_collab_op')).length
-    expect(opPageSelects).toBeLessThanOrEqual(2) // one batch + one EOF probe; pre-fix re-fetched per row
+    // No row body is ever re-fetched: at most one body SELECT per row (4), plus the EOF
+    // probe. The pre-fix whole-tail fetch + per-row re-SELECT was O(n²) body reads.
+    const opBodySelects = db.sqlLog.filter((s) => s.includes('SELECT seq, frame_id, frame_json FROM ppt_collab_op')).length
+    expect(opBodySelects).toBeLessThanOrEqual(4)
+  })
+
+  it('XIN-1807 P1-1: the byte-size pre-scan reads no frame bodies (bounded materialization)', async () => {
+    const store = new DbPptRelayStore()
+    for (const n of [1, 2, 3, 4]) await store.appendOp(D, `p${n}`, opsFrame('z'.repeat(60), { frameId: `p${n}` }))
+    db.sqlLog.length = 0
+    const cursor = await store.openReplay(D, 0, { pageRows: 100, pageBytes: 1 })
+    await cursor.nextPage()
+    await cursor.close()
+    // The first page issues a size pre-scan (seq + frame_bytes only — no frame_json) to
+    // pick the byte cutoff, then a body fetch of just the rows within budget.
+    expect(db.sqlLog.some((s) => s.includes('SELECT seq, frame_bytes FROM ppt_collab_op'))).toBe(true)
   })
 
   it('P1-H: the head read and each op page run in SEPARATE short transactions (no tx held across pages)', async () => {
