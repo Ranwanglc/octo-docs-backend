@@ -412,6 +412,104 @@ describe('PPT relay: op actor binding (XIN-1772 P0-2)', () => {
   })
 })
 
+// ────────────────────────────────────────────────────────────────────────────
+// OWNER-DECISION BLOCKED (XIN-1783 D1): actor ↔ authenticated-uid binding.
+//
+// The block above pins conn.actor from the FIRST frame's self-declared op.a and
+// refuses a LATER switch, but NEVER cross-checks the actor against conn.uid, and
+// the credential carries no actor claim (src/auth/pptCollabToken.ts parses uid but
+// no actor). So an authenticated editor can declare a co-editor's actor on its
+// FIRST frame and have it acked — the impersonation/censorship path Jerry J2 and
+// yujiawei P0-2 flag. The test above ('pins the connection actor…') even ACKS
+// uid u_w declaring actor 'u-x', which is the proof.
+//
+// The FIX SHAPE is an owner decision (D1): server-mint the actor at token issuance
+// (e.g. HMAC(uid,docId,session) truncated into the accepted charset) vs a signed
+// `actor` claim vs client-declared-in-hello. Until D1 lands we must NOT invent the
+// minting scheme. These skipped tests encode the required OBSERVABLE contract so
+// the next round implements against a fixed target:
+//   1. a uid sending another collaborator's op.a is refused (no impersonation), and
+//   2. a legitimate idempotent resend whose ops carry a DIFFERENT actor (an offline
+//      queue flushed after a page reload that minted a fresh actor) is still
+//      RE-ACKED — i.e. the actor/identity check must move AFTER the known-duplicate
+//      re-ack (src/ppt/relay/pptRelay.ts, currently the pin sits BEFORE it).
+// Unskip and wire to the chosen scheme once D1 is relayed.
+describe.skip('PPT relay: op actor bound to authenticated uid (XIN-1783 D1 — owner-blocked)', () => {
+  it('refuses a first frame declaring another collaborator’s actor (impersonation)', async () => {
+    const h = await setup()
+    // D1-dependent: the harness will bind uid→actor via the chosen scheme.
+    const attacker = await h.connect({ uid: 'u_attacker', role: 'writer' })
+    await helloReady(attacker)
+    // The attacker read a victim's actor off a broadcast and declares it.
+    attacker.send({ t: 'ops', pv: 2, k: 1, frameId: 'imp', epoch: 0, ops: [{ op: 'set', a: 'u-victim-actor', s: 1, l: 1, k: 'x', v: 1 }] })
+    expect(await attacker.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+  })
+
+  it('still re-acks a legitimate idempotent resend that carries a freshly-minted actor', async () => {
+    const h = await setup()
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+    // Original write commits under the session's first actor.
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'dup', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor-1', s: 1, l: 1, k: 'x', v: 1 }] })
+    expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    // Reload → offline queue flush → the SAME frameId is resent, now under a fresh
+    // actor. It is already durable, so it MUST re-ack its stored seq, not be refused.
+    const w2 = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w2)
+    w2.send({ t: 'ops', pv: 2, k: 1, frameId: 'dup', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor-2', s: 1, l: 1, k: 'x', v: 1 }] })
+    expect(await w2.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
+// OWNER-DECISION BLOCKED (XIN-1783 D1): op-metadata trust boundary — who may mint
+// `s`, `l`, `sd[0]`. These are the same trust-boundary decision as the actor
+// minting above (root-cause consolidation item 3): the current absolute bounds
+// (ACTOR_ID_PATTERN / MAX_OP_CLOCK in frames.ts) admit a wire-legal value that
+// permanently bricks a room, and the correct bound is RELATIVE to the room's live
+// state — which is only well-defined once D1 fixes how those fields are minted /
+// trusted. Encoded here as the required behavior; unskip with the D1 scheme.
+describe.skip('PPT relay: op-metadata bounds are relative, not absolute (XIN-1783 P1-1/1-2/1-3 — owner-blocked)', () => {
+  it('P1-1: a non-contiguous / duplicate per-actor s is refused at the trust boundary', async () => {
+    const h = await setup()
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+    // s=1 establishes the per-connection sequence.
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'g1', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor', s: 1, l: 1, k: 'x', v: 1 }] })
+    expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    // s=3 skips s=2 → an unfillable per-actor gap that freezes room GC forever.
+    // Must be refused (track conn.nextS; refuse skip/reorder/repeat).
+    w.send({ t: 'ops', pv: 2, k: 2, frameId: 'g2', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor', s: 3, l: 2, k: 'x', v: 2 }] })
+    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
+  })
+
+  it('P1-2: a near-ceiling Lamport clock does not permanently brick the room', async () => {
+    const h = await setup()
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+    // A poison op at the absolute ceiling: with a RELATIVE bound this is refused up
+    // front (l far above roomLamport), so it can never pin the clock…
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'poison', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor', s: 1, l: 2 ** 45, k: 'x', v: 1 }] })
+    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
+    // …and a subsequent legitimately-minted op is still accepted (room not bricked).
+    w.send({ t: 'ops', pv: 2, k: 2, frameId: 'ok', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor', s: 1, l: 1, k: 'x', v: 2 }] })
+    expect(await w.recv()).toMatchObject({ ctl: 'ack' })
+  })
+
+  it('P1-3: a txt seed generation (sd[0]) above the room clock is refused', async () => {
+    const h = await setup()
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+    // sd[0] is a Lamport value (cmpReg); a MAX_SAFE_INTEGER seed pins the text
+    // generation above every legitimate successor. Same relative bound as `l`.
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'txtpoison', epoch: 0, ops: [
+      { op: 'txt', a: 'u-w-actor', s: 1, l: 1, el: 'e1', sd: [Number.MAX_SAFE_INTEGER, 'u-w-actor'], base: 'x', ins: [{ at: 'x', toks: ['a'] }] },
+    ] })
+    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
+  })
+})
+
 describe('PPT relay: refused retry classification (PPT-WS-006)', () => {
   it('classifies every refused code; rate-limited is retryable with retryInMs', async () => {
     const h = await setup({ limits: { maxOpsPerFrame: 2, maxFramesPerWindow: 3, maxRoomFrameBytes: 100_000_000 } })
