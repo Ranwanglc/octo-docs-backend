@@ -11,11 +11,9 @@ import { config } from '../src/config/env.js'
 import { PptRelay, type RelayLimits } from '../src/ppt/relay/pptRelay.js'
 import { InMemoryPptRelayStore, type PptRelayStore, RetryableStorageError, canonicalPayloadHash } from '../src/ppt/relay/store.js'
 import { isRetryable, STORAGE_RETRY_BACKOFF_MS } from '../src/ppt/relay/frames.js'
-import { issuePptCollabToken, mintCollabActor, PPT_RELAY_TICKET_AUD } from '../src/auth/pptCollabToken.js'
+import { issuePptCollabToken, PPT_RELAY_TICKET_AUD } from '../src/auth/pptCollabToken.js'
 import type { ResolvedRole, Role } from '../src/permission/role.js'
 import type { BentoDoc } from '../src/ppt/bentoDoc.js'
-import { SyncState } from '../src/ppt/sync/slidesSync.js'
-import type { Op } from '../src/ppt/sync/crdt.js'
 
 /**
  * R4-B1 integration tests for the Bento-frame WS relay (§7.2 / §7.3 / §7.4),
@@ -29,10 +27,6 @@ import type { Op } from '../src/ppt/sync/crdt.js'
 
 const DOC = 'd_ppt1'
 const DOCNAME = 'octo:s_1:f_default:ppt:d_ppt1'
-
-function clone<T>(v: T): T {
-  return JSON.parse(JSON.stringify(v)) as T
-}
 
 function deck(title = 'Deck'): BentoDoc {
   return {
@@ -99,8 +93,8 @@ class WsClient {
 interface Harness {
   relay: PptRelay
   store: PptRelayStore
-  connect: (opts: { uid: string; role: Role; name?: string; ticket?: string; path?: string; actor?: string }) => Promise<WsClient>
-  ticketFor: (opts: { uid: string; role: Role; name?: string; epoch?: number; actor?: string }) => string
+  connect: (opts: { uid: string; role: Role; name?: string; ticket?: string; path?: string }) => Promise<WsClient>
+  ticketFor: (opts: { uid: string; role: Role; name?: string; epoch?: number }) => string
   setEpoch: (e: number) => void
   setRole: (uid: string, r: ResolvedRole) => void
   setDocStatus: (s: 'live' | 'deleted') => void
@@ -137,7 +131,7 @@ async function setup(
   await new Promise<void>((res) => server.listen(0, '127.0.0.1', () => res()))
   const port = (server.address() as AddressInfo).port
 
-  const ticketFor = (o: { uid: string; role: Role; name?: string; epoch?: number; actor?: string }): string =>
+  const ticketFor = (o: { uid: string; role: Role; name?: string; epoch?: number }): string =>
     issuePptCollabToken({
       uid: o.uid,
       docId: DOC,
@@ -146,12 +140,9 @@ async function setup(
       permission_epoch: o.epoch ?? liveEpoch,
       snapshotVersion: 0,
       ...(o.name ? { name: o.name } : {}),
-      // A server-minted actor claim (XIN-1789 D1). Present => the relay enforces
-      // `op.a === actor` + per-actor `s` continuity; absent => legacy first-frame pin.
-      ...(o.actor ? { actor: o.actor } : {}),
     }).ticket
 
-  const connect = (o: { uid: string; role: Role; name?: string; ticket?: string; path?: string; actor?: string }): Promise<WsClient> => {
+  const connect = (o: { uid: string; role: Role; name?: string; ticket?: string; path?: string }): Promise<WsClient> => {
     const ticket = o.ticket ?? ticketFor(o)
     const ws = new WebSocket(`ws://127.0.0.1:${port}${o.path ?? '/api/v1/ppt/collab'}`, ['ppt-relay', ticket])
     const client = new WsClient(ws)
@@ -380,12 +371,12 @@ describe('PPT relay: protocol version (PPT-WS-004)', () => {
   })
 })
 
-// XIN-1772 P0-2: op metadata is validated at the trust boundary. `op.a` is otherwise
-// fully client-chosen, so the relay both charset-restricts it (no client can mint the
-// reserved `@relay` reducer actor) AND binds it to the connection (an editor cannot
-// attribute ops to a co-editor's actor to censor them, nor mint a per-actor gap under
-// a foreign actor).
-describe('PPT relay: op actor binding (XIN-1772 P0-2)', () => {
+// XIN-1772 P0-2: op metadata is validated at the trust boundary. The relay
+// charset-restricts `op.a` so no client can mint the reserved `@relay` reducer actor
+// — the structural check the snapshotter relies on to reason about persisted ops.
+// (Half A does not bind the actor to the connection or gate per-actor `s`; that
+// op-metadata trust boundary moved to Half B, paired with R4-F1 — see XIN-1810 seam.)
+describe('PPT relay: reserved reducer actor exclusion (XIN-1772 P0-2)', () => {
   it('refuses a frame minting the reserved reducer actor and never persists it', async () => {
     const h = await setup()
     const w = await h.connect({ uid: 'u_w', role: 'writer' })
@@ -394,349 +385,6 @@ describe('PPT relay: op actor binding (XIN-1772 P0-2)', () => {
     w.send({ t: 'ops', pv: 2, k: 1, frameId: 'reserved', epoch: 0, ops: [{ op: 'set', a: '@relay', s: 1, l: 1, k: 'x', v: 1 }] })
     expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
     expect(await h.store.currentSeq(DOC)).toBe(0)
-  })
-
-  it('pins the connection actor on its first ops frame and refuses a later foreign actor', async () => {
-    const h = await setup()
-    const w = await h.connect({ uid: 'u_w', role: 'writer' })
-    await helloReady(w)
-
-    // First frame establishes the connection actor `u-x` and is acked.
-    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'f1', epoch: 0, ops: [{ op: 'set', a: 'u-x', s: 1, l: 1, k: 'x', v: 1 }] })
-    expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 1 })
-
-    // A later frame attributing ops to a DIFFERENT actor (co-editor censorship) is refused.
-    w.send({ t: 'ops', pv: 2, k: 2, frameId: 'f2', epoch: 0, ops: [{ op: 'set', a: 'u-victim', s: 5, l: 5, k: 'x', v: 2 }] })
-    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
-
-    // A frame mixing two actors is refused too.
-    w.send({ t: 'ops', pv: 2, k: 3, frameId: 'f3', epoch: 0, ops: [
-      { op: 'set', a: 'u-x', s: 2, l: 2, k: 'x', v: 3 },
-      { op: 'set', a: 'u-other', s: 1, l: 3, k: 'y', v: 4 },
-    ] })
-    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
-
-    // Only the first (legitimate) frame ever persisted.
-    expect(await h.store.currentSeq(DOC)).toBe(1)
-  })
-})
-
-// ────────────────────────────────────────────────────────────────────────────
-// XIN-1789 D1: actor ↔ authenticated-uid binding (server-mint).
-//
-// The XIN-1772 block above pins conn.actor from the FIRST frame's self-declared
-// op.a — a LEGACY credential with no actor claim keeps that behavior. D1 closes the
-// impersonation/censorship path (Jerry J2 / yujiawei P0-2) by minting the actor
-// SERVER-SIDE from the authenticated uid at token issuance (HMAC(uid,docId,session)
-// truncated into the accepted charset, src/auth/pptCollabToken.ts `mintCollabActor`)
-// and carrying it as a signed claim. The relay pins conn.actor from that claim (not
-// the first frame) and refuses any op whose `a` differs, so the client can neither
-// choose nor forge its actor. The two observable contracts:
-//   1. a uid sending another collaborator's op.a is refused (no impersonation), and
-//   2. a legitimate idempotent resend whose ops carry a DIFFERENT (freshly minted)
-//      actor — an offline queue flushed after a page reload — is still RE-ACKED,
-//      because the actor check runs AFTER the known-duplicate re-ack lookup and the
-//      dedup identity is actor-independent (src/ppt/relay/store.ts canonicalPayloadHash).
-describe('PPT relay: op actor bound to authenticated uid (XIN-1783 D1)', () => {
-  it('refuses a first frame declaring another collaborator’s actor (impersonation)', async () => {
-    const h = await setup()
-    // D1: the credential carries a server-minted actor derived from the uid; the
-    // client cannot choose it. The harness pins it deterministically to assert the
-    // binding — production mints it via HMAC(uid, docId, session).
-    const attacker = await h.connect({ uid: 'u_attacker', role: 'writer', actor: 'u-attacker-actor' })
-    await helloReady(attacker)
-    // The attacker read a victim's actor off a broadcast and declares it.
-    attacker.send({ t: 'ops', pv: 2, k: 1, frameId: 'imp', epoch: 0, ops: [{ op: 'set', a: 'u-victim-actor', s: 1, l: 1, k: 'x', v: 1 }] })
-    expect(await attacker.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
-    expect(await h.store.currentSeq(DOC)).toBe(0)
-  })
-
-  it('re-acks a byte-identical idempotent resend under the stable session actor', async () => {
-    const h = await setup()
-    // XIN-1792 P0-2: the actor is derived from (uid, docId, clientSessionId) and is
-    // STABLE across reconnects, so a page-reload → offline-queue flush resends the
-    // SAME frame under the SAME actor. The harness pins the session actor here.
-    const w = await h.connect({ uid: 'u_w', role: 'writer', actor: 'u-w-actor' })
-    await helloReady(w)
-    // Original write commits under the session actor.
-    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'dup', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor', s: 1, l: 1, k: 'x', v: 1 }] })
-    expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 1 })
-    // Reload → offline queue flush → the SAME frameId is resent BYTE-IDENTICALLY under
-    // the SAME stable session actor. It is already durable, so it MUST re-ack its
-    // stored seq (the re-ack precedes the actor/continuity checks).
-    const w2 = await h.connect({ uid: 'u_w', role: 'writer', actor: 'u-w-actor' })
-    await helloReady(w2)
-    w2.send({ t: 'ops', pv: 2, k: 1, frameId: 'dup', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor', s: 1, l: 1, k: 'x', v: 1 }] })
-    expect(await w2.recv()).toMatchObject({ ctl: 'ack', q: 1 })
-  })
-
-  it('refuses a resend that reuses a frameId with a DIFFERENT actor (no silent mis-attribution)', async () => {
-    // XIN-1792 P1-1: the dedup hash includes the actor `a` again. A frame re-sent
-    // under a DIFFERENT actor is NOT the same durable write (LWW `[l,a]` and `vv` are
-    // actor-keyed), so re-acking the original actor's row would falsely tell the
-    // client its new-actor ops are durable while the server/peers hold the old-actor
-    // version — a silent divergence. The reused frameId with different ops is refused.
-    const h = await setup()
-    const w = await h.connect({ uid: 'u_w', role: 'writer', actor: 'u-w-actor-1' })
-    await helloReady(w)
-    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'dup', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor-1', s: 1, l: 1, k: 'x', v: 1 }] })
-    expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 1 })
-    const w2 = await h.connect({ uid: 'u_w', role: 'writer', actor: 'u-w-actor-2' })
-    await helloReady(w2)
-    w2.send({ t: 'ops', pv: 2, k: 1, frameId: 'dup', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor-2', s: 1, l: 1, k: 'x', v: 1 }] })
-    expect(await w2.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
-  })
-
-  it('P0-1 (E2E): delivers the server-minted actor in `ready`; a client authoring under only the delivered actor is accepted', async () => {
-    // The coverage gap the review flagged: previously the harness pre-seeded the actor
-    // into the credential AND the client's ops, assuming away the step a real client
-    // cannot perform (learning WHICH actor to author under). Drive the REAL production
-    // derivation (`mintCollabActor`, the exact call `collabTokenHandler` makes) and let
-    // the client discover its actor ONLY from the `ready` frame — never decoding the JWT.
-    const h = await setup()
-    const actor = mintCollabActor('u_w', DOC, 'client-session-xyz')
-    const w = await h.connect({ uid: 'u_w', role: 'writer', actor })
-    w.send({ t: 'hello', pv: 2, since: 0 })
-    const replay = await w.recvUntil((m) => m.ctl === 'ready')
-    const ready = replay[replay.length - 1] as { ctl: string; actor?: string }
-    // P0-1 delivery: the required actor is on the wire.
-    expect(ready.actor).toBe(actor)
-    // Authoring under the DELIVERED actor is accepted end-to-end…
-    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'e2e-ok', epoch: 0, ops: [{ op: 'set', a: ready.actor, s: 1, l: 1, k: 'x', v: 1 }] })
-    expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 1 })
-    // …while a client that mints its OWN actor (every pre-P0-1 client) is permanently
-    // refused — which is precisely why the delivery half is required to unblock clients.
-    w.send({ t: 'ops', pv: 2, k: 2, frameId: 'e2e-self', epoch: 0, ops: [{ op: 'set', a: 'self-chosen-actor', s: 1, l: 2, k: 'x', v: 2 }] })
-    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
-  })
-})
-
-// ────────────────────────────────────────────────────────────────────────────
-// XIN-1789 P1-1/P1-2/P1-3: op-metadata trust boundary — `s`, `l`, `sd[0]`. Same
-// trust-boundary decision as the actor minting above (root-cause consolidation
-// item 3). An absolute cap (MAX_OP_CLOCK) admits a wire-legal value FAR below the
-// ceiling but far ABOVE the room's live clock that still bricks the room; the
-// meaningful bound is RELATIVE to the room's live state. The relay now enforces
-// per-actor `s` continuity (conn.nextS) and bounds `l`/`sd[0]` against
-// `roomLamport + OP_CLOCK_SLACK`. All three run in server-bound mode (a minted
-// actor claim), which also enables the per-actor `s` continuity gate.
-describe('PPT relay: op-metadata bounds are relative, not absolute (XIN-1783 P1-1/1-2/1-3)', () => {
-  it('P1-1: a non-contiguous / duplicate per-actor s is refused at the trust boundary', async () => {
-    const h = await setup()
-    const w = await h.connect({ uid: 'u_w', role: 'writer', actor: 'u-w-actor' })
-    await helloReady(w)
-    // s=1 establishes the per-connection sequence.
-    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'g1', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor', s: 1, l: 1, k: 'x', v: 1 }] })
-    expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 1 })
-    // A REPEAT of s=1 (a distinct frameId, so not a dedup re-ack) is refused: the
-    // per-actor sequence already advanced past 1.
-    w.send({ t: 'ops', pv: 2, k: 2, frameId: 'g1repeat', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor', s: 1, l: 2, k: 'x', v: 9 }] })
-    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
-    // s=3 skips s=2 → an unfillable per-actor gap that freezes room GC forever.
-    // Must be refused (track conn.nextS; refuse skip/reorder/repeat).
-    w.send({ t: 'ops', pv: 2, k: 3, frameId: 'g2', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor', s: 3, l: 2, k: 'x', v: 2 }] })
-    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
-    // The contiguous successor s=2 is still accepted (a refused frame never advanced
-    // the sequence), so the room is not bricked by the rejected gap.
-    w.send({ t: 'ops', pv: 2, k: 4, frameId: 'g2ok', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor', s: 2, l: 2, k: 'x', v: 2 }] })
-    expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 2 })
-  })
-
-  it('P1-2: a near-ceiling Lamport clock does not permanently brick the room', async () => {
-    const h = await setup()
-    const w = await h.connect({ uid: 'u_w', role: 'writer', actor: 'u-w-actor' })
-    await helloReady(w)
-    // A poison op at the absolute ceiling: with a RELATIVE bound this is refused up
-    // front (l far above roomLamport), so it can never pin the clock…
-    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'poison', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor', s: 1, l: 2 ** 45, k: 'x', v: 1 }] })
-    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
-    // …and a subsequent legitimately-minted op is still accepted (room not bricked).
-    w.send({ t: 'ops', pv: 2, k: 2, frameId: 'ok', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor', s: 1, l: 1, k: 'x', v: 2 }] })
-    expect(await w.recv()).toMatchObject({ ctl: 'ack' })
-  })
-
-  it('P1-3: a txt seed generation (sd[0]) above the room clock is refused', async () => {
-    const h = await setup()
-    const w = await h.connect({ uid: 'u_w', role: 'writer', actor: 'u-w-actor' })
-    await helloReady(w)
-    // sd[0] is a Lamport value (cmpReg); a MAX_SAFE_INTEGER seed pins the text
-    // generation above every legitimate successor. Same relative bound as `l`.
-    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'txtpoison', epoch: 0, ops: [
-      { op: 'txt', a: 'u-w-actor', s: 1, l: 1, el: 'e1', sd: [Number.MAX_SAFE_INTEGER, 'u-w-actor'], base: 'x', ins: [{ at: 'x', toks: ['a'] }] },
-    ] })
-    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
-  })
-
-  it('P1-2 (XIN-1792): the room clock re-seeds from the un-snapshotted TAIL after a room eviction', async () => {
-    const SLACK = 2 ** 20
-    const h = await setup()
-    // A first writer pushes the room clock up to SLACK via a slack-consuming op, then
-    // a legitimate successor just above it — both accepted while the room is live.
-    const w1 = await h.connect({ uid: 'u1', role: 'writer', actor: 'u1-actor' })
-    await helloReady(w1)
-    w1.send({ t: 'ops', pv: 2, k: 1, frameId: 't1', epoch: 0, ops: [{ op: 'set', a: 'u1-actor', s: 1, l: SLACK, k: 'x', v: 1 }] })
-    expect(await w1.recv()).toMatchObject({ ctl: 'ack', q: 1 })
-    w1.send({ t: 'ops', pv: 2, k: 2, frameId: 't2', epoch: 0, ops: [{ op: 'set', a: 'u1-actor', s: 2, l: SLACK + 1, k: 'x', v: 2 }] })
-    expect(await w1.recv()).toMatchObject({ ctl: 'ack', q: 2 })
-    // Evict the room: the last socket leaves, so the process-local room clock is dropped
-    // and must re-seed on the next join. No snapshot was taken, so seeding from the
-    // snapshot ALONE would regress to 0 and permanently refuse an honest successor.
-    w1.close()
-    await waitFor(async () => (h.relay.roomSize(DOC) === 0 ? true : null))
-    const w2 = await h.connect({ uid: 'u2', role: 'writer', actor: 'u2-actor' })
-    await helloReady(w2)
-    // An honest op just above the tail's high-water is ACCEPTED because the clock
-    // re-seeded from the durable tail (max l = SLACK+1), not from the (absent) snapshot.
-    w2.send({ t: 'ops', pv: 2, k: 1, frameId: 't3', epoch: 0, ops: [{ op: 'set', a: 'u2-actor', s: 1, l: SLACK + 2, k: 'x', v: 3 }] })
-    expect(await w2.recv()).toMatchObject({ ctl: 'ack' })
-  })
-})
-
-// ────────────────────────────────────────────────────────────────────────────
-// XIN-1800 P0-1: the server-minted actor is STABLE across reconnects (derived from
-// (uid, docId, clientSessionId)), so `nextS` — the per-actor sequence — must be
-// SEEDED from durable state on reconnect, not reset to 1 per socket. Reset-to-1
-// paired with a stable actor either PERMANENTLY refuses every post-reconnect write
-// (the client kept its engine and sends s=last+1, but the gate expects 1) or, on a
-// fresh-engine restart at s=1, SILENTLY persists a duplicate (actor,s) the reducer
-// drops. Both branches were reproduced by yujiawei at c1ed326; both are closed by
-// re-deriving nextS from the durable per-actor high-water (the twin of the room clock).
-describe('PPT relay: nextS is seeded from durable state across a reconnect (XIN-1800 P0-1)', () => {
-  it('Branch A: a reconnecting session that KEEPS its engine continues its per-actor s (s=2 ACCEPTED, not refused)', async () => {
-    const h = await setup()
-    const actor = 'u-w-actor'
-    const w1 = await h.connect({ uid: 'u_w', role: 'writer', actor })
-    await helloReady(w1)
-    w1.send({ t: 'ops', pv: 2, k: 1, frameId: 'r1', epoch: 0, ops: [{ op: 'set', a: actor, s: 1, l: 1, k: 'x', v: 1 }] })
-    expect(await w1.recv()).toMatchObject({ ctl: 'ack', q: 1 })
-    // Evict the room so `nextS` is NOT carried in process memory: it must re-seed from
-    // the durable per-actor high-water on the next join (the whole point of P0-1).
-    w1.close()
-    await waitFor(async () => (h.relay.roomSize(DOC) === 0 ? true : null))
-    // Reconnect under the SAME stable actor; the client kept its engine, so its next
-    // op is s=2. Pre-fix (nextS reset to 1) this was refused `protocol-version` and the
-    // session's writes were dead. Post-fix it is accepted.
-    const w2 = await h.connect({ uid: 'u_w', role: 'writer', actor })
-    const { ready } = await helloReady(w2)
-    // `ready` PUBLISHES the durable per-actor sequence the client must continue from
-    // (XIN-1807 P0-1) — the value the gate enforces, now observable on the wire. A
-    // rebuilt client reads it here instead of guessing; at 8be3f57 the field was absent.
-    expect(ready.nextS).toBe(2)
-    w2.send({ t: 'ops', pv: 2, k: 1, frameId: 'r2', epoch: 0, ops: [{ op: 'set', a: actor, s: 2, l: 2, k: 'x', v: 2 }] })
-    expect(await w2.recv()).toMatchObject({ ctl: 'ack', q: 2 })
-    // Two distinct durable frames — no silent loss, no permanent refusal.
-    expect(await h.store.currentSeq(DOC)).toBe(2)
-  })
-
-  it('Branch B: a reconnecting session that RESTARTS s at 1 is VISIBLY refused, never silently persisted as a duplicate (actor,s)', async () => {
-    const h = await setup()
-    const actor = 'u-w-actor'
-    const w1 = await h.connect({ uid: 'u_w', role: 'writer', actor })
-    await helloReady(w1)
-    w1.send({ t: 'ops', pv: 2, k: 1, frameId: 'b1', epoch: 0, ops: [{ op: 'set', a: actor, s: 1, l: 1, k: 'title', v: 'first' }] })
-    expect(await w1.recv()).toMatchObject({ ctl: 'ack', q: 1 })
-    w1.close()
-    await waitFor(async () => (h.relay.roomSize(DOC) === 0 ? true : null))
-    // A rebuilt-engine reconnect restarts s at 1 under a NEW frameId (NOT a dedup
-    // resend, so it does not short-circuit on the ledger). Pre-fix this was ACKed and
-    // the reducer silently dropped it as a duplicate (actor,s=1) — the post-reconnect
-    // edit was durable but lost everywhere. Post-fix nextS re-seeds to 2, so the stale
-    // s=1 is a VISIBLE `protocol-version` refusal and no second (actor,s=1) row lands.
-    const w2 = await h.connect({ uid: 'u_w', role: 'writer', actor })
-    await helloReady(w2)
-    w2.send({ t: 'ops', pv: 2, k: 1, frameId: 'b2', epoch: 0, ops: [{ op: 'set', a: actor, s: 1, l: 2, k: 'title', v: 'second' }] })
-    // The refusal now carries the expected `nextS` (XIN-1807 P0-1) so a client that
-    // restarted `s` too low recovers IN BAND (re-seed from nextS-1, resend) instead of
-    // being permanently bricked. At 8be3f57 the refusal carried no such value.
-    expect(await w2.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version', nextS: 2 })
-    expect(await h.store.currentSeq(DOC)).toBe(1)
-  })
-
-  it('P2-1: a reauth ticket carrying a DIFFERENT actor is refused (4403), not silently kept', async () => {
-    const h = await setup()
-    const w = await h.connect({ uid: 'u_w', role: 'writer', actor: 'u-w-actor' })
-    await helloReady(w)
-    // A reauth minted under a DIFFERENT clientSessionId carries a different actor. The
-    // uid pin already blocks cross-user migration; adopting a different actor silently
-    // would leave the connection authoring under the OLD actor while the client (which
-    // reads its actor from the token response) switches to the new one — every op then
-    // permanently refused with no diagnostic. Fail closed instead.
-    const ticket = h.ticketFor({ uid: 'u_w', role: 'writer', actor: 'u-w-actor-2' })
-    w.send({ t: 'reauth', pv: 2, ticket })
-    expect((await w.closed).code).toBe(4403)
-  })
-
-  it('concurrent-socket variant: two LIVE sockets sharing one actor do NOT both accept s=1 — the second is refused, not silently dropped', async () => {
-    const h = await setup()
-    const actor = 'u-shared-actor'
-    const a = await h.connect({ uid: 'u_w', role: 'writer', actor })
-    const b = await h.connect({ uid: 'u_w', role: 'writer', actor })
-    await helloReady(a)
-    await helloReady(b)
-    // Socket A authors s=1 and it commits durably.
-    a.send({ t: 'ops', pv: 2, k: 1, frameId: 'a1', epoch: 0, ops: [{ op: 'set', a: actor, s: 1, l: 1, k: 'x', v: 1 }] })
-    expect(await a.recv()).toMatchObject({ ctl: 'ack', q: 1 })
-    // Socket B (same actor, still live) then authors its OWN s=1 under a distinct
-    // frameId. Pre-fix both sockets reset nextS to 1 and the second was ACKed then
-    // dropped by every reducer as a duplicate (actor,s=1). Post-fix B re-derives nextS
-    // from the room's durable per-actor high-water (now 1), so its stale s=1 is a
-    // VISIBLE refusal and no second (actor,s=1) row lands.
-    b.send({ t: 'ops', pv: 2, k: 1, frameId: 'b1', epoch: 0, ops: [{ op: 'set', a: actor, s: 1, l: 2, k: 'x', v: 2 }] })
-    // B also receives A's committed op as a peer broadcast; skip past it to B's verdict.
-    const out = await b.recvUntil((m) => m.ctl === 'refused' || m.ctl === 'ack')
-    expect(out[out.length - 1]).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
-    expect(await h.store.currentSeq(DOC)).toBe(1)
-  })
-
-  it('P0-1 (XIN-1807): ready publishes nextS so a REBUILT client (real vendored engine) authors after reload — permanently refused at 8be3f57', async () => {
-    const h = await setup()
-    const actor = 'u-reload-actor'
-    // The live session authors s=1 under the REAL vendored engine; on a fresh deck (no
-    // snapshot yet) the op is entirely in the durable tail — the exact state yujiawei
-    // reproduced against, where the durable per-actor high-water is above the snapshot's.
-    const engine = new SyncState(actor)
-    const base = deck()
-    engine.adopt(base)
-    const edited = clone(base)
-    ;(edited as unknown as { title: string }).title = 'authored before reload'
-    const ops1 = engine.diff(base, edited, { text: true }) as unknown as Op[]
-    expect(ops1.length).toBeGreaterThan(0)
-    // A fresh engine mints its first op at s=1 — the only value a rebuilt replica can
-    // reconstruct from replay (see below).
-    expect(ops1.every((o) => o.a === actor && o.s === 1)).toBe(true)
-
-    const w1 = await h.connect({ uid: 'u_w', role: 'writer', actor })
-    await helloReady(w1)
-    w1.send({ t: 'ops', pv: 2, k: 1, frameId: 'reload-1', epoch: 0, ops: ops1 })
-    expect(await w1.recv()).toMatchObject({ ctl: 'ack', q: 1 })
-    w1.close()
-    await waitFor(async () => (h.relay.roomSize(DOC) === 0 ? true : null))
-
-    // Page reload / crashed renderer: the client REBUILDS its engine from the relay
-    // replay. Reconnect under the same stable actor and capture ready + the replayed ops.
-    const w2 = await h.connect({ uid: 'u_w', role: 'writer', actor })
-    const { ready, replay } = await helloReady(w2)
-
-    // Faithful rebuilt engine: apply the replayed op frames to a fresh replica. The
-    // vendored engine SKIPS its own replayed ops (`applyOne` returns early for
-    // `op.a === actor`), so `vv[actor]` stays 0 — the ONLY per-actor `s` a rebuilt client
-    // can derive from replay alone is 1, exactly the value the gate refuses.
-    const rebuilt = new SyncState(actor)
-    const workingDoc = clone(base)
-    rebuilt.adopt(workingDoc)
-    for (const m of replay) {
-      if (m.ctl === 'op') rebuilt.apply(workingDoc, (m.frame as { ops: Op[] }).ops)
-    }
-    expect(rebuilt.vv[actor] ?? 0).toBe(0)
-
-    // `ready` PUBLISHES the durable per-actor high-water + 1 = 2. At 8be3f57 this field
-    // was absent, so the rebuilt client could only send s=1 and was PERMANENTLY refused
-    // `protocol-version` with no in-band recovery. Now it adopts the published value and
-    // its first post-reload write is ACCEPTED and durable.
-    expect(ready.nextS).toBe(2)
-    w2.send({ t: 'ops', pv: 2, k: 1, frameId: 'reload-2', epoch: 0, ops: [{ op: 'set', a: actor, s: ready.nextS as number, l: 2, k: 'title', v: 'authored after reload' }] })
-    expect(await w2.recv()).toMatchObject({ ctl: 'ack', q: 2 })
-    expect(await h.store.currentSeq(DOC)).toBe(2)
   })
 })
 

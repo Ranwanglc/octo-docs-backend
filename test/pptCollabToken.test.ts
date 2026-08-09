@@ -109,13 +109,6 @@ async function listen(app: Express): Promise<{ base: string; close: () => Promis
 }
 
 function post(base: string, body: unknown, opts: { token?: string; space?: string } = {}) {
-  // The endpoint now REQUIRES a stable clientSessionId (XIN-1792 P0-2). Inject a
-  // default for the general-case tests; a test exercising the missing/invalid path
-  // passes its own body.
-  const withSession =
-    body && typeof body === 'object' && !Array.isArray(body) && !('clientSessionId' in (body as Record<string, unknown>))
-      ? { ...(body as Record<string, unknown>), clientSessionId: 'sess-test' }
-      : body
   return fetch(`${base}/api/v1/ppt/docs/collab-token`, {
     method: 'POST',
     headers: {
@@ -123,7 +116,7 @@ function post(base: string, body: unknown, opts: { token?: string; space?: strin
       token: opts.token ?? 'user-tok',
       'X-Space-Id': opts.space ?? 's_1',
     },
-    body: JSON.stringify(withSession),
+    body: JSON.stringify(body),
   })
 }
 
@@ -187,57 +180,10 @@ describe('POST /api/v1/ppt/docs/collab-token (§7.1)', () => {
       expect(tik.docId).toBe('d_ppt1')
       expect(tik.jti.length).toBeGreaterThan(0)
 
-      // XIN-1792 P0-1: the server-minted actor is DELIVERED to the client (a
-      // wire-legal `[a-z0-9-]` id) AND signed into the token, so the client authors
-      // under exactly the actor the relay enforces — no JWT decoding required.
-      expect(typeof d.actor).toBe('string')
-      expect(d.actor as string).toMatch(/^[a-z0-9-]{1,64}$/)
-      expect(tok.actor).toBe(d.actor)
-      expect(tik.actor).toBe(d.actor)
-    } finally {
-      await close()
-    }
-  })
-
-  it('PPT-TOKEN-001: the actor is STABLE for a given clientSessionId and DIFFERS across sessions (P0-2)', async () => {
-    seedDoc()
-    currentMemberRole = 'writer'
-    const { base, close } = await listen(makeApp())
-    try {
-      const body = async (session: string) => {
-        const res = await fetch(`${base}/api/v1/ppt/docs/collab-token`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', token: 'user-tok', 'X-Space-Id': 's_1' },
-          body: JSON.stringify({ docId: 'd_ppt1', clientSessionId: session }),
-        })
-        return ((await res.json()) as { data: { actor: string } }).data.actor
-      }
-      const a1 = await body('sess-A')
-      const a2 = await body('sess-A')
-      const b1 = await body('sess-B')
-      // Same (uid, docId, clientSessionId) → same actor across reconnects; a different
-      // session id → a different actor. This is what lets a reconnect reuse the same
-      // CRDT replica identity instead of discarding unsent work.
-      expect(a1).toBe(a2)
-      expect(a1).not.toBe(b1)
-    } finally {
-      await close()
-    }
-  })
-
-  it('PPT-TOKEN-002: a missing clientSessionId is rejected 400 (required for a stable actor)', async () => {
-    seedDoc()
-    currentMemberRole = 'writer'
-    const { base, close } = await listen(makeApp())
-    try {
-      // Bypass the helper's default injection: post a body with no clientSessionId.
-      const res = await fetch(`${base}/api/v1/ppt/docs/collab-token`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', token: 'user-tok', 'X-Space-Id': 's_1' },
-        body: JSON.stringify({ docId: 'd_ppt1' }),
-      })
-      expect(res.status).toBe(400)
-      expect(((await res.json()) as { error: { code: string } }).error.code).toBe('VALIDATION_ERROR')
+      // Half A issues no server-minted actor and no per-actor `s` hint (that op-metadata
+      // trust boundary moved to Half B): the response carries neither field.
+      expect(d.actor).toBeUndefined()
+      expect(d.nextS).toBeUndefined()
     } finally {
       await close()
     }

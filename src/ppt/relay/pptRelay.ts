@@ -38,7 +38,6 @@ import {
   opsAreValid,
   isRetryable,
   STORAGE_RETRY_BACKOFF_MS,
-  OP_CLOCK_SLACK,
   type OpsFrame,
   type SnapFrame,
   type ReauthFrame,
@@ -351,50 +350,6 @@ interface Conn {
    * reauth; on fire (still pending) the socket is closed.
    */
   reauthGraceTimer?: NodeJS.Timeout
-  /**
-   * The Bento actor id this connection authors under (XIN-1772 P0-2 / XIN-1789 D1).
-   *
-   * When the credential carries a server-minted `actor` claim (D1), this is set at
-   * connection time from that claim ({@link actorBound} = true) and every op is
-   * refused unless its `a` equals it — the client can neither choose nor forge its
-   * actor, structurally closing the impersonation / co-editor-censorship path P0-2
-   * and the per-actor `s`-gap manufacture. On a LEGACY credential with no actor claim
-   * this is instead PINNED on the first `ops` frame's self-declared `op.a` and a
-   * later switch is refused ({@link actorBound} = false) — the pre-D1 behavior, kept
-   * so tokens minted before D1 still bind their actor for the socket's lifetime.
-   * Undefined until either source establishes it.
-   */
-  actor?: string
-  /**
-   * True when {@link actor} came from a server-minted token claim (XIN-1789 D1), so
-   * the relay enforces `op.a === actor` and per-actor `s` continuity ({@link nextS}).
-   * False for a legacy first-frame-pinned actor (no per-actor `s` continuity gate —
-   * a legacy client's `s` sequence is not server-trusted).
-   */
-  actorBound: boolean
-  /**
-   * The next per-actor sequence `s` this connection may mint under its server-minted
-   * actor (XIN-1789 P1-1). SEEDED from durable room state on the connection's first
-   * new frame — `(durable per-actor high-water) + 1` — NOT reset to 1 per socket
-   * (XIN-1800 P0-1). The actor is stable across reconnects (derived from
-   * `(uid, docId, clientSessionId)`), so a client that keeps its engine continues its
-   * `s` sequence past a reconnect; seeding `nextS` from what the room durably holds is
-   * the per-actor twin of the room-clock seed and is what makes that continuation
-   * accepted instead of refused (or, on a fresh-engine restart at `s=1`, VISIBLY
-   * refused rather than silently persisting a duplicate `(actor,s)` the reducer drops).
-   * Advances by the op count of each ACCEPTED frame. A frame whose ops' `s` values are
-   * not exactly `nextS, nextS+1, …` (a skip, reorder, or repeat) is refused at the
-   * trust boundary, so one wire-legal non-contiguous `s` can no longer manufacture an
-   * unfillable per-actor gap that freezes room GC. Enforced only when {@link actorBound}.
-   */
-  nextS: number
-  /**
-   * True once {@link nextS} has been seeded from durable room state (XIN-1800 P0-1).
-   * The seed is lazy — it runs on the first NEW (`known === null`) frame, after
-   * {@link ensureRoomLamport} has folded the durable tail into the per-actor
-   * high-water — so a socket that only ever re-acks or reads never triggers it.
-   */
-  nextSSeeded: boolean
 }
 
 function send(socket: WebSocket, frame: ServerFrame): void {
@@ -403,25 +358,6 @@ function send(socket: WebSocket, frame: ServerFrame): void {
   } catch {
     /* peer closed mid-broadcast; the close handler prunes it */
   }
-}
-
-/**
- * The highest Bento Lamport-clock value a frame's ops carry (XIN-1789 P1-2/P1-3):
- * the max over every op's `l` plus, for a `txt` op, its seed generation `sd[0]`
- * (a Lamport value the engine folds into the clock exactly like `l`). Callers have
- * already run `opsAreValid`, so `l` is a number and a `txt` op's `sd` is a valid
- * `[lamport, actor]` register; the guards below stay defensive against a non-op
- * entry so this is safe to call on any `ops` array.
- */
-function maxFrameClock(ops: unknown[]): number {
-  let max = 0
-  for (const op of ops) {
-    if (typeof op !== 'object' || op === null) continue
-    const o = op as { l?: unknown; op?: unknown; sd?: unknown }
-    if (typeof o.l === 'number' && o.l > max) max = o.l
-    if (o.op === 'txt' && Array.isArray(o.sd) && typeof o.sd[0] === 'number' && o.sd[0] > max) max = o.sd[0]
-  }
-  return max
 }
 
 /**
@@ -524,37 +460,6 @@ export class PptRelay {
   private readonly roomBytes = new Map<string, number>()
   /** Rooms whose {@link roomBytes} has been seeded from durable state. */
   private readonly roomBytesSeeded = new Set<string>()
-  /**
-   * Highest Bento Lamport clock the room is known to have reached — the live clock
-   * the RELATIVE op-metadata bound checks against (XIN-1789 P1-2/P1-3). Seeded from
-   * the durable snapshot state's `lamport` on first use (so a fresh joiner inheriting
-   * the serialized clock is never over-cap) and advanced to the max of each ACCEPTED
-   * op's `l` and text seed `sd[0]`. An incoming `l`/`sd[0]` above `value +
-   * {@link OP_CLOCK_SLACK}` is refused, so an admitted value can never leap the clock
-   * to a ceiling that then invalidates its own legitimate successors.
-   */
-  private readonly roomLamport = new Map<string, number>()
-  /** Rooms whose {@link roomLamport} has been seeded from durable snapshot state. */
-  private readonly roomLamportSeeded = new Set<string>()
-  /**
-   * Per-room, per-actor highest durably-accepted `s` (XIN-1800 P0-1). The per-actor
-   * twin of {@link roomLamport}: seeded from durable state (the snapshot's version
-   * vector plus the un-snapshotted tail) in the SAME pass as the room clock, then
-   * advanced by each accepted server-minted frame. A reconnecting session re-derives
-   * its {@link Conn.nextS} from this map instead of resetting to 1, so a client that
-   * keeps one replica identity across a reconnect continues its `s` sequence — and a
-   * fresh-engine restart at a stale `s` is VISIBLY refused rather than silently
-   * persisting a duplicate `(actor,s)` the reducer would drop. Dropped alongside
-   * {@link roomLamport} when the last socket leaves (re-seeded on the next join).
-   *
-   * GROWTH (XIN-1807 P2-6): this is the in-process twin of the accepted `state_json.vv`
-   * growth — one entry per actor that has EVER written to a live room, bounded by the
-   * distinct-actor count while the room is resident and reclaimed entirely when the room
-   * empties. A retirement pass is deliberately not run here for the same reason the
-   * `vv` column keeps every actor: dropping an actor's high-water could reintroduce the
-   * silent duplicate-`(actor,s)` class this map exists to close.
-   */
-  private readonly roomActorSeq = new Map<string, Map<string, number>>()
   /**
    * Per-room serialization chain for seq-allocating frames (`ops`/`snap`).
    * `onMessage` is fire-and-forget (`void`), so without this two concurrent
@@ -790,13 +695,6 @@ export class PptRelay {
       outboundDepth: 0,
       outboundChain: Promise.resolve(),
       drainChain: Promise.resolve(),
-      // Bind the actor from the server-minted token claim when present (XIN-1789 D1):
-      // the client cannot choose it, and every op is checked against it. Absent (a
-      // legacy token) leaves it unbound to be pinned on the first frame (XIN-1772).
-      ...(claims.actor !== undefined ? { actor: claims.actor } : {}),
-      actorBound: claims.actor !== undefined,
-      nextS: 1,
-      nextSSeeded: false,
     }
     this.addToRoom(conn)
     this.armAuthRefresh(conn)
@@ -859,13 +757,6 @@ export class PptRelay {
       // state when the room is next joined, so this only bounds memory.
       this.roomBytes.delete(conn.docId)
       this.roomBytesSeeded.delete(conn.docId)
-      // Same for the room's live Lamport clock — it re-seeds from the durable
-      // snapshot state on the next join (XIN-1789 P1-2).
-      this.roomLamport.delete(conn.docId)
-      this.roomLamportSeeded.delete(conn.docId)
-      // And the per-actor `s` high-water (seeded in the same pass as the clock);
-      // it re-seeds from durable state on the next join (XIN-1800 P0-1).
-      this.roomActorSeq.delete(conn.docId)
       // Evict the room's doc-status cache entry too, so a churn of short-lived
       // rooms cannot grow the cache unbounded (XIN-1736 P2-b). It re-populates on
       // the next join within its short TTL.
@@ -1235,7 +1126,7 @@ export class PptRelay {
   private refuse(
     conn: Conn,
     code: RefusedCode,
-    opts: { k?: number; frameId?: string; message?: string; retryInMs?: number; nextS?: number } = {},
+    opts: { k?: number; frameId?: string; message?: string; retryInMs?: number } = {},
   ): void {
     const retryable = isRetryable(code)
     // Both retryable codes carry a bounded backoff hint. `rate-limited` supplies
@@ -1252,10 +1143,6 @@ export class PptRelay {
       ...(opts.k !== undefined ? { k: opts.k } : {}),
       ...(opts.frameId !== undefined ? { frameId: opts.frameId } : {}),
       ...(opts.message !== undefined ? { message: opts.message } : {}),
-      // The expected per-actor `s` on a contiguity `protocol-version` refusal, so an
-      // out-of-sync client recovers IN BAND rather than being permanently refused
-      // (XIN-1807 P0-1). Only the contiguity gate passes it.
-      ...(opts.nextS !== undefined ? { nextS: opts.nextS } : {}),
     })
   }
 
@@ -1478,19 +1365,6 @@ export class PptRelay {
     // connection's authority, never migrate the socket to another user or doc.
     if (claims.uid !== conn.uid || claims.docId !== conn.docId || claims.documentName !== conn.documentName) {
       return this.failReauth(conn, 'reauth identity mismatch')
-    }
-    // The server-minted actor is now part of identity (XIN-1800 P2-1). A reauth ticket
-    // minted under a DIFFERENT clientSessionId carries a different actor; adopting it
-    // silently would leave the connection authoring under its OLD actor while the
-    // client (which reads its actor from the token response) switches to the new one —
-    // every subsequent op then permanently refused `protocol-version` with no
-    // diagnostic. The uid pin above already blocks cross-user migration, so this is a
-    // correctness/diagnosability gate, not a cross-user hole: refuse a reauth that
-    // would change a bound connection's actor rather than diverge silently. A legacy
-    // (non-actorBound) connection is unaffected — its actor is first-frame-pinned, not
-    // carried in the ticket.
-    if (conn.actorBound && claims.actor !== conn.actor) {
-      return this.failReauth(conn, 'reauth actor mismatch')
     }
     let fresh: boolean
     try {
@@ -1806,36 +1680,12 @@ export class PptRelay {
             /* keep replay usable with the last-known epoch; mutation re-checks */
           }
           if (!this.canPushRead(conn)) return false
-          // Seed + publish the per-actor `s` the client MUST author from (XIN-1807
-          // P0-1). Best-effort: a seed-read failure omits `nextS` rather than failing
-          // the whole replay — reads/presence stay serviceable and the client recovers
-          // via the in-band refusal `nextS` on its first write. When present, it equals
-          // the value the contiguity gate will enforce for this connection.
-          let nextS: number | undefined
-          try {
-            // `replay()` already holds a replay permit, so the seed cursor reuses it
-            // (holdsReplayPermit=true) rather than acquiring a second — a single-slot
-            // config would otherwise self-deadlock (XIN-1807 P1-1). PEEK (do not pin):
-            // the ops gate seeds authoritatively on the first frame, so a concurrent
-            // same-actor commit after this `ready` is still refused, not silently duped.
-            nextS = await this.peekNextS(conn, true)
-          } catch {
-            nextS = undefined
-          }
           await this.gatedSend(conn, {
             ctl: 'ready',
             q: readySeq,
             snapshotVersion: snapshot?.snapshotVersion ?? 0,
             epoch,
             role: conn.role,
-            // Deliver the server-minted actor the client MUST author under (XIN-1792
-            // P0-1). `ready` is the robust surface: it survives a reauth and reaches
-            // the client on every (re)join without re-fetching the token.
-            ...(conn.actor !== undefined ? { actor: conn.actor } : {}),
-            // Deliver the per-actor sequence the client must continue from (XIN-1807
-            // P0-1) — derived from durable state a rebuilt client cannot otherwise
-            // observe. Present only for a server-minted actor whose seed read succeeded.
-            ...(nextS !== undefined ? { nextS } : {}),
           })
         }
         return true
@@ -2112,194 +1962,6 @@ export class PptRelay {
   }
 
   /**
-   * The room's live Lamport clock high-water for the RELATIVE op-metadata bound
-   * (XIN-1789 P1-2/P1-3). Seeded ONCE per room from the durable snapshot state's
-   * `lamport` AND the durable op tail ABOVE the snapshot's coverage (XIN-1792 P1-2),
-   * then advanced in-process by each accepted op (see the post-commit advance in
-   * {@link handleOps}). A generous {@link OP_CLOCK_SLACK} absorbs the gap between the
-   * seeded clock and any un-serialized offline work.
-   *
-   * The SAME pass also seeds {@link roomActorSeq} — the per-actor `s` high-water —
-   * from the snapshot's version vector (the per-actor contiguous seq the snapshot
-   * covers) folded with the max `s` each actor carries in the un-snapshotted tail
-   * (XIN-1800 P0-1). The room clock and the per-actor sequence are twin durable
-   * watermarks read from the same tail, so they are seeded together in one scan.
-   *
-   * Seeding from the SNAPSHOT ALONE was insufficient: the room clock is dropped when
-   * the last socket leaves ({@link removeFromRoom}) and a frame may legitimately sit
-   * up to `OP_CLOCK_SLACK` above the snapshot's clock, so after a room empties and
-   * rejoins the seed would regress to the snapshot value while clients that applied
-   * the tail are at `snapshotLamport + slack` — their next honest mint is `+1` beyond
-   * the bound and PERMANENTLY refused. Folding the tail's max `l`/`sd[0]` into the
-   * seed makes the bound track what the room has actually observed. The snapshot /
-   * tail reads failing is RETRYABLE: the caller must not admit a frame against an
-   * unknown clock.
-   *
-   * The tail scan is genuinely BYTE-BOUNDED (XIN-1807 P1-1): the store's byte-aware
-   * {@link ReplayCursor} now picks each page's `seq` cutoff from a cheap size pre-scan
-   * so a page materializes at most ~`pageBytes` of op JSON — the previous read fetched
-   * `pageRows` FULL rows and only trimmed what it emitted, so a room of large frames
-   * materialized its whole tail (bounded only by the 64 MiB soft-snapshot threshold) on
-   * the REST heap. The seed cursor is also opened UNDER A REPLAY PERMIT (below) so its
-   * concurrency shares the same `maxInFlightReplays` budget as `replay()` rather than
-   * being bounded only by the number of distinct rooms, and the caller in
-   * {@link handleOps} runs this behind the per-connection rate gate, so a cheap flood of
-   * new frames can neither drive an unbounded read, spawn unbounded concurrent scans,
-   * nor bypass the limiter. The O(1) persisted per-actor/clock high-water yujiawei
-   * preferred stays DEFERRED (it needs a snapshot-row/append-transaction schema change);
-   * the byte-bounded scan + permit + rate gate removes the operational DoS without it.
-   */
-  private async ensureRoomLamport(docId: string, holdsReplayPermit = false): Promise<number> {
-    if (!this.roomLamportSeeded.has(docId)) {
-      let seed = 0
-      const actorSeq = new Map<string, number>()
-      // Fold one op's per-actor `s` into the actor high-water (XIN-1800 P0-1).
-      const foldActor = (raw: unknown): void => {
-        if (typeof raw !== 'object' || raw === null) return
-        const o = raw as { a?: unknown; s?: unknown }
-        if (typeof o.a === 'string' && typeof o.s === 'number' && o.s > (actorSeq.get(o.a) ?? 0)) {
-          actorSeq.set(o.a, o.s)
-        }
-      }
-      const foldFrame = (frame: unknown): void => {
-        const ops = Array.isArray((frame as { ops?: unknown })?.ops) ? (frame as { ops: unknown[] }).ops : []
-        const clock = maxFrameClock(ops)
-        if (clock > seed) seed = clock
-        for (const raw of ops) foldActor(raw)
-      }
-      // P2-1 (XIN-1807): a snapshot that COVERS ops (`coveredSeq > 0`) but carries NO
-      // persisted `state` (a pre-Part-B row, or one written by an earlier build) cannot
-      // seed the per-actor high-water or the room clock — its covered ops may be pruned,
-      // so seeding from the empty view would REGRESS both watermarks below what the room
-      // durably advanced, permanently refusing every reconnecting session (the mirror of
-      // P0-1). Fail CLOSED (retryable) rather than seed from a partial view.
-      const requireSeedableSnapshot = (snap: { coveredSeq: number; state: unknown } | null | undefined): void => {
-        if (snap && snap.coveredSeq > 0 && (snap.state === null || snap.state === undefined)) {
-          throw new RetryableStorageError('covered-but-stateless snapshot: refusing to seed room clock from a partial view')
-        }
-      }
-      let release: (() => void) | null = null
-      try {
-        // Prefer the store's byte-aware replay cursor: it reads the snapshot + high-water
-        // from one consistent point and pages the un-snapshotted tail bounded by
-        // `replayPageBytes`, so one page can never materialize the whole tail in memory
-        // (XIN-1807 P1-1). Fall back to the bounded-row `opsSince` loop for a store
-        // without `openReplay`.
-        if (this.store.openReplay) {
-          // Acquire a replay permit around the durable-tail seed cursor so it shares the
-          // SAME in-flight bound as `replay()` (XIN-1807 P1-1). Both open the same kind of
-          // cursor; without a permit here the number of concurrent durable-tail scans was
-          // bounded only by the count of distinct rooms, not by `maxInFlightReplays`. A
-          // permit-acquire timeout throws a retryable storage error (below), so the frame
-          // is refused `storage-retry` rather than blocking unboundedly. When the caller
-          // ALREADY holds a replay permit (the `replay()` -> `seedConnNextS` path), we must
-          // NOT re-acquire — a single-slot config would self-deadlock — so the seed cursor
-          // reuses the caller's permit instead.
-          if (!holdsReplayPermit) {
-            release = await this.replaySemaphore.acquire(this.limits.replayAcquireTimeoutMs)
-          }
-          const cursor = await this.store.openReplay(docId, 0, {
-            pageRows: this.limits.replayPageSize,
-            pageBytes: this.limits.replayPageBytes,
-          })
-          try {
-            requireSeedableSnapshot(cursor.snapshot)
-            seed = cursor.snapshot?.state?.lamport ?? 0
-            for (const [a, s] of Object.entries(cursor.snapshot?.state?.vv ?? {})) {
-              if (typeof s === 'number' && s > (actorSeq.get(a) ?? 0)) actorSeq.set(a, s)
-            }
-            for (;;) {
-              const page = await cursor.nextPage()
-              if (page.length === 0) break
-              for (const op of page) foldFrame(op.frame)
-            }
-          } finally {
-            await cursor.close()
-          }
-        } else {
-          const snap = await this.store.getSnapshot(docId)
-          requireSeedableSnapshot(snap)
-          seed = snap?.state?.lamport ?? 0
-          for (const [a, s] of Object.entries(snap?.state?.vv ?? {})) {
-            if (typeof s === 'number' && s > (actorSeq.get(a) ?? 0)) actorSeq.set(a, s)
-          }
-          let cursor = snap?.coveredSeq ?? 0
-          for (;;) {
-            const page = await this.store.opsSince(docId, cursor, this.limits.replayPageSize)
-            if (page.length === 0) break
-            for (const op of page) foldFrame(op.frame)
-            const last = page[page.length - 1]!.seq
-            if (last <= cursor) break
-            cursor = last
-          }
-        }
-      } catch (err) {
-        throw new RetryableStorageError('room clock seed read failed', { cause: err })
-      } finally {
-        // Release the replay permit acquired around the seed cursor (XIN-1807 P1-1),
-        // whether the scan completed, threw, or the snapshot was rejected fail-closed.
-        release?.()
-      }
-      // Do not clobber a clock already advanced by frames that landed during the seed
-      // read (the room chain serializes appends, but the seed read itself awaits).
-      this.roomLamport.set(docId, Math.max(seed, this.roomLamport.get(docId) ?? 0))
-      // Merge the seeded per-actor high-water without regressing any value a concurrent
-      // accepted frame already advanced during the seed read.
-      const existing = this.roomActorSeq.get(docId) ?? new Map<string, number>()
-      for (const [a, s] of actorSeq) if (s > (existing.get(a) ?? 0)) existing.set(a, s)
-      this.roomActorSeq.set(docId, existing)
-      this.roomLamportSeeded.add(docId)
-    }
-    return this.roomLamport.get(docId) ?? 0
-  }
-
-  /**
-   * Seed a server-minted-actor connection's per-actor `s` gate from durable room state
-   * and return the next `s` it MUST mint — the value published in `ready.nextS` and
-   * enforced by the contiguity gate (XIN-1807 P0-1). Idempotent per connection
-   * (`nextSSeeded`), so the `ready`-time seed here and the ops-gate's first-frame seed
-   * agree: what `ready` advertises is exactly what the gate then checks. Awaits
-   * {@link ensureRoomLamport} (idempotent per room), which folds the snapshot version
-   * vector + the un-snapshotted durable tail into {@link roomActorSeq}, then reads this
-   * actor's durable high-water. Returns undefined for a legacy connection (no
-   * server-minted actor => no per-actor gate, so nothing to publish). A seed-read
-   * failure propagates as a retryable storage error; the `ready` publisher catches it
-   * (a seed read that failed must not break an otherwise-serviceable replay — the
-   * client then recovers via the in-band refusal `nextS`), while the ops gate maps it
-   * to `storage-retry`.
-   */
-  private async seedConnNextS(conn: Conn, holdsReplayPermit = false): Promise<number | undefined> {
-    if (!conn.actorBound || conn.actor === undefined) return undefined
-    if (!conn.nextSSeeded) {
-      await this.ensureRoomLamport(conn.docId, holdsReplayPermit)
-      const durableS = this.roomActorSeq.get(conn.docId)?.get(conn.actor) ?? 0
-      conn.nextS = durableS + 1
-      conn.nextSSeeded = true
-    }
-    return conn.nextS
-  }
-
-  /**
-   * Compute the per-actor `s` to ADVERTISE in `ready.nextS` WITHOUT pinning the
-   * connection's gate state (XIN-1807 P0-1). A pure read of the durable per-actor
-   * high-water + 1 (via the idempotent {@link ensureRoomLamport} seed). Deliberately
-   * does NOT set {@link Conn.nextSSeeded}: the ops gate re-seeds authoritatively on the
-   * first frame ({@link seedConnNextS}), so a concurrent SAME-actor commit landing
-   * between this `ready` and that frame is still caught — the frame is refused with the
-   * corrected `nextS` rather than silently persisting a duplicate `(actor,s)`. Pinning
-   * here instead would let two live sockets under one actor both be handed, and then
-   * ENFORCE, `s=1`. Returns the already-seeded value when the gate has run, or undefined
-   * for a legacy connection (no per-actor gate). Throws (retryable) only via
-   * `ensureRoomLamport`; the `ready` publisher swallows that and omits `nextS`.
-   */
-  private async peekNextS(conn: Conn, holdsReplayPermit = false): Promise<number | undefined> {
-    if (!conn.actorBound || conn.actor === undefined) return undefined
-    if (conn.nextSSeeded) return conn.nextS
-    await this.ensureRoomLamport(conn.docId, holdsReplayPermit)
-    const durableS = this.roomActorSeq.get(conn.docId)?.get(conn.actor) ?? 0
-    return durableS + 1
-  }
-  /**
    * Emit the positive `ack` for a pure re-ack of an already-durable DUPLICATE
    * frame (its original ack was lost) at its stored `seq`. Reads the current
    * snapshot version for the ack envelope (a read failure keeps the re-ack — the
@@ -2462,99 +2124,24 @@ export class PptRelay {
         return
       }
     }
-    // ── Trust boundary for a genuinely NEW write (XIN-1789 D1 / P1-1/1-2/1-3) ──
-    // These gates apply ONLY when the frameId is UNKNOWN (`known === null`). A frame
-    // whose frameId is already in the ledger is a duplicate, even when we could not
-    // payload-verify it here (a NULL-hash row whose op was pruned, XIN-1792 P2-3):
-    // running the per-actor `s`-continuity gate on it would refuse it `protocol-version`
-    // (its `s` is behind the already-advanced `nextS`) BEFORE `appendOp`'s unique
-    // `(docId, frameId)` reconciliation could re-ack it. `appendOp` is the authoritative
-    // dedup and STILL enforces the actor: the canonical payload hash includes `a`, so a
-    // resend re-attributed to a different actor mismatches the stored row and is refused
-    // `DuplicateFramePayloadError` there — no gate is bypassed, only reordered after the
-    // dedup that owns it.
+    // Rate-gate a genuinely NEW write (XIN-1800 P1-1). This applies ONLY when the
+    // frameId is UNKNOWN (`known === null`); a frame whose frameId is already in the
+    // ledger is a duplicate and was re-acked above. A pure re-ack (`known !== null`)
+    // returns above and is deliberately never rate-limited (idempotent-resend
+    // contract), so gating here — the first point a NEW mutation is known — sheds a
+    // flood before it can persist, mirroring the inbound-queue shed.
+    //
+    // NOTE (Half A): the op-metadata trust boundary — server-minted actor binding,
+    // the room-relative clock bound, and the per-actor `s`-continuity gate — is
+    // deliberately NOT enforced here. Half A accepts any structurally-valid Bento op
+    // (charset/shape/coarse-bounds checked by `opsAreValid`) and relies on the durable
+    // sequencing + snapshot-materialization proof for safety, not on op-metadata trust.
+    // That boundary moves to Half B (paired with R4-F1); see XIN-1810 split seam.
     if (known === null) {
-      // Rate-gate a genuinely NEW frame BEFORE the durable room-clock / per-actor-seq
-      // seed read (XIN-1800 P1-1). `ensureRoomLamport` pages the durable tail on the
-      // first new frame in a room; leaving it ahead of the limiter let the cheapest
-      // client action drive that read on the per-room chain in the REST process with
-      // the rate limiter never consulted. A pure re-ack (`known !== null`) returns
-      // above and is deliberately never rate-limited (idempotent-resend contract), so
-      // gating here — the first point a NEW mutation is known — sheds a flood before it
-      // can seed or persist, mirroring the inbound-queue shed.
       const retryInMs = this.rateLimited(conn.frameTimes)
       if (retryInMs !== null) {
         this.refuse(conn, 'rate-limited', { k, frameId, retryInMs })
         return
-      }
-      // Actor binding. When the credential carried a server-minted actor claim
-      // (`actorBound`), the connection's actor is FIXED at issuance from the
-      // authenticated uid: refuse any op whose `a` differs, so the client can neither
-      // choose nor forge which actor its ops are attributed to (P0-2 impersonation /
-      // co-editor censorship). On a legacy credential (no actor claim) fall back to the
-      // pre-D1 behavior — pin the actor on this first frame and refuse a later switch.
-      if (conn.actorBound) {
-        if (frameActor !== conn.actor) {
-          this.refuse(conn, 'protocol-version', { k, frameId, message: 'op actor is not the authenticated actor' })
-          return
-        }
-      } else if (conn.actor === undefined) {
-        conn.actor = frameActor
-      } else if (conn.actor !== frameActor) {
-        this.refuse(conn, 'protocol-version', { k, frameId, message: 'ops actor does not match the connection actor' })
-        return
-      }
-      // Relative op-metadata bounds (P1-2 / P1-3). `l` (Lamport) and a `txt` op's seed
-      // generation `sd[0]` are both room-clock values the engine folds in via
-      // `lamport = max(lamport, value)`. An absolute cap admits a value far above the
-      // room's live clock that pins it at a ceiling and invalidates every legitimate
-      // successor; bound them RELATIVE to the room's live clock instead. Seeded from the
-      // durable snapshot state AND the un-snapshotted tail (XIN-1792 P1-2), so a fresh
-      // joiner or a room rejoined after eviction inheriting the serialized clock is
-      // never over-cap.
-      let roomLamport: number
-      try {
-        roomLamport = await this.ensureRoomLamport(conn.docId)
-      } catch (err) {
-        const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
-        this.refuse(conn, code, { k, frameId, message: 'room clock unavailable' })
-        return
-      }
-      const frameClock = maxFrameClock(frame.ops)
-      if (frameClock > roomLamport + OP_CLOCK_SLACK) {
-        this.refuse(conn, 'protocol-version', { k, frameId, message: 'op clock exceeds the room clock bound' })
-        return
-      }
-      // Per-actor `s` continuity (P1-1), server-minted actors only. A fresh session's
-      // Bento `SyncState` mints `s` contiguously from 1; require the frame's ops to be
-      // exactly `nextS, nextS+1, …` so one wire-legal skip/reorder/repeat can no longer
-      // manufacture an unfillable per-actor gap that freezes room GC forever. A legacy
-      // (first-frame-pinned) actor's `s` sequence is not server-trusted, so it is not
-      // gated here. `nextS` advances only after the write is durable (below).
-      if (conn.actorBound) {
-        // Seed `nextS` from the durable per-actor high-water on first use (XIN-1800
-        // P0-1 / XIN-1807 P0-1). `roomActorSeq` was folded from the snapshot vv + the
-        // un-snapshotted tail by `ensureRoomLamport` (awaited just above, and again
-        // idempotently inside the helper), so a session that keeps its replica identity
-        // across a reconnect continues its sequence (next mint = high-water+1) instead
-        // of resetting to 1. The SAME helper seeds `ready.nextS` at (re)join, so the
-        // value the client was handed is exactly the value enforced here. Without this a
-        // reconnecting session either had every write PERMANENTLY refused (it sends `s =
-        // last+1` but the gate expects 1) or, on a fresh-engine restart at `s = 1`,
-        // silently persisted a duplicate `(actor,s)` the reducer drops — both reproduced
-        // by yujiawei.
-        await this.seedConnNextS(conn)
-        const sValues = (frame.ops as Array<{ s?: unknown }>).map((op) => op.s)
-        const contiguous = sValues.every((s, i) => s === conn.nextS + i)
-        if (!contiguous) {
-          // Attach the expected `nextS` so a client that rebuilt its engine and
-          // restarted `s` too low recovers IN BAND — re-seeds from `nextS - 1` and
-          // resends — instead of being permanently refused with no recoverable
-          // signal (XIN-1807 P0-1). `ready.nextS` already publishes this on (re)join;
-          // the refusal is the recovery surface if a client still lands off it.
-          this.refuse(conn, 'protocol-version', { k, frameId, message: 'op sequence is not contiguous for this actor', nextS: conn.nextS })
-          return
-        }
       }
     }
     // Not a known duplicate (or a NULL-hash row we could not verify as one): enforce
@@ -2635,27 +2222,6 @@ export class PptRelay {
     }
     if (!duplicate) {
       this.roomBytes.set(conn.docId, roomUsed + frameBytes)
-      // The write is durable: advance the room's live clock past the ops it carried,
-      // and (server-minted actor only) the per-actor sequence to the next contiguous
-      // `s`, so subsequent frames are bounded against the values now in the room
-      // (XIN-1789 P1-1/1-2/1-3). Both advance ONLY on a genuine new commit — a
-      // duplicate re-ack (which never reaches here) must not move either watermark.
-      const current = this.roomLamport.get(conn.docId) ?? 0
-      const advanced = Math.max(current, maxFrameClock(frame.ops))
-      if (advanced > current) this.roomLamport.set(conn.docId, advanced)
-      if (conn.actorBound && conn.actor !== undefined) {
-        conn.nextS += frame.ops.length
-        // Advance the room's durable per-actor high-water too (XIN-1800 P0-1), so a
-        // LATER socket under the same stable actor (a reconnect, or a concurrent
-        // second socket) re-derives its `nextS` past this commit — a stale `s` from a
-        // rebuilt engine is then VISIBLY refused, never silently persisted as a
-        // duplicate `(actor,s)`. Ops are contiguous from the old `nextS`, so the
-        // highest `s` this frame carried is the new `nextS - 1`.
-        const lastS = conn.nextS - 1
-        const perActor = this.roomActorSeq.get(conn.docId) ?? new Map<string, number>()
-        if (lastS > (perActor.get(conn.actor) ?? 0)) perActor.set(conn.actor, lastS)
-        this.roomActorSeq.set(conn.docId, perActor)
-      }
     }
 
     // Post-commit: the write is DURABLE, so the sender MUST get an ack (never a

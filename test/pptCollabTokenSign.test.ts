@@ -46,22 +46,6 @@ describe('PPT collab token + one-time ticket (§7.1)', () => {
     expect(r.token).not.toBe(r.ticket)
   })
 
-  it('delivers the pre-connect actor + nextS hint only when an actor is bound (XIN-1807 P0-1)', () => {
-    // No actor bound: no per-actor gate, so no actor/nextS in the response.
-    const legacy = issuePptCollabToken(base)
-    expect(legacy.actor).toBeUndefined()
-    expect(legacy.nextS).toBeUndefined()
-    // Actor bound: both the actor (P0-1 delivery) and the pre-connect nextS lower-bound
-    // hint are delivered so a fresh client can pre-seed its replica before the socket
-    // opens. The authoritative value is `ready.nextS`; this is a hint (default 1).
-    const bound = issuePptCollabToken({ ...base, actor: 'aabbccdd', nextS: 1 })
-    expect(bound.actor).toBe('aabbccdd')
-    expect(bound.nextS).toBe(1)
-    // nextS is suppressed for a legacy (actor-less) token even if a caller passes one.
-    const noActorButNextS = issuePptCollabToken({ ...base, nextS: 5 })
-    expect(noActorButNextS.nextS).toBeUndefined()
-  })
-
   it('the relay token has aud=ppt-relay; the ticket has aud=ppt-relay-ticket + a jti', () => {
     const r = issuePptCollabToken(base)
     const tok = verifyPptRelayToken(r.token)

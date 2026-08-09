@@ -23,11 +23,10 @@
  * collab token carries.)
  */
 import jwt from 'jsonwebtoken'
-import { createHmac, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import { config } from '../config/env.js'
 import { getRedis, rkey } from '../db/redis.js'
 import type { Role } from '../permission/role.js'
-import { isValidActorId } from '../ppt/relay/frames.js'
 
 /** JWT audience for the primary relay token. */
 export const PPT_RELAY_AUD = 'ppt-relay'
@@ -48,17 +47,6 @@ export interface PptCollabClaims {
   permission_epoch: number
   /** Server-trusted display name resolved at issuance; absent when unknown. */
   name?: string
-  /**
-   * The Bento actor id this credential authors under, MINTED SERVER-SIDE from the
-   * authenticated `uid` at issuance (XIN-1789 D1 — see {@link mintCollabActor}). The
-   * relay pins the connection's actor from THIS claim, not the first frame's
-   * self-declared `op.a`, and refuses any op whose `a` differs — so the client can
-   * neither choose nor forge its actor (structurally closing the impersonation /
-   * co-editor-censorship path P0-2). A signed claim: the client cannot alter it
-   * without breaking the token signature. Absent on legacy tokens minted before D1,
-   * for which the relay falls back to the first-frame pin (XIN-1772).
-   */
-  actor?: string
   /**
    * The caller's space-membership at issuance (§4.4). Carried so the relay can
    * re-resolve the SAME effective role issuance did — folding in an
@@ -99,34 +87,6 @@ export interface PptCollabTokenResult {
   pptWsUrl?: string
   /** Trusted display name; omitted when the directory supplied none. */
   name?: string
-  /**
-   * The server-minted Bento actor id this session authors under (XIN-1792 P0-1 —
-   * the DELIVERY half of the D1 actor contract). The relay REQUIRES every `op.a` to
-   * equal this value and refuses any mismatch PERMANENTLY (`protocol-version`), so a
-   * client MUST author its Bento `SyncEngine` under exactly this actor — it can no
-   * longer mint its own. Returned here (and echoed in the relay `ready` frame) so the
-   * client seeds its replica identity WITHOUT decoding the opaque JWT, exactly as
-   * `epoch`/`snapshotVersion` are. Stable across reconnects for a fixed
-   * `clientSessionId` (XIN-1792 P0-2), so the client reuses the same actor after a
-   * blip. Populated whenever the token binds a server-minted actor — which the
-   * production `collab-token` endpoint always does (it mints one from the caller's
-   * `clientSessionId`); omitted only by low-level callers that sign a legacy
-   * actor-less token.
-   */
-  actor?: string
-  /**
-   * A pre-connect HINT for the per-actor sequence `s` the session should mint its
-   * first `ops` frame from (XIN-1807 P0-1). Computed at issuance as `(the snapshot's
-   * covered per-actor high-water for this actor) + 1`, i.e. `1` for a fresh actor with
-   * no durable ops. It is a LOWER BOUND, deliberately NOT authoritative: it is derived
-   * from the durable SNAPSHOT alone and cannot see ops still in the un-snapshotted tail
-   * (computing the tail-inclusive value at REST would mean the per-join durable-tail
-   * scan P1-1 warns against). The AUTHORITATIVE value is the relay `ready.nextS`, which
-   * the client MUST adopt on connect; this token field only lets a client pre-seed a
-   * fresh replica before the socket is open. Omitted when the token binds no
-   * server-minted actor. See {@link ../ppt/relay/frames.ts ReadyCtl.nextS}.
-   */
-  nextS?: number
 }
 
 export interface IssuePptCollabInput {
@@ -139,50 +99,6 @@ export interface IssuePptCollabInput {
   name?: string
   /** Caller's space-membership at issuance (fold-in for share-derived re-resolve). */
   spaceMember?: boolean
-  /**
-   * The server-minted Bento actor id to bind this credential to (XIN-1789 D1).
-   * Normally omitted by callers — {@link issuePptCollabToken} mints one via
-   * {@link mintCollabActor} from `uid`/`docId`. Passed explicitly only by tests that
-   * pin a deterministic actor to assert the binding.
-   */
-  actor?: string
-  /**
-   * A pre-connect lower-bound hint for the actor's next per-actor sequence `s`
-   * (XIN-1807 P0-1). Passed through verbatim to {@link PptCollabTokenResult.nextS};
-   * see that field for the authoritative-value contract. Omitted => no hint delivered.
-   */
-  nextS?: number
-}
-
-/**
- * Mint the server-side Bento actor id for a collab session (XIN-1789 D1 / XIN-1792
- * P0-2). The actor is derived from the authenticated `uid` (+ `docId` + a STABLE
- * client-supplied `session` id) so the CLIENT can never choose or forge WHICH actor
- * its ops are attributed to (the value is an HMAC over the shared collab secret,
- * truncated into the wire-accepted actor charset `[a-z0-9-]`, see
- * {@link isValidActorId}), yet the actor is STABLE for a given `(uid, docId,
- * session)` triple.
- *
- * `session` is a REQUIRED, caller-supplied identifier the client persists across
- * reconnects (XIN-1792 P0-2). A Bento actor is the identity of a CRDT *replica* — it
- * is embedded in the replica's durable structures (`vv` keys, LWW stamps `[l,a]`, RGA
- * token ids `s<l>.<a>.<i>`) and fixed at engine construction. Minting a fresh random
- * actor per issuance (the pre-P0-2 default) yielded one actor per WS connection and a
- * new one on every reconnect, so a network blip either permanently refused the
- * client's ops (its engine kept an actor the relay no longer accepts) or discarded
- * every op minted under the old actor that was not yet durable. Deriving from a
- * client-persisted session id makes the actor a property of the SESSION, not the
- * connection: the same session id reconnects to the same actor, so a byte-identical
- * idempotent resend re-acks and unsent work survives a reconnect.
- *
- * Hex output is a subset of the accepted charset; 32 hex chars (128 bits) is
- * collision-safe and well under the 64-char cap.
- */
-export function mintCollabActor(uid: string, docId: string, session: string): string {
-  return createHmac('sha256', config.collabToken.secret)
-    .update(`${uid}\u0000${docId}\u0000${session}`)
-    .digest('hex')
-    .slice(0, 32)
 }
 
 /**
@@ -193,13 +109,6 @@ export function mintCollabActor(uid: string, docId: string, session: string): st
  */
 export function issuePptCollabToken(input: IssuePptCollabInput): PptCollabTokenResult {
   const name = typeof input.name === 'string' && input.name !== '' ? input.name : undefined
-  // The actor is a signed identity claim (XIN-1789 D1): reject a caller-supplied
-  // value that is not a wire-legal actor id rather than sign an unusable token the
-  // relay would refuse on the first frame.
-  const actor = input.actor
-  if (actor !== undefined && !isValidActorId(actor)) {
-    throw new Error('invalid ppt collab actor id')
-  }
   const claims = {
     uid: input.uid,
     docId: input.docId,
@@ -208,7 +117,6 @@ export function issuePptCollabToken(input: IssuePptCollabInput): PptCollabTokenR
     permission_epoch: input.permission_epoch,
     ...(name !== undefined ? { name } : {}),
     ...(input.spaceMember !== undefined ? { space_member: input.spaceMember } : {}),
-    ...(actor !== undefined ? { actor } : {}),
   }
 
   const tokenTtl = config.collabToken.ttlSeconds
@@ -239,16 +147,6 @@ export function issuePptCollabToken(input: IssuePptCollabInput): PptCollabTokenR
   }
   if (config.ppt.relay.publicWsUrl !== '') result.pptWsUrl = config.ppt.relay.publicWsUrl
   if (name !== undefined) result.name = name
-  // Deliver the server-minted actor to the client (XIN-1792 P0-1): the relay refuses
-  // any op whose `a` differs, so a client that never learns this value would have
-  // every `ops` frame permanently refused. Seeded here alongside the token, and
-  // re-delivered on the relay `ready` frame.
-  if (actor !== undefined) result.actor = actor
-  // Deliver the pre-connect per-actor `s` hint (XIN-1807 P0-1). A LOWER BOUND from
-  // durable snapshot state, superseded by the authoritative `ready.nextS` on connect —
-  // only carried when an actor is bound (a legacy actor-less token has no per-actor
-  // gate). A caller that did not compute one leaves it omitted.
-  if (actor !== undefined && input.nextS !== undefined) result.nextS = input.nextS
   return result
 }
 
@@ -257,7 +155,7 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
     throw new Error('invalid ppt collab token payload')
   }
   const d = decoded as Record<string, unknown>
-  const { uid, docId, documentName, role, permission_epoch: epoch, name, jti, space_member: spaceMember, actor, exp } = d
+  const { uid, docId, documentName, role, permission_epoch: epoch, name, jti, space_member: spaceMember, exp } = d
   if (
     typeof uid !== 'string' ||
     typeof docId !== 'string' ||
@@ -275,10 +173,6 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
     permission_epoch: epoch,
     ...(typeof name === 'string' && name !== '' ? { name } : {}),
     ...(typeof spaceMember === 'boolean' ? { space_member: spaceMember } : {}),
-    // Only trust an actor claim that is still a wire-legal id; a malformed one is
-    // dropped so the relay treats the token as legacy (first-frame pin) rather than
-    // pinning an unusable actor (XIN-1789 D1).
-    ...(isValidActorId(actor) ? { actor } : {}),
     ...(typeof jti === 'string' ? { jti } : {}),
     ...(typeof exp === 'number' ? { exp } : {}),
   }

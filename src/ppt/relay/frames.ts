@@ -168,35 +168,6 @@ export interface ReadyCtl {
   snapshotVersion: number
   epoch: number
   role: string
-  /**
-   * The server-minted Bento actor this connection MUST author under (XIN-1792 P0-1).
-   * Delivered here as the robust surface — it survives a reauth and is available on
-   * every (re)join without re-fetching the collab token — so a client seeds its
-   * replica identity from the wire rather than by decoding the opaque JWT. The relay
-   * refuses any `op.a` that differs (permanent `protocol-version`), so a client that
-   * never learned this value would have every `ops` frame refused. Omitted only for a
-   * legacy connection that carries no server-minted actor (first-frame-pinned).
-   */
-  actor?: string
-  /**
-   * The next per-actor sequence `s` this connection MUST mint its first `ops` frame
-   * under (XIN-1807 P0-1). This is the AUTHORITATIVE value the relay's per-actor
-   * continuity gate enforces: `(the room's durable per-actor high-water for this
-   * connection's actor) + 1`, computed at (re)join from the same durable tail the
-   * gate seeds from. Published here because the value is derived from durable state
-   * the client CANNOT observe by any other means — a client whose engine survives the
-   * reconnect already holds it, but a client that REBUILDS its engine (page reload,
-   * new tab, crashed renderer) can only reconstruct from the replay, and the replay
-   * cannot reach it: the vendored engine takes its own `s` from the snapshot's version
-   * vector and SKIPS its own replayed ops, so a rebuilt engine lands on
-   * `snapshot.vv[actor] + 1` while the gate demands the tail-inclusive high-water + 1.
-   * A rebuilt client adopts THIS value (seeds its replica's per-actor sequence from
-   * `nextS - 1`) and authors from there, so its first post-reload write is accepted
-   * instead of permanently refused `protocol-version`. Omitted for a legacy connection
-   * (no server-minted actor, so no per-actor `s` gate applies), or when the durable
-   * seed read failed at join (the client falls back to the in-band refusal `nextS`).
-   */
-  nextS?: number
 }
 export interface AckCtl {
   ctl: 'ack'
@@ -215,18 +186,6 @@ export interface RefusedCtl {
   k?: number
   frameId?: string
   message?: string
-  /**
-   * The per-actor sequence `s` the relay expected, attached to a `protocol-version`
-   * refusal of an `ops` frame whose `s` was not contiguous for this actor (XIN-1807
-   * P0-1). `protocol-version` is a PERMANENT refusal, so without this an out-of-sync
-   * client (e.g. one that rebuilt its engine and restarted `s` too low) had no in-band
-   * way to learn the value the gate demands and every write stayed refused forever. A
-   * client that receives it re-seeds its replica's per-actor sequence from `nextS - 1`
-   * and resends, recovering IN BAND rather than being forced to rotate its session
-   * (which mints a different actor and discards unsent work). Present only on the
-   * contiguity refusal; absent on every other refusal.
-   */
-  nextS?: number
 }
 export interface RoleChangedCtl {
   ctl: 'role-changed'
@@ -386,31 +345,14 @@ export const ACTOR_ID_PATTERN = /^[a-z0-9-]{1,64}$/
 
 /**
  * Coarse structural ceiling for a Bento op's clock fields `s`/`l` (XIN-1772 P0-2).
- * This is now only a DEFENSE-IN-DEPTH sanity bound that keeps a wire value from
- * being an absurd near-`MAX_SAFE_INTEGER` integer; the MEANINGFUL, room-aware
- * enforcement moved to the relay (XIN-1789 P1-1/P1-2/P1-3): per-actor `s` continuity
- * ({@link OpsFrame} `s` must be contiguous under the connection's server-minted
- * actor) and a bound on `l`/`sd[0]` RELATIVE to the room's live Lamport clock (a
- * value above `roomLamport + {@link OP_CLOCK_SLACK}` is refused). An absolute cap
- * alone was insufficient: a wire-legal value FAR below this ceiling but far ABOVE the
- * room's live clock still pins the Lamport clock and invalidates every legitimate
- * successor, and a fresh joiner inheriting a serialized clock could be over an
- * absolute cap through no fault of its own. 2^45 (≈3.5e13) leaves an astronomically
- * large runway for the coarse bound while the relative bound does the real work.
+ * This is a DEFENSE-IN-DEPTH sanity bound that keeps a wire value from being an
+ * absurd near-`MAX_SAFE_INTEGER` integer. It does NOT prove a value is consistent
+ * with the room's live clock — Half A accepts any structurally-valid op metadata
+ * within this bound and relies on the durable sequencing / snapshot-materialization
+ * proof for safety, not on op-metadata trust (that trust boundary is Half B). 2^45
+ * (≈3.5e13) leaves an astronomically large runway for the coarse bound.
  */
 export const MAX_OP_CLOCK = 2 ** 45
-
-/**
- * Slack above the room's live Lamport clock the relay admits on an incoming `l` /
- * text seed `sd[0]` (XIN-1789 P1-2/P1-3). A legitimate client may be ahead of the
- * server's last-observed clock by the ops it minted while offline plus the concurrent
- * peer ops it applied but the relay has not yet serialized — so the bound must not be
- * `<= roomLamport`. 2^20 (≈1e6) is generous headroom for any real editing session
- * (a slide deck never mints a million offline ops) while still refusing a poison
- * value orders of magnitude above the live clock long before it reaches
- * {@link MAX_OP_CLOCK}.
- */
-export const OP_CLOCK_SLACK = 2 ** 20
 
 /** True for a wire-legal client actor id: `[a-z0-9-]`, non-reserved, bounded. */
 export function isValidActorId(v: unknown): v is string {
