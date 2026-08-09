@@ -238,6 +238,15 @@ export function reduceProving(
     // An empty buffer set proves every op applied so far materialized into
     // (doc, state); nothing sits in the non-serialized gap/pending buffers, so
     // this prefix survives a snapshot round-trip losslessly.
+    //
+    // This equivalence (buffer-empty ⟺ effect-in-`toJSON()`) held for gap/pending but
+    // was BROKEN by a prototype-named node id: on a plain-object engine map,
+    // `pos['__proto__'] = …` wrote through the prototype accessor, so an op that left
+    // both buffers ("applied") had its effect ABSENT from `toJSON()` — proven, then
+    // pruned, then lost (XIN-1821 P1-1). That vector is now closed at BOTH ends: the
+    // wire validator rejects reserved-key ids/keys, and the engine keys its maps on
+    // null-prototype objects so a reserved key is always a serialized OWN slot. The
+    // buffer probe is therefore sound again for every op the reducer can apply.
     if (engine.bufferedOps.length === 0) provenSeq = f.seq
   }
   return { doc, engine, provenSeq }

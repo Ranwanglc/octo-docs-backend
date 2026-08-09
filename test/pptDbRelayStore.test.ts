@@ -124,6 +124,13 @@ function makeDb() {
         ledger.set(frameId, { seq, payloadHash: hash })
         return []
       }
+      if (sql.includes('DELETE FROM ppt_collab_frame')) {
+        // Retention prune (XIN-1821 P1-4): `DELETE ... WHERE doc_id = ? AND seq <= ?`.
+        const [docId, seq] = p as [string, number]
+        const ledger = frames.get(docId)
+        if (ledger) for (const [fid, row] of [...ledger]) if (row.seq <= seq) ledger.delete(fid)
+        return []
+      }
     }
     // ── ppt_collab_seq: atomic counter allocate ──
     if (sql.includes('INSERT INTO ppt_collab_seq')) {
@@ -311,6 +318,10 @@ vi.mock('../src/db/pool.js', () => ({
 
 import { DbPptRelayStore } from '../src/ppt/relay/dbStore.js'
 import { canonicalPayloadHash } from '../src/ppt/relay/store.js'
+import { transaction } from '../src/db/pool.js'
+import { pptCollabFrameRepo } from '../src/db/repos/pptCollabFrameRepo.js'
+import { SnapshotColumnOverflowError, SNAPSHOT_COLUMN_MAX_BYTES } from '../src/db/repos/pptLiveSnapshotRepo.js'
+import type { Tx } from '../src/db/pool.js'
 import type { BentoDoc } from '../src/ppt/bentoDoc.js'
 
 function deck(title = 'S'): BentoDoc {
@@ -417,6 +428,28 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
     expect((db.ops.get(D) ?? new Map()).has(1)).toBe(false) // no resurrected op row
   })
 
+  it('ledger retention prune (P1-4): drops rows at/below retainThroughSeq, keeps recent ones', async () => {
+    const store = new DbPptRelayStore()
+    for (const f of ['f1', 'f2', 'f3']) await store.appendOp(D, f, { f })
+    expect(db.frames.get(D)!.size).toBe(3)
+    // Reclaim ledger rows FAR behind coverage (here: through seq 2). f1/f2 go; f3 stays,
+    // so a recent resend still re-acks its original seq.
+    await transaction((tx) => pptCollabFrameRepo.pruneLedgerThroughTx(tx as Tx, D, 2))
+    expect(await store.frameIdentity(D, 'f1')).toBeNull()
+    expect(await store.frameIdentity(D, 'f2')).toBeNull()
+    expect((await store.frameIdentity(D, 'f3'))?.seq).toBe(3)
+  })
+
+  it('ledger retention prune is a no-op when the retention window covers the whole ledger', async () => {
+    const store = new DbPptRelayStore()
+    for (const f of ['f1', 'f2']) await store.appendOp(D, f, { f })
+    // retainThroughSeq <= 0 (coveredSeq below the retention window) removes nothing —
+    // this is why the default C1 idempotent-resend contract is preserved.
+    await transaction((tx) => pptCollabFrameRepo.pruneLedgerThroughTx(tx as Tx, D, 0))
+    await transaction((tx) => pptCollabFrameRepo.pruneLedgerThroughTx(tx as Tx, D, -5))
+    expect(db.frames.get(D)!.size).toBe(2)
+  })
+
   it('legacy pruned frame identities with NULL payload_hash fail closed instead of wildcard re-acking', async () => {
     const store = new DbPptRelayStore()
     db.frames.set(D, new Map([['legacy-pruned', { seq: 1, payloadHash: null }]]))
@@ -507,6 +540,20 @@ describe('DbPptRelayStore — snapshot version atomicity (B2 / P0-3)', () => {
     const snap = await store.getSnapshot(D)
     expect(snap!.coveredSeq).toBe(3) // coverage did not rewind
     expect(snap!.snapshotVersion).toBe(1)
+  })
+
+  it('P1-3: a snapshot whose doc_json/state_json overflows the MEDIUMTEXT ceiling fails CLOSED before the write (no truncate-then-prune)', async () => {
+    const store = new DbPptRelayStore()
+    await store.appendOp(D, 'f1', { n: 1 })
+    // A doc whose JSON exceeds the 16 MiB column ceiling must be REFUSED before the
+    // upsert — a silent truncation followed by a prune would destroy the deck.
+    const huge = deck('x'.repeat(SNAPSHOT_COLUMN_MAX_BYTES + 1))
+    await expect(store.saveSnapshot({ docId: D, coveredSeq: 1, doc: huge })).rejects.toBeInstanceOf(
+      SnapshotColumnOverflowError,
+    )
+    // Nothing was written and — crucially — nothing was pruned.
+    expect(await store.getSnapshot(D)).toBeNull()
+    expect((db.ops.get(D) ?? new Map()).has(1)).toBe(true)
   })
 
   it('prune-after-durable reclaims bytes and getSnapshot reflects the latest save', async () => {

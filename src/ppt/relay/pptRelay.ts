@@ -37,6 +37,7 @@ import {
   parseClientFrame,
   opsAreValid,
   isRetryable,
+  OP_CLOCK_SLACK,
   STORAGE_RETRY_BACKOFF_MS,
   type OpsFrame,
   type SnapFrame,
@@ -124,6 +125,15 @@ export interface RelayLimits {
    * approaches the hard `maxRoomFrameBytes` cap that would refuse writes `room-full`.
    */
   snapshotSoftThresholdBytes: number
+  /**
+   * Seq-lag cap after which the snapshotter ages out a permanently-buffered op to
+   * unfreeze GC (XIN-1792 P1-3). Now operator-tunable (XIN-1821 P2 / yujiawei
+   * addendum #2): lowering it lets a deployment whose average frame is well above
+   * `maxRoomFrameBytes / lagCap` bytes force the reclaim on seq lag before the byte
+   * budget is exhausted, rather than relying solely on the byte-budget (`room-full`)
+   * trigger. Was previously hard-wired to `DEFAULT_MAX_BUFFERED_OP_LAG`.
+   */
+  maxBufferedOpLag: number
 }
 
 function defaultLimits(): RelayLimits {
@@ -151,6 +161,7 @@ function defaultLimits(): RelayLimits {
     maxInboundQueue: r.maxInboundQueue,
     maxOutboundQueue: r.maxOutboundQueue,
     snapshotSoftThresholdBytes: softDefault,
+    maxBufferedOpLag: r.maxBufferedOpLag,
   }
 }
 
@@ -361,6 +372,30 @@ function send(socket: WebSocket, frame: ServerFrame): void {
 }
 
 /**
+ * The highest Bento Lamport-clock value a frame's ops carry (XIN-1789 P1-2/P1-3,
+ * retained server-only in Half A per XIN-1821): the max over every op's `l` plus, for
+ * a `txt` op, its seed generation `sd[0]` (a Lamport value the engine folds into the
+ * clock exactly like `l`, `crdt.ts` `applyTxt`). Callers have already run `opsAreValid`,
+ * so `l` is a number and a `txt` op's `sd` is a valid `[lamport, actor]` register; the
+ * guards below stay defensive against a non-op entry so this is safe to call on any
+ * `ops` array. This is what the relay bounds RELATIVE to the room's live clock — an
+ * absolute-only cap admits a value far above the live clock that pins it at a ceiling
+ * and permanently refuses every legitimate successor (P0-2), and the seed register
+ * `sd[0]` gets no `l`-style bound at the wire so without folding it here one `txt` op
+ * could freeze an element's text forever (P0-3).
+ */
+function maxFrameClock(ops: unknown[]): number {
+  let max = 0
+  for (const op of ops) {
+    if (typeof op !== 'object' || op === null) continue
+    const o = op as { l?: unknown; op?: unknown; sd?: unknown }
+    if (typeof o.l === 'number' && o.l > max) max = o.l
+    if (o.op === 'txt' && Array.isArray(o.sd) && typeof o.sd[0] === 'number' && o.sd[0] > max) max = o.sd[0]
+  }
+  return max
+}
+
+/**
  * A counting semaphore that never admits more than `max` holders. Exported for
  * direct unit coverage of the max+1 barge invariant (P1-D).
  */
@@ -461,6 +496,23 @@ export class PptRelay {
   /** Rooms whose {@link roomBytes} has been seeded from durable state. */
   private readonly roomBytesSeeded = new Set<string>()
   /**
+   * The room's live Lamport clock high-water for the RELATIVE op-metadata bound
+   * (XIN-1789 P1-2/P1-3, retained server-only in Half A per XIN-1821). Seeded ONCE per
+   * room from the durable snapshot state's `lamport` AND the durable op tail ABOVE the
+   * snapshot's coverage (XIN-1792 P1-2), then advanced in-process by each accepted op
+   * (see the post-commit advance in {@link handleOps}). A generous {@link OP_CLOCK_SLACK}
+   * absorbs the gap between the seeded clock and any un-serialized offline work. An
+   * incoming `l` / text seed `sd[0]` above `value + OP_CLOCK_SLACK` is refused, so an
+   * admitted value can never leap the clock to a ceiling that permanently invalidates
+   * every legitimate successor. This is the ONLY op-metadata trust retained in Half A —
+   * it needs nothing from the client half (it applied to EVERY connection pre-split,
+   * outside the actor-bound branch); the actor↔uid binding and per-actor `s` gate stay
+   * deferred to Half B.
+   */
+  private readonly roomLamport = new Map<string, number>()
+  /** Rooms whose {@link roomLamport} has been seeded from durable snapshot state. */
+  private readonly roomLamportSeeded = new Set<string>()
+  /**
    * Per-room serialization chain for seq-allocating frames (`ops`/`snap`).
    * `onMessage` is fire-and-forget (`void`), so without this two concurrent
    * writers could allocate seq 1 and 2 but broadcast 2 before 1 — peers would
@@ -496,7 +548,7 @@ export class PptRelay {
     this.replaySemaphore = new Semaphore(this.limits.maxInFlightReplays)
     this.snapshotter = new PptSnapshotter(
       this.store,
-      undefined,
+      this.limits.maxBufferedOpLag,
       deps.onAgedOpDrop,
     )
     this.baseDocProvider = deps.baseDocProvider
@@ -757,6 +809,10 @@ export class PptRelay {
       // state when the room is next joined, so this only bounds memory.
       this.roomBytes.delete(conn.docId)
       this.roomBytesSeeded.delete(conn.docId)
+      // Same for the room's live Lamport clock — it re-seeds from the durable
+      // snapshot + un-snapshotted tail on the next join (XIN-1789 P1-2/P1-3).
+      this.roomLamport.delete(conn.docId)
+      this.roomLamportSeeded.delete(conn.docId)
       // Evict the room's doc-status cache entry too, so a churn of short-lived
       // rooms cannot grow the cache unbounded (XIN-1736 P2-b). It re-populates on
       // the next join within its short TTL.
@@ -1962,6 +2018,105 @@ export class PptRelay {
   }
 
   /**
+   * Return the room's live Lamport clock high-water for the RELATIVE op-metadata bound
+   * (XIN-1789 P1-2/P1-3, server-only bound retained in Half A per XIN-1821), seeding it
+   * ONCE per room from durable state. Seeded from the durable snapshot state's `lamport`
+   * AND the max `l`/`sd[0]` in the durable op tail ABOVE the snapshot's coverage
+   * (XIN-1792 P1-2), then advanced in-process by each accepted op.
+   *
+   * Seeding from the SNAPSHOT ALONE was insufficient: the clock is dropped when the last
+   * socket leaves ({@link removeFromRoom}) and a frame may legitimately sit up to
+   * `OP_CLOCK_SLACK` above the snapshot's clock, so after a room empties and rejoins the
+   * seed would regress to the snapshot value while clients that applied the tail are at
+   * `snapshotLamport + slack` — their next honest mint is `+1` beyond the bound and
+   * PERMANENTLY refused. Folding the tail's max `l`/`sd[0]` into the seed makes the bound
+   * track what the room has actually observed. The snapshot / tail read failing is
+   * RETRYABLE: the caller must not admit a frame against an unknown clock.
+   *
+   * The tail scan is BYTE-BOUNDED via the store's byte-aware {@link ReplayCursor} (each
+   * page materializes at most ~`replayPageBytes` of op JSON) and runs UNDER A REPLAY
+   * PERMIT so its concurrency shares the same `maxInFlightReplays` budget as `replay()`;
+   * the caller in {@link handleOps} runs it BEHIND the per-connection rate gate, so a
+   * cheap flood of new frames can neither drive an unbounded read nor bypass the limiter.
+   *
+   * NOTE (Half A scope): this seeds/tracks ONLY the room clock. The per-actor `s`
+   * high-water and the server-minted actor binding are NOT reconstructed here — that
+   * trust boundary is deferred to Half B (it depends on the client-sent `clientSessionId`).
+   */
+  private async ensureRoomLamport(docId: string): Promise<number> {
+    if (!this.roomLamportSeeded.has(docId)) {
+      let seed = 0
+      const foldFrame = (frame: unknown): void => {
+        const ops = Array.isArray((frame as { ops?: unknown })?.ops) ? (frame as { ops: unknown[] }).ops : []
+        const clock = maxFrameClock(ops)
+        if (clock > seed) seed = clock
+      }
+      // P2-1 (XIN-1807): a snapshot that COVERS ops (`coveredSeq > 0`) but carries NO
+      // persisted `state` cannot seed the room clock — its covered ops may be pruned, so
+      // seeding from the empty view would REGRESS the clock below what the room durably
+      // advanced, permanently refusing every reconnecting session. Fail CLOSED (retryable)
+      // rather than seed from a partial view.
+      const requireSeedableSnapshot = (snap: { coveredSeq: number; state: unknown } | null | undefined): void => {
+        if (snap && snap.coveredSeq > 0 && (snap.state === null || snap.state === undefined)) {
+          throw new RetryableStorageError('covered-but-stateless snapshot: refusing to seed room clock from a partial view')
+        }
+      }
+      let release: (() => void) | null = null
+      try {
+        // Prefer the store's byte-aware replay cursor: it reads the snapshot + high-water
+        // from one consistent point and pages the un-snapshotted tail bounded by
+        // `replayPageBytes`, so one page can never materialize the whole tail in memory
+        // (XIN-1807 P1-1). Fall back to the bounded-row `opsSince` loop for a store
+        // without `openReplay`.
+        if (this.store.openReplay) {
+          // Acquire a replay permit around the durable-tail seed cursor so it shares the
+          // SAME in-flight bound as `replay()`. A permit-acquire timeout throws a retryable
+          // storage error (below), so the frame is refused `storage-retry` rather than
+          // blocking unboundedly.
+          release = await this.replaySemaphore.acquire(this.limits.replayAcquireTimeoutMs)
+          const cursor = await this.store.openReplay(docId, 0, {
+            pageRows: this.limits.replayPageSize,
+            pageBytes: this.limits.replayPageBytes,
+          })
+          try {
+            requireSeedableSnapshot(cursor.snapshot)
+            seed = cursor.snapshot?.state?.lamport ?? 0
+            for (;;) {
+              const page = await cursor.nextPage()
+              if (page.length === 0) break
+              for (const op of page) foldFrame(op.frame)
+            }
+          } finally {
+            await cursor.close()
+          }
+        } else {
+          const snap = await this.store.getSnapshot(docId)
+          requireSeedableSnapshot(snap)
+          seed = snap?.state?.lamport ?? 0
+          let cursor = snap?.coveredSeq ?? 0
+          for (;;) {
+            const page = await this.store.opsSince(docId, cursor, this.limits.replayPageSize)
+            if (page.length === 0) break
+            for (const op of page) foldFrame(op.frame)
+            const last = page[page.length - 1]!.seq
+            if (last <= cursor) break
+            cursor = last
+          }
+        }
+      } catch (err) {
+        throw new RetryableStorageError('room clock seed read failed', { cause: err })
+      } finally {
+        release?.()
+      }
+      // Do not clobber a clock already advanced by frames that landed during the seed
+      // read (the room chain serializes appends, but the seed read itself awaits).
+      this.roomLamport.set(docId, Math.max(seed, this.roomLamport.get(docId) ?? 0))
+      this.roomLamportSeeded.add(docId)
+    }
+    return this.roomLamport.get(docId) ?? 0
+  }
+
+  /**
    * Emit the positive `ack` for a pure re-ack of an already-durable DUPLICATE
    * frame (its original ack was lost) at its stored `seq`. Reads the current
    * snapshot version for the ack envelope (a read failure keeps the re-ack — the
@@ -2017,12 +2172,13 @@ export class PptRelay {
     }
     // Structural single-actor check (XIN-1772 P0-2): every op in a frame is authored
     // by ONE actor. `opsAreValid` has already charset-restricted each `op.a` (no
-    // client can mint the reserved `@relay` reducer actor). The check that the frame's
-    // actor matches the CONNECTION's actor — and the per-actor `s` continuity gate —
-    // is deferred until AFTER the known-duplicate re-ack lookup below (XIN-1789 D1):
-    // an idempotent resend flushed after a page reload carries the session's freshly
-    // minted actor, so it must re-ack on `frameId` before any actor/identity check, or
-    // it would be permanently refused `protocol-version` for a write that committed.
+    // client can mint the reserved `@relay` reducer actor) and rejected reserved-key
+    // ids/keys (XIN-1821 P0-4). Binding that actor to the CONNECTION (server-minted
+    // actor↔uid) and the per-actor `s`-continuity gate are DEFERRED to Half B (they
+    // depend on the client-sent `clientSessionId`); Half A keeps only this shape-level
+    // check plus the server-only room-relative clock bound enforced below. The relay is
+    // gated OFF by default (XIN-1821) so the deferred actor impersonation (P0-1) is
+    // unreachable in production until Half B lands.
     const frameOps = frame.ops as Array<{ a?: unknown }>
     const frameActor = frameOps[0]!.a
     if (typeof frameActor !== 'string' || !frameOps.every((op) => op.a === frameActor)) {
@@ -2131,16 +2287,41 @@ export class PptRelay {
     // contract), so gating here — the first point a NEW mutation is known — sheds a
     // flood before it can persist, mirroring the inbound-queue shed.
     //
-    // NOTE (Half A): the op-metadata trust boundary — server-minted actor binding,
-    // the room-relative clock bound, and the per-actor `s`-continuity gate — is
-    // deliberately NOT enforced here. Half A accepts any structurally-valid Bento op
-    // (charset/shape/coarse-bounds checked by `opsAreValid`) and relies on the durable
-    // sequencing + snapshot-materialization proof for safety, not on op-metadata trust.
-    // That boundary moves to Half B (paired with R4-F1); see XIN-1810 split seam.
+    // NOTE (Half A, XIN-1821): the op-metadata trust boundary is SPLIT. The server-only
+    // RELATIVE room-clock bound on `l`/`sd[0]` IS enforced here (below) — it needs
+    // nothing from the client half and closes P0-2 (a wire-legal Lamport value above the
+    // room clock permanently bricks the deck) and P0-3 (an unbounded `txt` seed `sd[0]`
+    // freezes an element's text). The server-minted actor↔uid binding and the per-actor
+    // `s`-continuity gate remain DEFERRED to Half B (paired with R4-F1): they depend on
+    // the client sending `clientSessionId`, and while deferred the relay is gated OFF by
+    // default (`PPT_RELAY_ENABLED`, see src/index.ts / src/api/ppt/envelope.ts) so the
+    // remaining P0-1 (actor impersonation) is UNREACHABLE in production.
     if (known === null) {
       const retryInMs = this.rateLimited(conn.frameTimes)
       if (retryInMs !== null) {
         this.refuse(conn, 'rate-limited', { k, frameId, retryInMs })
+        return
+      }
+      // Relative op-metadata bound (P0-2 / P0-3). `l` (Lamport) and a `txt` op's seed
+      // generation `sd[0]` are both room-clock values the engine folds in via
+      // `lamport = max(lamport, value)`. An absolute cap admits a value far above the
+      // room's live clock that pins it at a ceiling and invalidates every legitimate
+      // successor; bound them RELATIVE to the room's live clock instead. Seeded from the
+      // durable snapshot state AND the un-snapshotted tail (XIN-1792 P1-2), so a fresh
+      // joiner or a room rejoined after eviction inheriting the serialized clock is
+      // never over-cap. A seed-read failure is fail-closed (retryable): never admit a
+      // frame against an unknown clock.
+      let roomLamport: number
+      try {
+        roomLamport = await this.ensureRoomLamport(conn.docId)
+      } catch (err) {
+        const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
+        this.refuse(conn, code, { k, frameId, message: 'room clock unavailable' })
+        return
+      }
+      const frameClock = maxFrameClock(frame.ops)
+      if (frameClock > roomLamport + OP_CLOCK_SLACK) {
+        this.refuse(conn, 'protocol-version', { k, frameId, message: 'op clock exceeds the room clock bound' })
         return
       }
     }
@@ -2228,6 +2409,13 @@ export class PptRelay {
     }
     if (!duplicate) {
       this.roomBytes.set(conn.docId, roomUsed + frameBytes)
+      // The write is durable: advance the room's live clock past the ops it carried, so
+      // subsequent frames are bounded against the values now in the room (XIN-1789
+      // P1-2/P1-3). Advances ONLY on a genuine new commit — a duplicate re-ack (which
+      // never reaches here) must not move the watermark.
+      const current = this.roomLamport.get(conn.docId) ?? 0
+      const advanced = Math.max(current, maxFrameClock(frame.ops))
+      if (advanced > current) this.roomLamport.set(conn.docId, advanced)
     }
 
     // Post-commit: the write is DURABLE, so the sender MUST get an ack (never a

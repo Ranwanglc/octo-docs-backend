@@ -59,7 +59,11 @@ async function main(): Promise<void> {
   // relay after wiring `sub.on('message', ...)` left a temporal-dead-zone window
   // where an invalidation arriving between subscribe and relay-construction would
   // throw a ReferenceError (XIN-1693 P2-g). It is ATTACHED to the REST HTTP server
-  // further below, once that server exists.
+  // further below, once that server exists — and ONLY when `config.ppt.relay.enabled`
+  // is true (default false). While disabled the relay is constructed but never
+  // attached, so `applyEpochBump` is a cheap no-op on empty rooms and the
+  // `/api/v1/ppt/collab` upgrade path is absent (XIN-1821: Half A ships inert until
+  // the Half B op-metadata trust boundary lands; see docs/DEPLOYMENT.md).
   const pptRelay = createPptRelay()
 
   // Subscribe to epoch invalidation events (§4.5 step 3). On an event we drop
@@ -114,9 +118,22 @@ async function main(): Promise<void> {
   // service"), NOT the Hocuspocus server above and NOT a new deployable. The relay
   // itself was constructed earlier (before the epoch subscriber that references
   // it); here we only bind it to the now-listening HTTP server.
-  pptRelay.attach(httpServer)
-  // eslint-disable-next-line no-console
-  console.log('[octo-docs] PPT relay attached on /api/v1/ppt/collab')
+  // R4-B1: the Bento-frame PPT relay is hosted INSIDE B — attached to the REST
+  // HTTP server on the `/api/v1/ppt/collab` upgrade path (owner-locked "no second
+  // service"), NOT the Hocuspocus server above and NOT a new deployable. The relay
+  // itself was constructed earlier (before the epoch subscriber that references
+  // it); here we only bind it to the now-listening HTTP server — and ONLY when the
+  // relay is enabled. Default OFF (XIN-1821): Half A carries no reachable op-metadata
+  // trust boundary yet, so the endpoint stays absent until an operator opts in via
+  // `PPT_RELAY_ENABLED=true` (Half B pairs the boundary with R4-F1).
+  if (config.ppt.relay.enabled) {
+    pptRelay.attach(httpServer)
+    // eslint-disable-next-line no-console
+    console.log('[octo-docs] PPT relay attached on /api/v1/ppt/collab')
+  } else {
+    // eslint-disable-next-line no-console
+    console.log('[octo-docs] PPT relay DISABLED (PPT_RELAY_ENABLED not set); /api/v1/ppt/collab is not mounted')
+  }
 
   // §9.4 graceful shutdown: flush docs, then release locks, then close infra.
   const shutdown = async (signal: string): Promise<void> => {

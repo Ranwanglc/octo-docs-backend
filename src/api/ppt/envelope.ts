@@ -25,6 +25,7 @@
  * bare-JSON error handler.
  */
 import { Router, json, type Request, type Response, type NextFunction } from 'express'
+import { config } from '../../config/env.js'
 import { createPptDocsRouter } from './docs.js'
 import { createPptSourceRouter } from './source.js'
 import { createPptCollabTokenRouter } from './collabToken.js'
@@ -206,8 +207,15 @@ export function createPptRouter(): Router {
   router.use(createPptDocsRouter())
   // R3-B1: source/bootstrap — GET /api/v1/ppt/docs/:docId/source.
   router.use(createPptSourceRouter())
-  // R4-B1: collab-token/ticket — POST /api/v1/ppt/docs/collab-token.
-  router.use(createPptCollabTokenRouter())
+  // R4-B1: collab-token/ticket — POST /api/v1/ppt/docs/collab-token. Mounted ONLY
+  // when the relay is enabled (default OFF, XIN-1821): issuing a relay ticket for an
+  // endpoint that is not attached would be a dead credential, and keeping issuance
+  // reachable while the op-metadata trust boundary is deferred to Half B is exactly
+  // what the reviewers flagged. With the relay disabled the path resolves to the
+  // enveloped NOT_FOUND below, same as any other unmounted PPT route.
+  if (config.ppt.relay.enabled) {
+    router.use(createPptCollabTokenRouter())
+  }
 
   // Terminal 404: any PPT path without a matching route returns the enveloped
   // NOT_FOUND rather than falling through to the app's bare-JSON handler.

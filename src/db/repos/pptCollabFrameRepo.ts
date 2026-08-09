@@ -21,10 +21,12 @@
  *    took shared next-key locks over the gap above `coveredSeq` and blocked a
  *    concurrent append there into `ER_LOCK_WAIT_TIMEOUT`).
  *
- * The mapping OUTLIVES the op row: a snapshot prunes `ppt_collab_op` but never this
- * ledger, so a re-send of a pruned frame still re-acks its original seq instead of
- * being minted a fresh one and rebroadcast as a duplicate the snapshot already
- * subsumes (XIN-1655 C1).
+ * The mapping OUTLIVES the op row: a snapshot prunes `ppt_collab_op` but a ledger row
+ * is retained well past it, so a re-send of a pruned frame still re-acks its original
+ * seq instead of being minted a fresh one and rebroadcast as a duplicate the snapshot
+ * already subsumes (XIN-1655 C1). It is NOT retained forever, though: {@link
+ * pruneLedgerThroughTx} reclaims rows FAR behind the covered watermark (beyond a large
+ * retention window) so the ledger cannot grow without bound (XIN-1821 P1-4).
  */
 import { query, type Tx } from '../pool.js'
 
@@ -130,5 +132,22 @@ export const pptCollabFrameRepo = {
       `UPDATE ppt_collab_frame SET payload_hash = ? WHERE doc_id = ? AND frame_id = ? AND payload_hash IS NULL`,
       [payloadHash, docId, frameId],
     )
+  },
+
+  /**
+   * Retention prune for the dedup ledger (XIN-1821 P1-4). Deletes ledger rows for a
+   * doc whose `seq <= retainThroughSeq`, where the caller passes a seq FAR BELOW the
+   * covered watermark (`coveredSeq - ledgerRetentionFrames`), so every recent frame —
+   * the ones an idempotent resend could still target — is preserved and only long-
+   * settled rows are reclaimed. Without this the ledger grew forever (the op table is
+   * pruned, this never was). Runs in the SAME transaction as the op prune, bounded to a
+   * single `DELETE` over the `(doc_id, seq)` prefix. `retainThroughSeq <= 0` is a no-op
+   * (nothing to reclaim yet). Losing a very old ledger row only means a stale resend is
+   * re-minted and rebroadcast; the reducer drops it as a duplicate (`op.s <= vv[op.a]`),
+   * so it is never a divergence.
+   */
+  async pruneLedgerThroughTx(tx: Tx, docId: string, retainThroughSeq: number): Promise<void> {
+    if (retainThroughSeq <= 0) return
+    await tx.query(`DELETE FROM ppt_collab_frame WHERE doc_id = ? AND seq <= ?`, [docId, retainThroughSeq])
   },
 }

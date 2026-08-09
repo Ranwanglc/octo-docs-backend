@@ -10,7 +10,7 @@ import { WebSocket } from 'ws'
 import { config } from '../src/config/env.js'
 import { PptRelay, type RelayLimits } from '../src/ppt/relay/pptRelay.js'
 import { InMemoryPptRelayStore, type PptRelayStore, RetryableStorageError, canonicalPayloadHash } from '../src/ppt/relay/store.js'
-import { isRetryable, STORAGE_RETRY_BACKOFF_MS } from '../src/ppt/relay/frames.js'
+import { isRetryable, STORAGE_RETRY_BACKOFF_MS, MAX_OP_CLOCK, OP_CLOCK_SLACK } from '../src/ppt/relay/frames.js'
 import { issuePptCollabToken, PPT_RELAY_TICKET_AUD } from '../src/auth/pptCollabToken.js'
 import type { ResolvedRole, Role } from '../src/permission/role.js'
 import type { BentoDoc } from '../src/ppt/bentoDoc.js'
@@ -2736,5 +2736,65 @@ describe('PPT relay: round-19 P0 (XIN-1759) — deliveredThrough single-source p
     expect(asAny.canAdvanceDeliveredThroughFromAuthor(stable, false)).toBe(true)
     expect(asAny.canAdvanceDeliveredThroughFromAuthor(stable, true)).toBe(false) // duplicate re-ack
     relay.close()
+  })
+})
+
+// XIN-1821 P0-2 / P0-3 (server-only bounds retained in Half A): the RELATIVE room-clock
+// bound on `l` and a `txt` op's seed `sd[0]` is re-enforced for EVERY connection. Both
+// values are folded into the engine's Lamport clock (`lamport = max(lamport, value)`), so
+// a wire-legal value far above the room's live clock would pin the clock at a ceiling and
+// permanently refuse every legitimate successor. This bound needs nothing from the client
+// half, so it stays in Half A (the actor↔uid binding + per-actor `s` gate are Half B).
+describe('PPT relay: relative room-clock bound (XIN-1821 P0-2 / P0-3)', () => {
+  it('P0-2: a near-ceiling Lamport op is refused and does NOT brick the room', async () => {
+    const h = await setup()
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    await helloReady(a)
+
+    // A frame at the ABSOLUTE ceiling passes isBentoOp but is far above the room clock
+    // (0 + OP_CLOCK_SLACK), so the relative bound refuses it — the poison never lands.
+    a.send(OPS_FRAME(1, 'poison', 0, [{ op: 'set', a: 'u-atk', s: 1, l: MAX_OP_CLOCK, k: 'x', v: 1 }]))
+    const refused = await a.recv()
+    expect(refused.ctl).toBe('refused')
+    expect(refused.code).toBe('protocol-version')
+    // Nothing was persisted, so the clock was not poisoned.
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+
+    // An honest low-clock op is still accepted — the deck is NOT bricked.
+    a.send(OPS_FRAME(2, 'honest', 0, [{ op: 'set', a: 'u-a', s: 1, l: 1, k: 'y', v: 2 }]))
+    const ack = await a.recv()
+    expect(ack.ctl).toBe('ack')
+    expect(ack.q).toBe(1)
+  })
+
+  it('P0-3: a txt op whose seed sd[0] is above the room clock is refused', async () => {
+    const h = await setup()
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    await helloReady(a)
+
+    // `l` is small but the text seed generation sd[0] is at the ceiling — maxFrameClock
+    // folds sd[0] in exactly like `l`, so the same relative bound refuses it (without
+    // this a single txt op freezes an element's text forever).
+    a.send(
+      OPS_FRAME(1, 'poison-txt', 0, [
+        { op: 'txt', a: 'u-atk', s: 1, l: 1, el: 's1e1', sd: [MAX_OP_CLOCK, 'u-atk'], base: '<p>owned</p>' },
+      ]),
+    )
+    const refused = await a.recv()
+    expect(refused.ctl).toBe('refused')
+    expect(refused.code).toBe('protocol-version')
+    expect(await h.store.currentSeq(DOC)).toBe(0)
+  })
+
+  it('accepts a legitimately-ahead op within OP_CLOCK_SLACK of the room clock', async () => {
+    const h = await setup()
+    const a = await h.connect({ uid: 'u_a', role: 'writer' })
+    await helloReady(a)
+    // A client a little ahead of the server's last-observed clock (offline work +
+    // applied peer ops) is admitted; the slack absorbs it.
+    a.send(OPS_FRAME(1, 'ahead', 0, [{ op: 'set', a: 'u-a', s: 1, l: OP_CLOCK_SLACK, k: 'x', v: 1 }]))
+    const ack = await a.recv()
+    expect(ack.ctl).toBe('ack')
+    expect(ack.q).toBe(1)
   })
 })

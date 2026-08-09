@@ -347,12 +347,30 @@ export const ACTOR_ID_PATTERN = /^[a-z0-9-]{1,64}$/
  * Coarse structural ceiling for a Bento op's clock fields `s`/`l` (XIN-1772 P0-2).
  * This is a DEFENSE-IN-DEPTH sanity bound that keeps a wire value from being an
  * absurd near-`MAX_SAFE_INTEGER` integer. It does NOT prove a value is consistent
- * with the room's live clock — Half A accepts any structurally-valid op metadata
- * within this bound and relies on the durable sequencing / snapshot-materialization
- * proof for safety, not on op-metadata trust (that trust boundary is Half B). 2^45
- * (≈3.5e13) leaves an astronomically large runway for the coarse bound.
+ * with the room's live clock — the MEANINGFUL, room-aware enforcement is the relay's
+ * RELATIVE clock bound (XIN-1821 / XIN-1789 P1-2/P1-3): a `l` / text seed `sd[0]`
+ * above `roomLamport + {@link OP_CLOCK_SLACK}` is refused, applied to EVERY connection
+ * (it needs nothing from the client half, so it is retained in Half A). An absolute
+ * cap alone was insufficient: a wire-legal value FAR below this ceiling but far ABOVE
+ * the room's live clock still pins the Lamport clock (`lamport = max(lamport, op.l)`)
+ * and invalidates every legitimate successor. The per-actor `s`-continuity gate and
+ * the server-minted actor binding remain deferred to Half B (they depend on the client
+ * sending `clientSessionId`). 2^45 (≈3.5e13) leaves an astronomically large runway for
+ * the coarse bound while the relative bound does the real work.
  */
 export const MAX_OP_CLOCK = 2 ** 45
+
+/**
+ * Slack above the room's live Lamport clock the relay admits on an incoming `l` /
+ * text seed `sd[0]` (XIN-1789 P1-2/P1-3, retained server-only in Half A per XIN-1821).
+ * A legitimate client may be ahead of the server's last-observed clock by the ops it
+ * minted while offline plus the concurrent peer ops it applied but the relay has not
+ * yet serialized — so the bound must not be `<= roomLamport`. 2^20 (≈1e6) is generous
+ * headroom for any real editing session (a slide deck never mints a million offline
+ * ops) while still refusing a poison value orders of magnitude above the live clock
+ * long before it reaches {@link MAX_OP_CLOCK}.
+ */
+export const OP_CLOCK_SLACK = 2 ** 20
 
 /** True for a wire-legal client actor id: `[a-z0-9-]`, non-reserved, bounded. */
 export function isValidActorId(v: unknown): v is string {
@@ -377,6 +395,42 @@ function isReg(v: unknown): boolean {
 }
 
 /**
+ * Reserved JS object-key names that are dangerous when used as a map key against a
+ * plain (`Object.prototype`-backed) object: `__proto__` invokes the prototype
+ * accessor rather than creating an own key, and `constructor` / `prototype` walk the
+ * chain (XIN-1821 P0-4). The vendored engine keys `pending`/`pos`/`births`/`tombs`/
+ * `txt`/`stash`/`regs` — and the persisted doc node itself, via `set` — by the bare
+ * wire id/key, so a wire-legal op naming one of these could crash the reducer (an
+ * `ins` under `id:'__proto__'` makes `pending[id]` resolve to a non-iterable
+ * `Object.prototype`) or mutate a prototype instead of the intended own key, and
+ * because the reducer is downstream of the snapshotter that permanently disables GC
+ * for the room. The engine ALSO hardens against this by using null-prototype maps, so
+ * this wire rejection is defense-in-depth (and it additionally protects the real doc
+ * node written by `set d[op.k]`, which is not an engine map). `a` is already
+ * charset-restricted so it cannot carry one; `id`/`el`/`sl`/`k` were only checked as
+ * non-empty strings.
+ */
+const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
+
+/** True for a non-empty string that is safe to use as a map / object key. */
+function isSafeKeyString(v: unknown): v is string {
+  return typeof v === 'string' && v.length > 0 && !RESERVED_KEYS.has(v)
+}
+
+/**
+ * True for a safe `set` op key. A `set` `k` is written onto the real doc node via
+ * `d[op.k]`, and a `blobs.`/`assets.` key is split on the FIRST `.` and its remainder
+ * used as a sub-map key (`doc.assets[k.slice(...)]`, `crdt.ts` `applySet`). So no
+ * `.`-delimited segment may be a reserved prototype key: `assets.__proto__` would
+ * otherwise mutate the assets map's prototype. `style.fontFamily` and the like are
+ * unaffected — only the exact reserved names are rejected (XIN-1821 P0-4).
+ */
+function isSafeSetKey(v: unknown): v is string {
+  if (typeof v !== 'string' || v.length === 0) return false
+  return !v.split('.').some((seg) => RESERVED_KEYS.has(seg))
+}
+
+/**
  * Structural validation of a single Bento `Op`. Mirrors the op shapes the vendored
  * engine mints (`src/ppt/sync/crdt.ts` `SetOp`/`InsOp`/`DelOp`/`OrdOp`/`TxtOp`) and
  * reads in `applyEffect`. Checks the discriminant (`op`), the shared `OpBase`
@@ -390,35 +444,45 @@ export function isBentoOp(op: unknown): boolean {
   // OpBase: every op carries actor + per-actor seq + lamport. `a` must be a
   // wire-legal client actor id (charset-restricted, non-reserved — a client can
   // NEVER mint the snapshot reducer's `@`-namespace actor); `s` and `l` must be
-  // positive safe integers within the op-clock bound so a crafted huge value can
-  // neither poison the Lamport clock nor manufacture an unfillable per-actor gap
-  // (XIN-1772 P0-2).
+  // positive safe integers within the coarse op-clock ceiling. The coarse ceiling is
+  // only defense-in-depth: the MEANINGFUL bound on `l` (and a `txt` op's seed `sd[0]`)
+  // is the relay's RELATIVE room-clock check in `handleOps` (`> roomLamport +
+  // OP_CLOCK_SLACK` refused), which prevents a wire-legal value above the room's live
+  // clock from poisoning the Lamport clock (XIN-1821 P0-2/P0-3, server-only bound
+  // retained in Half A). The per-actor `s`-continuity gate that would stop a
+  // non-contiguous `s` from manufacturing an unfillable gap is DEFERRED to Half B (it
+  // needs the client-sent `clientSessionId`); Half A relies on the snapshot aged-op
+  // reclaim path for a stuck gap instead.
   if (!isValidActorId(o.a) || !isBoundedOpClock(o.s) || !isBoundedOpClock(o.l)) return false
   switch (o.op) {
     case 'set':
       // node id is implicit @doc when neither el nor sl is present; `k` is required.
-      if (!isNonEmptyString(o.k)) return false
-      if (o.el !== undefined && typeof o.el !== 'string') return false
-      if (o.sl !== undefined && typeof o.sl !== 'string') return false
+      // `k` and any present `el`/`sl` are used as object keys by the engine (and `k`
+      // is written onto the real doc node via `d[op.k]`), so they must be safe keys
+      // (reject `__proto__`/`constructor`/`prototype`, XIN-1821 P0-4).
+      if (!isSafeSetKey(o.k)) return false
+      if (o.el !== undefined && !isSafeKeyString(o.el)) return false
+      if (o.sl !== undefined && !isSafeKeyString(o.sl)) return false
       return true // `v` is any (undefined = key delete)
     case 'ins':
       if (o.kind !== 'slide' && o.kind !== 'element') return false
-      if (!isNonEmptyString(o.id) || !isNonEmptyString(o.ord)) return false
+      // `id` keys the engine's pos/births/pending maps, so it must be a safe key.
+      if (!isSafeKeyString(o.id) || !isNonEmptyString(o.ord)) return false
       if (typeof o.node !== 'object' || o.node === null) return false
-      if (o.sl !== undefined && typeof o.sl !== 'string') return false
+      if (o.sl !== undefined && !isSafeKeyString(o.sl)) return false
       return true
     case 'del':
       if (o.kind !== 'slide' && o.kind !== 'element') return false
-      if (!isNonEmptyString(o.id)) return false
+      if (!isSafeKeyString(o.id)) return false
       if (o.cas !== undefined && !(Array.isArray(o.cas) && o.cas.every((c) => typeof c === 'string'))) return false
       return true
     case 'ord':
       if (o.kind !== 'slide' && o.kind !== 'element') return false
-      if (!isNonEmptyString(o.id) || !isNonEmptyString(o.ord)) return false
-      if (o.sl !== undefined && typeof o.sl !== 'string') return false
+      if (!isSafeKeyString(o.id) || !isNonEmptyString(o.ord)) return false
+      if (o.sl !== undefined && !isSafeKeyString(o.sl)) return false
       return true
     case 'txt':
-      if (!isNonEmptyString(o.el) || !isReg(o.sd)) return false
+      if (!isSafeKeyString(o.el) || !isReg(o.sd)) return false
       if (o.base !== undefined && typeof o.base !== 'string') return false
       if (o.del !== undefined && !(Array.isArray(o.del) && o.del.every((d) => typeof d === 'string'))) return false
       if (o.ins !== undefined) {

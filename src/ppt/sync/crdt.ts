@@ -329,6 +329,33 @@ export interface ApplyResult {
 const clone = <T>(v: T): T => (v === undefined ? v : JSON.parse(JSON.stringify(v)))
 
 /**
+ * A prototype-less string map (XIN-1821 P0-4/P1-1). The engine keys its internal maps
+ * — `pending`/`pos`/`births`/`tombs`/`txt`/`stash`/`regs`/`vv`/`gap`/`limbo` — by bare
+ * wire ids/keys. On a plain (`Object.prototype`-backed) object, a wire-legal id/key of
+ * `__proto__` resolves to the prototype accessor rather than an own slot: `pending['__proto__']`
+ * returns a non-iterable `Object.prototype` (crashing `for (const p of ps)` in
+ * `drainPending`, which permanently disables the room's snapshotter/GC), and an assigned
+ * effect lands on the prototype instead of an own key so it is absent from `toJSON()` (the
+ * unsound-materialization hole). A null-prototype map has no such accessor, so EVERY key —
+ * including the reserved names — is a plain own data property: reads never walk a chain and
+ * writes never mutate a prototype. The wire validator (`frames.ts isBentoOp`) also rejects
+ * these reserved names for ids/keys; this is the defense-in-depth twin that also protects a
+ * durable snapshot that predates that validator. `JSON.stringify` serializes a null-proto
+ * object's own enumerable keys identically, and `Object.assign(nullMap(), parsed)` re-homes a
+ * JSON-parsed map's own `__proto__` key as a safe own slot on load.
+ */
+function nullMap<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>
+}
+
+/** Re-home a JSON-parsed map onto a null-prototype object (see {@link nullMap}). */
+function nullMapFrom<T>(src: Record<string, T> | undefined): Record<string, T> {
+  const out = nullMap<T>()
+  if (src) Object.assign(out, src)
+  return out
+}
+
+/**
  * The engine, shape-injected. Not exported as the app-facing name — see
  * `SyncState` below.
  */
@@ -336,21 +363,21 @@ export class SyncEngine {
   actor: string
   lamport = 0
   /** per-actor max contiguous sequence applied */
-  vv: Record<string, number> = {}
+  vv: Record<string, number> = nullMap()
   private seq = 0
-  regs: Record<string, Reg> = {}
-  pos: Record<string, PosEntry> = {}
-  births: Record<string, Reg> = {}
-  tombs: Record<string, Reg> = {}
-  txt: Record<string, TxtState> = {}
+  regs: Record<string, Reg> = nullMap()
+  pos: Record<string, PosEntry> = nullMap()
+  births: Record<string, Reg> = nullMap()
+  tombs: Record<string, Reg> = nullMap()
+  txt: Record<string, TxtState> = nullMap()
   /** dead-window set values, replayed if the node resurrects */
-  stash: Record<string, Record<string, { v?: unknown; r: Reg }>> = {}
+  stash: Record<string, Record<string, { v?: unknown; r: Reg }>> = nullMap()
   /** live nodes whose winning parent is dead/absent — data parked here */
-  limbo: Record<string, SlideElement> = {}
+  limbo: Record<string, SlideElement> = nullMap()
   /** ops targeting nodes we haven't seen yet, keyed by node id */
-  private pending: Record<string, Op[]> = {}
+  private pending: Record<string, Op[]> = nullMap()
   /** out-of-order ops per actor awaiting their gap to fill */
-  private gap: Record<string, Op[]> = {}
+  private gap: Record<string, Op[]> = nullMap()
 
   /** The document shape. NO DEFAULT, deliberately: a default is how a spaces
    *  call site silently gets slides' shape and corrupts a room that then has
@@ -426,15 +453,19 @@ export class SyncEngine {
     const s = new this(actor)
     if (j.v !== SYNC_V) return s // pre-v2 state keyed elements by bare id — unusable
     s.lamport = j.lamport
-    s.vv = j.vv ?? {}
+    // Re-home every restored map onto a null-prototype object (XIN-1821 P0-4/P1-1): a
+    // durable state written before the reserved-key wire guard could carry an own
+    // `__proto__`/`constructor` key from JSON.parse; homing it here keeps a later
+    // `[id]` write from mutating a prototype instead of the intended own slot.
+    s.vv = nullMapFrom(j.vv)
     s.seq = s.vv[actor] ?? 0
-    s.regs = j.regs ?? {}
-    s.pos = j.pos ?? {}
-    s.births = j.births ?? {}
-    s.tombs = j.tombs ?? {}
-    s.txt = j.txt ?? {}
-    s.stash = j.stash ?? {}
-    s.limbo = j.limbo ?? {}
+    s.regs = nullMapFrom(j.regs)
+    s.pos = nullMapFrom(j.pos)
+    s.births = nullMapFrom(j.births)
+    s.tombs = nullMapFrom(j.tombs)
+    s.txt = nullMapFrom(j.txt)
+    s.stash = nullMapFrom(j.stash)
+    s.limbo = nullMapFrom(j.limbo)
     return s
   }
 
@@ -834,7 +865,7 @@ export class SyncEngine {
       // outrank it, so every replica lands on the same post-resurrect state
       dbg(nodeId, `set ${op.k}@${op.l},${op.a} DEAD-STASH`)
       this.regs[rk] = [op.l, op.a]
-      ;(this.stash[nodeId] ??= {})[op.k] =
+      ;(this.stash[nodeId] ??= nullMap())[op.k] =
         op.v === undefined ? { r: [op.l, op.a] } : { v: clone(op.v), r: [op.l, op.a] }
       return
     }
@@ -843,7 +874,7 @@ export class SyncEngine {
       if (op.k.startsWith('assets.') || op.k.startsWith('blobs.')) {
         const isBlob = op.k.startsWith('blobs.')
         const field = isBlob ? 'blobs' : 'assets'
-        const map = ((doc as unknown as Record<string, Record<string, unknown>>)[field] ??= {})
+        const map = ((doc as unknown as Record<string, Record<string, unknown>>)[field] ??= nullMap<unknown>())
         const ak = op.k.slice(field.length + 1)
         if (op.v === undefined) delete map[ak]
         else map[ak] = clone(op.v)
@@ -1015,7 +1046,7 @@ export class SyncEngine {
       if (!rk.startsWith(pref)) continue
       const k = rk.slice(pref.length)
       const r = clone(this.regs[rk])
-      const st = (this.stash[id] ??= {})
+      const st = (this.stash[id] ??= nullMap())
       // overwrite entries whose register is stale — the current register's
       // value (living on this node) is the authoritative parked value
       if (!(k in st) || cmpReg(st[k].r, r) !== 0)
@@ -1380,8 +1411,8 @@ export class SyncEngine {
         const src = rNode(nodeId)
         const rstash = rstate.stash?.[nodeId]?.[key]
         if (src && src[key] !== undefined)
-          (this.stash[nodeId] ??= {})[key] = { v: clone(src[key]), r: clone(rr) }
-        else if (rstash) (this.stash[nodeId] ??= {})[key] = clone(rstash)
+          (this.stash[nodeId] ??= nullMap())[key] = { v: clone(src[key]), r: clone(rr) }
+        else if (rstash) (this.stash[nodeId] ??= nullMap())[key] = clone(rstash)
         continue
       }
       const src = rNode(nodeId)
@@ -1396,7 +1427,7 @@ export class SyncEngine {
         const field = key.startsWith('blobs.') ? 'blobs' : 'assets'
         const ak = key.slice(field.length + 1)
         const rm = ((rdoc as unknown as Record<string, Record<string, unknown>>)[field] ?? {})
-        const lm = ((doc as unknown as Record<string, Record<string, unknown>>)[field] ??= {})
+        const lm = ((doc as unknown as Record<string, Record<string, unknown>>)[field] ??= nullMap<unknown>())
         if (rm[ak] === undefined) delete lm[ak]
         else lm[ak] = clone(rm[ak])
       } else if (src[key] === undefined) delete dst[key]

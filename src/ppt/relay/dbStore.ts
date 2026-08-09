@@ -28,6 +28,7 @@
  *    the bytes reclaimed so the relay's room-budget counter stays in step.
  */
 import { getPool, transaction, type Tx } from '../../db/pool.js'
+import { config } from '../../config/env.js'
 import { pptCollabFrameRepo } from '../../db/repos/pptCollabFrameRepo.js'
 import { pptCollabOpRepo } from '../../db/repos/pptCollabOpRepo.js'
 import { pptLiveSnapshotRepo } from '../../db/repos/pptLiveSnapshotRepo.js'
@@ -461,6 +462,19 @@ export class DbPptRelayStore implements PptRelayStore {
     // `DELETE`. Dropping the old `INSERT IGNORE … SELECT` also drops the shared
     // next-key locks it took over the gap above `coveredSeq`, which used to block a
     // concurrent append there into `ER_LOCK_WAIT_TIMEOUT` (XIN-1660 D2).
-    return withStoreRetry('pruneOpsThrough', () => transaction((tx) => pptCollabOpRepo.pruneThroughTx(tx, docId, coveredSeq)))
+    //
+    // In the SAME transaction, retention-prune the dedup ledger (XIN-1821 P1-4): the
+    // ledger OUTLIVES the op row (so a resend after a lost ack still re-acks), but with
+    // no retention it grew forever. We reclaim only rows FAR behind coverage — keeping
+    // the last `ledgerRetentionFrames` seqs so every recent frame an idempotent resend
+    // could target is preserved — which bounds the table to ~that many rows per doc.
+    const retainThroughSeq = coveredSeq - config.ppt.relay.ledgerRetentionFrames
+    return withStoreRetry('pruneOpsThrough', () =>
+      transaction(async (tx) => {
+        const freed = await pptCollabOpRepo.pruneThroughTx(tx, docId, coveredSeq)
+        await pptCollabFrameRepo.pruneLedgerThroughTx(tx, docId, retainThroughSeq)
+        return freed
+      }),
+    )
   }
 }

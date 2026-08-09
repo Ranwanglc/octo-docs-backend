@@ -33,6 +33,38 @@ interface RawRow {
   state_json: string | null
 }
 
+/**
+ * MySQL `MEDIUMTEXT` byte ceiling (2^24 − 1). `doc_json` and `state_json` are
+ * `MEDIUMTEXT` (`migrations/schema.sql`), so a serialized value ABOVE this cannot be
+ * stored intact: in strict mode the write errors `ER_DATA_TOO_LONG` (not a transient
+ * lock error, so `withStoreRetry` rethrows it non-retryably) and, worse, if `sql_mode`
+ * omits `STRICT_TRANS_TABLES` MySQL TRUNCATES the value with only a warning, the upsert
+ * "succeeds", `covered_seq` advances, and the relay then prunes the op log behind a
+ * truncated, unparseable `doc_json` — total, silent loss of the deck (XIN-1821 P1-3).
+ * We therefore fail CLOSED in application code BEFORE the write, so neither outcome is
+ * reachable regardless of server `sql_mode`.
+ */
+export const SNAPSHOT_COLUMN_MAX_BYTES = 16_777_215
+
+/**
+ * A snapshot whose serialized `doc_json`/`state_json` exceeds the `MEDIUMTEXT` column
+ * ceiling. Thrown BEFORE the write so the op log is never pruned behind a value that
+ * could not be persisted intact (XIN-1821 P1-3). Non-retryable by construction (it is
+ * not a transient lock error), so the relay's forced-snapshot path surfaces it as a
+ * permanent `room-full` (the deck is at storage capacity) rather than retrying forever,
+ * and the soft path leaves the op log durable. OPERATOR: alert on this — the deck's
+ * materialized state has outgrown the column and needs a schema/segmentation change.
+ */
+export class SnapshotColumnOverflowError extends Error {
+  constructor(
+    readonly column: 'doc_json' | 'state_json',
+    readonly bytes: number,
+  ) {
+    super(`ppt_live_snapshot.${column} is ${bytes} bytes, over the ${SNAPSHOT_COLUMN_MAX_BYTES}-byte MEDIUMTEXT ceiling`)
+    this.name = 'SnapshotColumnOverflowError'
+  }
+}
+
 /** Parse a persisted snapshot row (doc + optional state JSON) into the model. */
 function rowToSnapshot(row: RawRow): PptLiveSnapshot {
   const rawDoc = row.doc_json
@@ -89,17 +121,18 @@ export const pptLiveSnapshotRepo = {
    * The caller reads the authoritative post-write `(snapshot_version, covered_seq)`
    * back on the same connection.
    *
-   * ACCEPTED GROWTH (XIN-1800 P2-5): `state_json` embeds the Bento version vector
-   * `vv` — one entry per actor that ever landed an op. Actors are minted per
-   * `(uid, docId, clientSessionId)`, so a user opening N distinct client sessions on
-   * one deck accrues N permanent `vv` entries with no cap or retirement. This is
-   * bounded GROWTH, not a DoS: each entry is a short `actor:number` pair (~40 bytes),
-   * a heavily-collaborated deck reaches only hundreds, and the `state_bytes` column is
-   * already charged against the room byte budget. A per-`(uid, docId)` actor cap or a
-   * `vv`-retirement pass would bound it further but risks dropping a live replica's
-   * seq (re-introducing the very silent-loss class XIN-1800 P0-1 fixes), so it is
-   * deliberately NOT added here; documented as accepted growth per the reviewer's
-   * either/or. Revisit if a deck's `vv` is observed growing without bound in practice.
+   * STATE GROWTH (XIN-1821 P1-3): `state_json` embeds the Bento version vector `vv`
+   * (one entry per actor that ever landed an op) plus the `regs`/`tombs`/`txt`/`stash`/
+   * `limbo` maps, and NONE of them is GC'd. In Half A the actor id is CLIENT-CHOSEN
+   * (`[a-z0-9-]{1,64}`, `frames.ts`), not server-minted, so `vv` cardinality is not
+   * bounded by authenticated sessions — a writer could inflate it. Two controls keep
+   * this from becoming an unrecoverable loss: (1) the relay is gated OFF by default
+   * (`PPT_RELAY_ENABLED`), so this surface is unreachable in production until Half B
+   * lands the server-minted actor binding that re-bounds `vv`; and (2) the hard column
+   * guard below fails CLOSED before any write/prune. A `vv`-retirement / per-actor cap
+   * is deferred to Half B alongside the actor binding (adding it here, without the
+   * binding, risks dropping a live replica's seq — the silent-loss class XIN-1800 P0-1
+   * fixed). Bounding per-frame junk further is covered by the op/frame byte caps.
    */
   async upsertAdvanceTx(
     tx: Tx,
@@ -116,6 +149,12 @@ export const pptLiveSnapshotRepo = {
     const stateJson = state == null ? null : JSON.stringify(state)
     const stateSha = stateJson === null ? null : createHash('sha256').update(stateJson).digest('hex')
     const stateBytes = stateJson === null ? 0 : Buffer.byteLength(stateJson, 'utf8')
+    // Fail CLOSED before the write if either column would overflow the MEDIUMTEXT
+    // ceiling (XIN-1821 P1-3): a silent truncation followed by a prune destroys the
+    // deck. Throwing here (non-retryable) leaves the op log durable; the relay surfaces
+    // it as `room-full` on the forced path.
+    if (bytes > SNAPSHOT_COLUMN_MAX_BYTES) throw new SnapshotColumnOverflowError('doc_json', bytes)
+    if (stateBytes > SNAPSHOT_COLUMN_MAX_BYTES) throw new SnapshotColumnOverflowError('state_json', stateBytes)
     await tx.query(
       `INSERT INTO ppt_live_snapshot (doc_id, snapshot_version, covered_seq, doc_json, doc_sha, doc_bytes, state_json, state_sha, state_bytes)
        VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)

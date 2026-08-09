@@ -122,7 +122,8 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `COLLAB_TOKEN_SECRET` | **yes in prod** | signing secret for the short-lived collab JWT. Use an asymmetric key / KMS-managed secret; the HS256 default `dev-only-change-me` is dev only. |
 | `COLLAB_TOKEN_TTL_SECONDS` | no (`300`) | collab JWT TTL (5 min) |
 | `COLLAB_TOKEN_PUBLIC_WS_URL` | **yes in prod** | public, browser-reachable collab WS origin returned to clients as `collabWsUrl` (§4.4). Absolute `ws://`/`wss://` only — the Hocuspocus WS server runs on its own `:1234` origin and is **not** reverse-proxied, so a relative path never reaches it. **Fail-fast prod gate:** if `NODE_ENV=production` and this is unset or malformed the process **refuses to start** (clients no longer carry a build-time WS fallback). Optional in local dev only. |
-| `PPT_RELAY_PUBLIC_WS_URL` | **yes in prod** | public, browser-reachable origin of the Bento PPT collab relay, returned to clients as `pptWsUrl` in the collab-token response (§7.1). Absolute `ws://`/`wss://` only. The relay is hosted **inside the REST server** on the `/api/v1/ppt/collab` upgrade path (unlike the Hocuspocus WS server), so this normally points at the REST origin. **Fail-fast prod gate:** if `NODE_ENV=production` and this is unset or malformed the process **refuses to start** (same gate as `COLLAB_TOKEN_PUBLIC_WS_URL`). Optional in local dev only. |
+| `PPT_RELAY_ENABLED` | no (`false`) | **Master on/off switch for the PPT collab relay. Default OFF.** When false the relay is NOT attached to the REST server and the collab-token issuance route is NOT mounted, so `/api/v1/ppt/collab` is entirely absent. The relay currently ships as **Half A** (durable transport + snapshotting + the server-only room-relative clock bound); the op-metadata trust boundary that ties an op's actor to the authenticated uid and enforces per-actor sequence continuity is **deferred to Half B** (paired with the R4-F1 client). While that boundary is absent, an authenticated writer could submit ops under an arbitrary `a`/`s` (actor impersonation) — so **leave this OFF in production until Half B lands.** Accepts `true`/`false`/`1`/`0` only; any other value fails startup. See "PPT relay op-metadata trust model" below. |
+| `PPT_RELAY_PUBLIC_WS_URL` | **yes in prod** | public, browser-reachable origin of the Bento PPT collab relay, returned to clients as `pptWsUrl` in the collab-token response (§7.1). Absolute `ws://`/`wss://` only. The relay is hosted **inside the REST server** on the `/api/v1/ppt/collab` upgrade path (unlike the Hocuspocus WS server), so this normally points at the REST origin. **Fail-fast prod gate:** if `NODE_ENV=production` and this is unset or malformed the process **refuses to start** (same gate as `COLLAB_TOKEN_PUBLIC_WS_URL`). Optional in local dev only. Only consulted when `PPT_RELAY_ENABLED=true`. |
 | `PPT_RELAY_SYNC_PV` | no (`2`) | Bento CRDT sync protocol version the relay speaks; a frame whose `pv` differs is refused `protocol-version` before any decode. Keep in step with `ppt_doc_state.bento_sync_pv`. |
 | `PPT_RELAY_TICKET_TTL_SECONDS` | no (`30`) | one-time WS handshake ticket TTL. Short by design; the ticket is single-use across relay nodes (Redis-backed store), so a leaked/replayed ticket is useless quickly. |
 | `PPT_RELAY_MAX_FRAME_BYTES` / `PPT_RELAY_MAX_OPS_PER_FRAME` | no (`1900000` / `512`) | per-op-frame wire-byte cap and op-count cap (both `too-large`, permanent). |
@@ -138,6 +139,8 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `PPT_RELAY_AUTH_REFRESH_MS` | no (`5000`) | jittered per-connection read-auth refresh interval for live relay sockets. |
 | `PPT_RELAY_DOC_STATUS_CACHE_TTL_MS` | no (`2000`) | short doc-status cache TTL used to bound repeated status provider calls; local status-changing REST paths must invalidate by publishing the existing epoch/status bump. |
 | `PPT_RELAY_REAUTH_GRACE_MS` | no (`10000`) | grace window for a share-derived socket whose ticket membership claim just expired to present a fresh ticket via an in-place `reauth` frame before the relay fails closed. Keep it above `PPT_RELAY_AUTH_REFRESH_MS` so a read-auth refresh fires inside the window without clearing the sticky pending-reauth state. |
+| `PPT_RELAY_MAX_BUFFERED_OP_LAG` | no (`4096`) | seq-lag cap after which the snapshotter ages out a permanently-buffered op to unfreeze GC. Now operator-tunable: lower it so a room whose average frame is above `PPT_RELAY_MAX_ROOM_FRAME_BYTES / lagCap` bytes forces the reclaim on seq lag before the byte-budget (`room-full`) trigger fires. Each aged-op drop emits the `ppt_relay_aged_op_drop` alert (§6.1). |
+| `PPT_RELAY_LEDGER_RETENTION_FRAMES` | no (`262144`) | retention window (room seqs) for the `ppt_collab_frame` dedup ledger. The ledger outlives the pruned op log so a resend after a lost ack re-acks its original seq; without retention it grew forever. Ledger rows are reclaimed only once they fall this many seqs behind the covered watermark, bounding the table to ~this many rows per doc. An idempotent resend happens within seconds — far inside the window — so recent frames are always preserved; a resend older than the window is re-minted and rebroadcast but the reducer drops it as a duplicate (inert). |
 | `OCTO_IDENTITY_MODE` | no (`http`) | `http` (cross-service introspection) or `middleware` |
 | `OCTO_SERVER_BASE_URL` | when `http` | octo-server base for token→uid lookups |
 | `OCTO_SERVER_TOKEN` | no (default empty) — **set it if you want approver names on access cards** | Backend service token for octo-server, used by the server-side calls the backend makes on its own behalf (no user session available): (a) the add-member uid existence check (anti ghost-member) in `members.ts`, and (b) resolving the **approver's display name** for the access-decision result card (`decisionDisplay.ts`). For (a), leaving it empty is fine — that check falls back to the caller's own session token. For (b) there is no caller token (the card-action callback is a signed webhook), so with this unset `GET /v1/users/:uid` answers 401, the name is omitted, and the card renders octo-server's generic reviewer label instead of the real approver's name (the lookup miss is logged). Collaborator name/avatar display elsewhere is unaffected (the frontend fetches those directly with the logged-in user's token). |
@@ -452,6 +455,43 @@ from your log pipeline. Example line:
 ```
 [ppt-relay] aged-op drop (data-integrity divergence risk; alert + reconcile) {"event":"ppt_relay_aged_op_drop","docId":"…","targetSeq":42,"bufferedLag":5000,"lagCap":4096,"droppedCount":1,"dropped":[{"a":"…","s":7}]}
 ```
+
+### 6.2 PPT relay — op-metadata trust model (Half A / Half B split, XIN-1821)
+
+The PPT collab relay currently ships as **Half A**: durable transport, the dedup ledger,
+seq counter, replay, backpressure, room byte limits, the server-side snapshotter, the
+materialization proof, and the aged-op escalation above. **The relay is disabled by
+default (`PPT_RELAY_ENABLED=false`) and must stay off in production until Half B lands.**
+
+What Half A **does** enforce on op metadata (no client half required):
+
+- **Wire shape / charset.** Each op's actor `a` is charset-restricted (`[a-z0-9-]{1,64}`)
+  and the reserved reducer namespace (`@…`) is refused, and node ids / `set` keys naming a
+  reserved prototype member (`__proto__`/`constructor`/`prototype`) are rejected so a wire
+  op can neither mint the reducer actor nor crash/pollute the reduction.
+- **Room-relative clock bound.** An op's `l` (and a `txt` op's seed generation `sd[0]`) is
+  refused when it exceeds the room's live Lamport clock by more than a generous slack, so a
+  single wire-legal value cannot pin the clock at a ceiling and permanently refuse every
+  legitimate successor.
+- **Snapshot column guard.** A snapshot whose serialized `doc_json`/`state_json` would
+  exceed the 16 MiB `MEDIUMTEXT` ceiling fails closed **before** the write, so the op log is
+  never pruned behind a truncated document. If you see this, the deck's materialized state
+  has outgrown the column and needs a schema/segmentation change — it is a hard capacity
+  limit, surfaced to the client as a permanent `room-full`.
+
+What Half A **does NOT** enforce (deferred to **Half B**, paired with the R4-F1 client):
+
+- **Actor↔uid binding.** An op's `a` is NOT tied to the authenticated uid, so an
+  authenticated writer could author under another collaborator's actor (impersonation /
+  co-editor censorship). This needs the client to send a `clientSessionId` so the server can
+  mint and bind the actor.
+- **Per-actor `s` continuity.** A non-contiguous per-actor sequence is not refused at the
+  boundary (it can still park a buffered op that the aged-op path in §6.1 eventually drops).
+
+Because those two gates are absent, **the relay must not be exposed in production yet.**
+`PPT_RELAY_ENABLED=false` keeps `/api/v1/ppt/collab` unmounted and the collab-token route
+absent, so no ticket is issued and the endpoint cannot be reached. Turn it on only once
+Half B binds the actor to the authenticated identity.
 
 ---
 

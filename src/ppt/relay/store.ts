@@ -95,6 +95,16 @@ export const MAX_CANONICAL_DEPTH = 500
  *
  * Descends at most {@link MAX_CANONICAL_DEPTH} levels; a deeper payload throws
  * {@link CanonicalDepthError} rather than overflowing the stack (XIN-1739 P2).
+ *
+ * NORMALIZATION SCOPE (XIN-1821 P2-9): the known edge cases — `-0` vs `0` collapsing,
+ * `undefined` serializing to `null`, and NFC/NFD key forms hashing differently — are
+ * NOT normalized here ON PURPOSE. This hasher only ever runs on a `JSON.parse`d WIRE
+ * frame, and JSON cannot carry any of them: `-0` round-trips through `JSON.stringify`
+ * as `0` before it reaches the server, `undefined` is omitted entirely, and a client
+ * sends one byte form of a key. So the gaps are unreachable for the input this runs on.
+ * Changing the output format is also NOT free — the hash is the durable dedup identity
+ * in `ppt_collab_frame.payload_hash`, so a reformat would make every in-flight resend
+ * mismatch its stored hash and be refused. Left as-is deliberately.
  */
 export function canonicalStringify(value: unknown, depth = 0): string {
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null'
@@ -106,9 +116,8 @@ export function canonicalStringify(value: unknown, depth = 0): string {
 }
 
 /**
- * Canonical hash of a frame's SEMANTIC payload — its `ops` array ONLY, with
- * stable key order and with each op's `a` (actor) field EXCLUDED — NOT the whole
- * wire envelope.
+ * Canonical hash of a frame's SEMANTIC payload — its `ops` array ONLY, with stable
+ * key order and INCLUDING each op's `a` (actor) field — NOT the whole wire envelope.
  *
  * The envelope carries transport metadata (`t`, `pv`, `k`, `frameId`, `epoch`)
  * that legitimately varies between an original frame and an idempotent resend of
@@ -128,13 +137,15 @@ export function canonicalStringify(value: unknown, depth = 0): string {
  * and persist nothing: the client believed its newly-stamped ops were durable while
  * the server and every peer held the old-actor version — DIFFERENT ops to the
  * reducer (LWW `[l,a]` tie-breaks on actor, `vv` is actor-keyed), a silent
- * divergence and a false-positive ack for a write the server never made. With the
- * actor now SESSION-scoped (derived from `(uid, docId, clientSessionId)`, stable
- * across reconnects — XIN-1792 P0-2), a page reload → offline-queue flush resends
- * the SAME edit under the SAME actor, so the resend is byte-identical and re-acks on
- * the full canonical hash with no need to normalize `a` out. THE CLIENT CONTRACT is
- * therefore: resend queued frames byte-identically (same frameId, same ops including
- * `a`/`s`/`l`). A reused frameId carrying DIFFERENT ops is refused, as before.
+ * divergence and a false-positive ack for a write the server never made. THE CLIENT
+ * CONTRACT is therefore: resend queued frames byte-identically (same frameId, same
+ * ops including `a`/`s`/`l`), so a page reload → offline-queue flush re-acks on the
+ * full canonical hash. A reused frameId carrying DIFFERENT ops is refused, as before.
+ *
+ * (Half A note, XIN-1821: the actor is the CLIENT-CHOSEN `[a-z0-9-]{1,64}` id — the
+ * server-minted `(uid, docId, clientSessionId)` binding is deferred to Half B. This
+ * hash is unaffected: it hashes whatever `a` the ops carry, and a byte-identical
+ * resend carries the same `a`.)
  */
 export function canonicalPayloadHash(frame: unknown): string {
   const ops =

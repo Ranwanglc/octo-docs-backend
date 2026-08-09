@@ -95,3 +95,46 @@ describe('isBentoOp: op metadata trust-boundary validation (XIN-1772 P0-2)', () 
     expect(isBentoOp({ op: 'set', a: 'u1', s: MAX_OP_CLOCK + 1, l: 1, k: 'x', v: 1 })).toBe(false)
   })
 })
+
+// XIN-1821 P0-4: node ids and `set` keys are used as OBJECT KEYS by the vendored engine
+// (pending/pos/births/tombs/txt/stash + the real doc node via `set d[op.k]`). A wire-legal
+// id/key naming a reserved prototype member (`__proto__`/`constructor`/`prototype`) crashed
+// the reducer (`for (const p of pending['__proto__'])` iterated Object.prototype) — which
+// permanently disabled the room's snapshotter/GC — or mutated a prototype instead of an own
+// slot. The wire validator now rejects them (the engine ALSO uses null-proto maps as the
+// defense-in-depth twin).
+describe('isBentoOp: reserved prototype keys rejected at the wire (XIN-1821 P0-4)', () => {
+  const reserved = ['__proto__', 'constructor', 'prototype']
+
+  it('rejects a reserved node id on ins / del / ord', () => {
+    for (const id of reserved) {
+      expect(isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'slide', id, ord: 'V', node: { id } })).toBe(false)
+      expect(isBentoOp({ op: 'del', a: 'u1', s: 1, l: 1, kind: 'slide', id })).toBe(false)
+      expect(isBentoOp({ op: 'ord', a: 'u1', s: 1, l: 1, kind: 'slide', id, ord: 'a' })).toBe(false)
+    }
+  })
+
+  it('rejects a reserved el node key on txt / set, and reserved sl / el on set', () => {
+    for (const key of reserved) {
+      expect(isBentoOp({ op: 'txt', a: 'u1', s: 1, l: 1, el: key, sd: [1, 'u1'] })).toBe(false)
+      expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: 1, el: key, k: 'color', v: 'red' })).toBe(false)
+      expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: 1, sl: key, k: 'color', v: 'red' })).toBe(false)
+    }
+  })
+
+  it('rejects a reserved set key `k`, including inside an assets./blobs. path', () => {
+    for (const key of reserved) {
+      expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: 1, k: key, v: 1 })).toBe(false)
+      // `assets.__proto__` splits to the sub-map key `__proto__` (crdt.ts applySet).
+      expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: 1, k: `assets.${key}`, v: 1 })).toBe(false)
+      expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: 1, k: `blobs.${key}`, v: 1 })).toBe(false)
+    }
+  })
+
+  it('still accepts ordinary dotted / composite keys and ids', () => {
+    // Only the exact reserved segments are rejected — real keys are unaffected.
+    expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: 1, k: 'style.fontFamily', v: 'x' })).toBe(true)
+    expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: 1, k: 'assets.logo', v: 'x' })).toBe(true)
+    expect(isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'slide', id: 's1e1', ord: 'V', node: {} })).toBe(true)
+  })
+})

@@ -567,3 +567,46 @@ describe('PptSnapshotter.advance: ghost-target GC-freeze aging (XIN-1792 P1-3)',
     }
   })
 })
+
+// XIN-1821 P0-4 / P1-1: a wire-legal `ins` naming a prototype member as its node id
+// crashed the reducer (`for (const p of pending['__proto__'])` iterated Object.prototype),
+// which threw inside `reduceFrames` / the snapshotter and PERMANENTLY disabled the room's
+// snapshot + prune (GC). Reproduced by the reviewer against the real snapshotter. The
+// engine now keys its maps on null-prototype objects, so a reserved key is a plain OWN
+// slot: the reduction applies it (materialized into `toJSON()`, closing the unsound-proof
+// hole) instead of crashing, and GC runs. (The live wire path additionally rejects such
+// ids — see pptBentoOpValidation.test.ts; this guards a durable frame that predates that
+// validator and the engine reduction itself.)
+describe('reduceFrames / PptSnapshotter: a prototype-named node id cannot crash the reducer or disable GC (XIN-1821 P0-4 / P1-1)', () => {
+  const protoOps = [
+    { op: 'ins', a: 'x', s: 1, l: 1, kind: 'slide', id: '__proto__', ord: 'V', node: { id: '__proto__', elements: [] } },
+  ]
+
+  it('reduceFrames applies a prototype-named ins as an OWN key instead of throwing', () => {
+    const genesis = genesisDeck()
+    // Pre-fix this threw `TypeError: ps is not iterable`.
+    const res = reduceFrames(genesis, null, [{ seq: 1, ops: protoOps }])
+    // The effect is a real OWN-key slide present in the serialized state (materialized).
+    expect(Object.prototype.hasOwnProperty.call(res.state.pos, '__proto__')).toBe(true)
+    // And it did NOT pollute the global Object.prototype.
+    expect(Object.getPrototypeOf({})).toBe(Object.prototype)
+    expect(({} as Record<string, unknown>).elements).toBeUndefined()
+  })
+
+  it('advance() snapshots + prunes a room whose durable tail carries a prototype-named ins', async () => {
+    const store = new InMemoryPptRelayStore()
+    await store.appendOp(DOC, 'proto-1', { t: 'ops', pv: 2, k: 1, frameId: 'proto-1', epoch: 0, ops: protoOps })
+    const snapshotter = new PptSnapshotter(store)
+    // Pre-fix advance() threw here and left the op log un-prunable forever.
+    const res = await snapshotter.advance(DOC, baseDocProviderFor(genesisDeck()))
+    expect(res).not.toBeNull()
+    expect(res!.coveredSeq).toBe(1)
+    // GC actually ran: the covered op row was pruned.
+    expect(await store.currentSeq(DOC)).toBe(1)
+    const snap = await store.getSnapshot(DOC)
+    expect(snap!.coveredSeq).toBe(1)
+    // P1-1: the op's effect is IN the persisted state as an own key — proven AND
+    // materialized, never proven-then-pruned-while-absent.
+    expect(Object.prototype.hasOwnProperty.call(snap!.state!.pos, '__proto__')).toBe(true)
+  })
+})

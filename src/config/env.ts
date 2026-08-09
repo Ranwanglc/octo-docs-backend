@@ -784,6 +784,17 @@ export const config = {
     // the Hocuspocus server and NOT a new deployable. These knobs cover the
     // collab-token/ticket issuance and the relay's protocol/limit envelope.
     relay: {
+      // Master on/off switch for the R4-B1 collab relay (default OFF). When false
+      // (the default) the WS relay is NOT attached to the HTTP server and the
+      // collab-token issuance route is NOT mounted, so the `/api/v1/ppt/collab`
+      // endpoint is entirely absent — Half A is inert dead code until Half B lands
+      // the op-metadata trust boundary (server-minted actor binding + per-actor `s`
+      // continuity). This is the single control that keeps the relay's deferred
+      // trust boundary from being reachable in production before it exists (Half A
+      // still enforces the server-only room-relative clock bound; the actor/uid and
+      // per-actor sequence gates are Half B). `strictBool` so an operator typo fails
+      // startup loudly rather than silently turning the endpoint on.
+      enabled: strictBool('PPT_RELAY_ENABLED', false),
       // Bento CRDT sync protocol version the relay speaks (`SYNC_V`). A frame
       // whose `pv` is missing or != this is refused with `protocol-version`
       // BEFORE any decode/persist. Mirrors ppt_doc_state.bento_sync_pv. A protocol
@@ -814,8 +825,7 @@ export const config = {
       // op/blob caps. Previously only `ops`/`snap` were byte-capped, leaving these
       // frames an unbounded ingress a client could flood (XIN-1660 hardening).
       maxEphemeralFrameBytes: numMin('PPT_RELAY_MAX_EPHEMERAL_FRAME_BYTES', 64 * 1024, 1),
-      maxLiveBufferFrames: numMin('PPT_RELAY_MAX_LIVE_BUFFER_FRAMES', 4096, 1),
-      maxLiveBufferBytes: numMin('PPT_RELAY_MAX_LIVE_BUFFER_BYTES', 8 * 1024 * 1024, 1),
+      maxLiveBufferFrames: numMin('PPT_RELAY_MAX_LIVE_BUFFER_FRAMES', 4096, 1),      maxLiveBufferBytes: numMin('PPT_RELAY_MAX_LIVE_BUFFER_BYTES', 8 * 1024 * 1024, 1),
       // Page bounds for replay: each `openReplay` cursor reads at most this many
       // op rows and bytes per page, sends that page, then fetches the next.
       replayPageSize: numMin('PPT_RELAY_REPLAY_PAGE_SIZE', 1000, 1),
@@ -854,6 +864,25 @@ export const config = {
       // Beyond this cap the peer is closed 4410 (resync) rather than buffered further,
       // mirroring the inbound bound. Sized well above any legitimate in-flight fan-out.
       maxOutboundQueue: numMin('PPT_RELAY_MAX_OUTBOUND_QUEUE', 2048, 1),
+      // Retention window (in room seqs) for the dedup ledger `ppt_collab_frame`
+      // (XIN-1821 P1-4). The ledger is written at APPEND time and OUTLIVES the pruned
+      // op row so a resend after a lost ack re-acks its original seq instead of being
+      // re-minted and rebroadcast (XIN-1655 C1) — but with no retention it grew forever
+      // (a writer at the rate cap adds ~1.7M rows/day to a shared table). A prune keeps
+      // every ledger row within this many seqs of the covered watermark and reclaims
+      // only rows FAR below it: an idempotent resend happens within seconds, so the
+      // large default keeps clean re-ack for any realistic resend while bounding the
+      // table to ~this many rows per doc. A resend older than the window is re-minted
+      // and rebroadcast, but the op's `(a,s)` is `<= vv[a]` so every replica's reducer
+      // drops it — inert, never a divergence. Default 262144 (~2^18).
+      ledgerRetentionFrames: numMin('PPT_RELAY_LEDGER_RETENTION_FRAMES', 262_144, 1),
+      // Seq-lag cap after which the server-side snapshotter ages out a permanently
+      // buffered op to unfreeze GC (XIN-1792 P1-3). Operator-tunable (XIN-1821 / yujiawei
+      // addendum #2): a room whose average frame is above `maxRoomFrameBytes / lagCap`
+      // bytes hits the byte budget before this many seqs accumulate, so lowering it lets
+      // an operator force the reclaim on seq lag rather than relying only on the
+      // byte-budget (`room-full`) trigger. Default 4096 (mirrors the snapshotter default).
+      maxBufferedOpLag: numMin('PPT_RELAY_MAX_BUFFERED_OP_LAG', 4096, 1),
     },
   },
 } as const

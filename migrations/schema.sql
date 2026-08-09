@@ -407,17 +407,23 @@ CREATE TABLE ppt_collab_seq (
 -- resend (a CURRENT-read dedup that catches a resend whose transaction opened before
 -- the original committed), then re-acks the original seq via a locking read. The
 -- mapping OUTLIVES the op row: a snapshot prunes ppt_collab_op with a plain DELETE,
--- but this ledger is never pruned, so a re-send of a pruned frame still re-acks its
--- ORIGINAL seq instead of being minted a fresh one and rebroadcast.
+-- but this ledger is retained well PAST the op prune (a resend of a recently-pruned
+-- frame still re-acks its ORIGINAL seq instead of being minted a fresh one and
+-- rebroadcast). It is bounded, not infinite: the relay retention-prunes ledger rows
+-- FAR behind the covered watermark (keeping the last PPT_RELAY_LEDGER_RETENTION_FRAMES
+-- seqs) so the table cannot grow without bound (XIN-1821 P1-4).
 --
--- INVARIANT (ledger ⊇ op rows): this ledger is a SUPERSET of the (doc_id, frame_id)
+-- INVARIANT (ledger ⊇ live op rows): this ledger is a SUPERSET of the (doc_id, frame_id)
 -- pairs in ppt_collab_op — every persisted op has a ledger row (written at append
 -- time, and backfilled for pre-existing rows by
 -- 2026-08-07-backfill-ppt-collab-frame-ledger.sql), and the ledger additionally
--- retains mappings whose op rows were pruned. A future retention job on this table
--- MUST preserve it: only a mapping whose op row is already gone AND subsumed by a
--- durable snapshot may be dropped, never one whose op row is still live — otherwise
--- a live resend re-mints a fresh seq and rebroadcasts a duplicate (XIN-1693 P1-1).
+-- retains mappings whose op rows were pruned, up to the retention window. The retention
+-- prune MUST preserve it: it only drops mappings FAR behind coverage (seq far below
+-- covered_seq, so their op rows are already gone AND subsumed by a durable snapshot),
+-- never one whose op row is still live — a within-window resend of a live/recent frame
+-- always finds its row. A resend OLDER than the window re-mints a fresh seq and
+-- rebroadcasts, but the op's (a,s) is <= vv[a] so every reducer drops it as a
+-- duplicate — inert, never a divergence (XIN-1693 P1-1 / XIN-1821 P1-4).
 CREATE TABLE ppt_collab_frame (
   doc_id      VARCHAR(64) NOT NULL,                        -- FK-by-convention to doc_meta.doc_id (html_ppt row)
   frame_id    VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, -- globally-unique Bento frame id (dedup key)
