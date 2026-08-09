@@ -172,10 +172,14 @@ function makeDb() {
       // (an un-inlined limit no longer reaches it as a param) rather than mask it.
       const limitMatch = /LIMIT\s+(\d+)\b/i.exec(sql)
       const limit = limitMatch ? Number(limitMatch[1]) : undefined
+      // XIN-1783 P1-4: the paged replay caps at the head high-water via an inclusive
+      // `AND seq <= ?` bound (the 3rd param). Honor it so the fake reflects a cursor
+      // that converges instead of chasing ops appended after replay opened.
+      const maxSeq = sql.includes('seq <= ?') ? (p[2] as number) : Number.POSITIVE_INFINITY
       const room = ops.get(docId)
       if (!room) return []
       return [...room.values()]
-        .filter((r) => r.seq > since)
+        .filter((r) => r.seq > since && r.seq <= maxSeq)
         .sort((a, b) => a.seq - b.seq)
         .slice(0, limit ?? Number.POSITIVE_INFINITY)
         .map((r) => ({ seq: r.seq, frame_id: r.frameId, frame_json: r.frameJson }))
@@ -577,6 +581,41 @@ describe('DbPptRelayStore — ledger-less resend & transient lock retry (XIN-169
 
     const view = await store.readReplay(D, 0, 1000)
     expect(view.ops.map((o) => o.seq)).toEqual([2, 3])
+  })
+
+  it('P1-4: paged replay caps at the head high-water and converges even while writers append', async () => {
+    // The defect: readReplayPage ran `WHERE seq > cursor` with NO upper bound and
+    // opened a FRESH consistent-snapshot tx per page, so in an actively-written room
+    // every page saw newer committed ops and nextPage never returned empty — the
+    // loop chased live writes, `ready` never fired and the replay permit was held
+    // indefinitely (join starvation). The fix pins the read at the high-water
+    // captured when replay opened.
+    const store = new DbPptRelayStore()
+    await store.appendOp(D, 'f1', { n: 1 })
+    await store.appendOp(D, 'f2', { n: 2 })
+    await store.appendOp(D, 'f3', { n: 3 })
+    const cursor = await store.openReplay(D, 0, { pageRows: 1, pageBytes: 1_000_000 })
+    expect(cursor.highWater).toBe(3)
+
+    // A concurrent writer keeps appending AFTER replay opened. Drive the same loop
+    // the relay runs (`for (;;) { nextPage(); if empty break }`) and append between
+    // pages, so a cursor without the cap would keep finding rows forever.
+    const delivered: number[] = []
+    let appended = 3
+    for (let guard = 0; guard < 100; guard++) {
+      const page = await cursor.nextPage()
+      if (page.length === 0) break
+      for (const op of page) delivered.push(op.seq)
+      // Simulate a live append landing during replay (past the captured high-water).
+      appended += 1
+      await store.appendOp(D, `f${appended}`, { n: appended })
+    }
+    await cursor.close()
+
+    // Replay converged to the captured boundary: it delivered exactly seq 1..3 and
+    // NEVER chased the ops appended after open (which flow through the live buffer).
+    expect(delivered).toEqual([1, 2, 3])
+    expect(await store.currentSeq(D)).toBeGreaterThan(3) // writers did append past it
   })
 
   it('P1-D: transient replay page read failures are retried inside nextPage', async () => {

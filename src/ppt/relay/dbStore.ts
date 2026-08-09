@@ -296,7 +296,7 @@ export class DbPptRelayStore implements PptRelayStore {
           // snapshot (P1-B), and the transaction is committed before we return
           // (so it is not held across the caller's client I/O, P1-H).
           const batch = await withStoreRetry('openReplay.page', () =>
-            this.readReplayPage(docId, cursor, headCovered, limits.pageRows),
+            this.readReplayPage(docId, cursor, headCovered, limits.pageRows, head.highWater),
           )
           if (batch.rows.length === 0) {
             eof = true
@@ -349,6 +349,7 @@ export class DbPptRelayStore implements PptRelayStore {
     cursor: number,
     headCovered: number,
     pageRows: number,
+    highWater: number,
   ): Promise<{ rows: PersistedOp[] }> {
     return this.inConsistentSnapshot(async (tx) => {
       const snap = await pptLiveSnapshotRepo.getTx(tx, docId)
@@ -361,7 +362,13 @@ export class DbPptRelayStore implements PptRelayStore {
       if (snap && snap.coveredSeq > headCovered && snap.coveredSeq > cursor) {
         throw new RetryableStorageError('replay superseded by a concurrent snapshot prune')
       }
-      const rows = await pptCollabOpRepo.sinceTx(tx, docId, cursor, pageRows)
+      // Pin the paged read at the head high-water captured when replay opened
+      // (inclusive). Each page runs in its own consistent-snapshot transaction and
+      // would otherwise observe ops committed by live writers AFTER open, so in an
+      // actively-written room the cursor would never drain and `ready` would never
+      // fire (XIN-1783 P1-4). Post-head ops reach the client through the live
+      // buffer / cutover path instead.
+      const rows = await pptCollabOpRepo.sinceTx(tx, docId, cursor, pageRows, highWater)
       return { rows: rows.map((o) => ({ seq: o.seq, frameId: o.frameId, frame: o.frame, frameBytes: o.frameBytes })) }
     })
   }

@@ -111,21 +111,29 @@ export const pptCollabOpRepo = {
   /**
    * Ops with `seq > sinceSeq`, ascending, INSIDE the caller's transaction so the
    * read shares one consistent snapshot with the other replay reads (P1-4 atomic
-   * replay view). Bounded to `limit` rows when given (paged fetch).
+   * replay view). Bounded to `limit` rows when given (paged fetch). When `maxSeq`
+   * is given it is an INCLUSIVE upper bound (`seq <= maxSeq`): the paged replay
+   * pins it to the head high-water captured at replay open so the cursor converges
+   * to that boundary instead of chasing ops committed by concurrent writers across
+   * the fresh per-page transactions — otherwise an actively-written room's
+   * `nextPage()` never returns empty, the loop never terminates, `ready` is never
+   * emitted and the replay permit is held indefinitely (XIN-1783 P1-4).
    */
-  async sinceTx(tx: Tx, docId: string, sinceSeq: number, limit?: number): Promise<PptCollabOpRow[]> {
+  async sinceTx(tx: Tx, docId: string, sinceSeq: number, limit?: number, maxSeq?: number): Promise<PptCollabOpRow[]> {
+    const cap = maxSeq !== undefined ? ' AND seq <= ?' : ''
+    const capArgs = maxSeq !== undefined ? [maxSeq] : []
     if (limit !== undefined && limit >= 0) {
       const rows = await tx.query<RawRow>(
         `SELECT seq, frame_id, frame_json FROM ppt_collab_op
-          WHERE doc_id = ? AND seq > ? ORDER BY seq ASC LIMIT ${limitClause(limit)}`,
-        [docId, sinceSeq],
+          WHERE doc_id = ? AND seq > ?${cap} ORDER BY seq ASC LIMIT ${limitClause(limit)}`,
+        [docId, sinceSeq, ...capArgs],
       )
       return rows.map(toOp)
     }
     const rows = await tx.query<RawRow>(
       `SELECT seq, frame_id, frame_json FROM ppt_collab_op
-        WHERE doc_id = ? AND seq > ? ORDER BY seq ASC`,
-      [docId, sinceSeq],
+        WHERE doc_id = ? AND seq > ?${cap} ORDER BY seq ASC`,
+      [docId, sinceSeq, ...capArgs],
     )
     return rows.map(toOp)
   },

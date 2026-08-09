@@ -459,7 +459,12 @@ export class InMemoryPptRelayStore implements PptRelayStore {
       fromSeq: sinceSeq,
       nextPage: async () => {
         if (closed) return []
-        const rows = view.ops.filter((o) => o.seq > cursor).slice(0, limits.pageRows)
+        // Pin delivery at the high-water captured when replay opened (inclusive).
+        // The DB store's paged cursor caps at `head.highWater` so an active room's
+        // replay converges to `ready` instead of chasing live appends (XIN-1783
+        // P1-4); the in-memory cursor mirrors that bound so both stores share the
+        // same replay contract (post-head ops arrive via the live buffer / cutover).
+        const rows = view.ops.filter((o) => o.seq > cursor && o.seq <= view.highWater).slice(0, limits.pageRows)
         const page: PersistedOp[] = []
         let bytes = 0
         for (const row of rows) {
