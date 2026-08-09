@@ -5,7 +5,7 @@
  * fixtures (Jeff #2) and the in-memory store, which enforces the same
  * atomic-snapshot-then-prune + monotonic-seq invariants as the DB store.
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { InMemoryPptRelayStore } from '../src/ppt/relay/store.js'
 import { PptSnapshotter, reduceFrames, assertSyncVersionAligned, SNAPSHOT_REDUCER_ACTOR } from '../src/ppt/relay/snapshotter.js'
 import { SYNC_V, SyncState } from '../src/ppt/sync/slidesSync.js'
@@ -383,5 +383,62 @@ describe('PptSnapshotter.advance: idempotent prune re-attempt (XIN-1772 P1-2)', 
     expect((await store.opsSince(DOC, 0)).every((o) => o.seq > N)).toBe(true)
     expect((await store.opsSince(DOC, N)).map((o) => o.seq)).toEqual(tailBefore)
     expect((await store.getSnapshot(DOC))!.state).toBeNull() // still doc-only, not corrupted
+  })
+})
+
+describe('PptSnapshotter.advance: ghost-target GC-freeze aging (XIN-1792 P1-3)', () => {
+  // A wire-legal `set` against an element no `ins` ever creates parks in the engine's
+  // `pending` buffer forever, so `reduceProving` never advances the covered watermark
+  // past it — `coveredSeq` pins, nothing prunes, and the room bricks read-only at the
+  // byte cap. The snapshotter must give such a permanently-buffered op a BOUNDED life.
+  const ghostFrames = [
+    // seq 1: set on 'ghost-el', which no ins creates → parks in pending forever.
+    { seq: 1, ops: [{ op: 'set', a: 'u1', s: 1, l: 5, el: 'ghost-el', k: 'x', v: 1 }] },
+    // seq 2: a doc-level set that materializes cleanly.
+    { seq: 2, ops: [{ op: 'set', a: 'u1', s: 2, l: 6, k: 'title', v: 'hi' }] },
+  ]
+  async function seedGhost(store: InMemoryPptRelayStore): Promise<void> {
+    for (const f of ghostFrames) {
+      await store.appendOp(DOC, `f${f.seq}`, { t: 'ops', pv: 2, k: f.seq, frameId: `f${f.seq}`, epoch: 0, ops: f.ops })
+    }
+  }
+
+  it('does NOT age within the lag window — GC stays frozen so a genuine out-of-order op can still fill', async () => {
+    const store = new InMemoryPptRelayStore()
+    await seedGhost(store)
+    // A generous lag cap (default 4096) with only 2 seqs of tail: the buffered op is
+    // still within the window where its `ins` could legitimately arrive, so nothing
+    // is aged and nothing is pruned.
+    const res = await new PptSnapshotter(store).advance(DOC, baseDocProviderFor(genesisDeck()))
+    expect(res).toBeNull()
+    expect((await store.opsSince(DOC, 0)).length).toBe(2) // tail intact, not pruned
+    expect(await store.getSnapshot(DOC)).toBeNull() // no snapshot advanced
+  })
+
+  it('ages out a permanently-buffered op past the lag cap so GC unfreezes (bounded + audited)', async () => {
+    const store = new InMemoryPptRelayStore()
+    await seedGhost(store)
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      // A tiny lag cap forces the aging path: the ghost `set` has been un-materialized
+      // across the whole tail, so it is aged out — the whole-tail materialized state is
+      // persisted (WITHOUT the buffered op) and the op log is pruned.
+      const snapshotter = new PptSnapshotter(store, /* maxBufferedOpLag */ 2)
+      const res = await snapshotter.advance(DOC, baseDocProviderFor(genesisDeck()))
+      expect(res).not.toBeNull()
+      expect(res!.coveredSeq).toBe(2)
+      expect(res!.freedBytes).toBeGreaterThan(0)
+      // GC unfroze: the op log is pruned and a real (doc,state) snapshot now covers seq 2.
+      expect(await store.opsSince(DOC, 0)).toEqual([])
+      const snap = await store.getSnapshot(DOC)
+      expect(snap!.coveredSeq).toBe(2)
+      expect(snap!.state).not.toBeNull()
+      // The materialized doc reflects the CLEAN op (title) but not the ghost-target op.
+      expect((snap!.doc as unknown as { title?: unknown }).title).toBe('hi')
+      // The drop is audited.
+      expect(warn).toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
   })
 })

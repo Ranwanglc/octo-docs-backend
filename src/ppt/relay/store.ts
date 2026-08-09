@@ -122,31 +122,26 @@ export function canonicalStringify(value: unknown, depth = 0): string {
  * genuine resend re-acks and only a reused frameId carrying DIFFERENT ops is
  * refused.
  *
- * The actor `a` is likewise NOT part of the edit identity (XIN-1789 D1): with the
- * actor now server-minted per session, a page reload → offline-queue flush resends
- * the SAME edit under the session's freshly-minted actor. Folding `a` into the hash
- * would make that legitimate idempotent resend compute a different hash and be
- * refused `protocol-version` for an already-durable write — so `a` is normalized out
- * here, exactly as the envelope metadata is. A NEW (non-duplicate) write still has
- * its actor authenticated against the connection's minted actor at the trust
- * boundary in the relay, so actor-independent dedup grants no ability to forge or
- * mis-attribute a genuinely new op.
+ * The actor `a` IS part of the edit identity and is hashed like every other op
+ * field (XIN-1792 P1-1 — reverting the XIN-1789 `a`-strip). Excluding `a` made a
+ * resend re-attributed to a different actor re-ack the ORIGINAL actor's durable row
+ * and persist nothing: the client believed its newly-stamped ops were durable while
+ * the server and every peer held the old-actor version — DIFFERENT ops to the
+ * reducer (LWW `[l,a]` tie-breaks on actor, `vv` is actor-keyed), a silent
+ * divergence and a false-positive ack for a write the server never made. With the
+ * actor now SESSION-scoped (derived from `(uid, docId, clientSessionId)`, stable
+ * across reconnects — XIN-1792 P0-2), a page reload → offline-queue flush resends
+ * the SAME edit under the SAME actor, so the resend is byte-identical and re-acks on
+ * the full canonical hash with no need to normalize `a` out. THE CLIENT CONTRACT is
+ * therefore: resend queued frames byte-identically (same frameId, same ops including
+ * `a`/`s`/`l`). A reused frameId carrying DIFFERENT ops is refused, as before.
  */
 export function canonicalPayloadHash(frame: unknown): string {
   const ops =
     frame !== null && typeof frame === 'object' && 'ops' in (frame as Record<string, unknown>)
       ? (frame as { ops: unknown }).ops
       : frame
-  // Strip the per-op actor `a` so the dedup identity is actor-independent; every
-  // other op field (including `s`/`l` and the edit payload) is preserved.
-  const payload = Array.isArray(ops)
-    ? ops.map((op) =>
-        op !== null && typeof op === 'object' && !Array.isArray(op)
-          ? Object.fromEntries(Object.entries(op as Record<string, unknown>).filter(([key]) => key !== 'a'))
-          : op,
-      )
-    : ops
-  return createHash('sha256').update(canonicalStringify(payload), 'utf8').digest('hex')
+  return createHash('sha256').update(canonicalStringify(ops), 'utf8').digest('hex')
 }
 
 export function isDuplicateFramePayloadError(err: unknown): err is DuplicateFramePayloadError {

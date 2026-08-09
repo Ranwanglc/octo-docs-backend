@@ -40,6 +40,7 @@ import {
   type ReauthFrame,
   type RefusedCode,
   type ServerFrame,
+  type AckCtl,
 } from './frames.js'
 import {
   canonicalPayloadHash,
@@ -108,6 +109,12 @@ export interface RelayLimits {
   /** Max inbound frames queued on a connection's ordering chain before shedding. */
   maxInboundQueue: number
   /**
+   * Max frames queued on a connection's OUTBOUND ordering chain before the peer is
+   * closed 4410 (XIN-1792 P1-5). Bounds the send backlog a non-reading socket can
+   * accumulate in-process, mirroring {@link maxInboundQueue}.
+   */
+  maxOutboundQueue: number
+  /**
    * Room persisted-byte usage above which the server-side snapshotter is triggered
    * SOFTLY after a non-duplicate append (XIN-1759 Part B). Default
    * `min(64 MiB, floor(2/3 · maxRoomFrameBytes))` so a room compacts well before it
@@ -139,6 +146,7 @@ function defaultLimits(): RelayLimits {
     docStatusCacheTtlMs: r.docStatusCacheTtlMs,
     reauthGraceMs: r.reauthGraceMs,
     maxInboundQueue: r.maxInboundQueue,
+    maxOutboundQueue: r.maxOutboundQueue,
     snapshotSoftThresholdBytes: softDefault,
   }
 }
@@ -302,6 +310,8 @@ interface Conn {
   inboundChain: Promise<void>
   /** Frames currently queued on {@link inboundChain} (backpressure cap, P1-F). */
   inboundDepth: number
+  /** Frames currently queued on {@link outboundChain} (backpressure cap, P1-5). */
+  outboundDepth: number
   /** Per-connection outbound ordering chain. */
   outboundChain: Promise<void>
   /**
@@ -729,6 +739,7 @@ export class PptRelay {
       auth: { readAllowed: roleAtLeast(role, 'reader'), invalidated: false },
       inboundChain: Promise.resolve(),
       inboundDepth: 0,
+      outboundDepth: 0,
       outboundChain: Promise.resolve(),
       drainChain: Promise.resolve(),
       // Bind the actor from the server-minted token claim when present (XIN-1789 D1):
@@ -820,19 +831,60 @@ export class PptRelay {
   }
 
   private enqueueOutbound(conn: Conn, task: () => Promise<void> | void): Promise<void> {
-    const run = conn.outboundChain.then(async () => {
-      if (conn.socket.readyState !== WebSocket.OPEN) return
-      await task()
-    }, async () => {
-      if (conn.socket.readyState !== WebSocket.OPEN) return
-      await task()
-    })
+    // Bound the outbound backlog (XIN-1792 P1-5). A non-reading peer's kernel send
+    // buffer is drained per-frame by `gatedSend`, but frames still QUEUED on this
+    // promise chain are not yet reflected in `bufferedAmount`; a flood of refusals or
+    // broadcasts to a stalled peer would otherwise grow the chain unbounded in the
+    // process that also serves REST. Past the cap, stop enqueuing and close the peer
+    // 4410 (resync) — a single close, mirroring the inbound shed. The close itself is
+    // issued directly (not via `closeConn`, which would enqueue onto this same capped
+    // chain) so overflow always terminates.
+    if (conn.outboundDepth >= this.limits.maxOutboundQueue) {
+      if (conn.socket.readyState === WebSocket.OPEN) {
+        try {
+          conn.socket.close(CLOSE_RESYNC_REQUIRED, 'outbound backlog exceeded')
+        } catch {
+          /* peer already gone; the close handler prunes it */
+        }
+      }
+      this.removeFromRoom(conn)
+      return Promise.resolve()
+    }
+    conn.outboundDepth++
+    const runTask = async (): Promise<void> => {
+      try {
+        if (conn.socket.readyState !== WebSocket.OPEN) return
+        await task()
+      } finally {
+        conn.outboundDepth--
+      }
+    }
+    const run = conn.outboundChain.then(runTask, runTask)
     conn.outboundChain = run.catch(() => {})
     return run
   }
 
   private sendFrame(conn: Conn, frame: ServerFrame): Promise<void> {
     return this.enqueueOutbound(conn, () => send(conn.socket, frame))
+  }
+
+  /**
+   * Send the ack for a DURABLY-COMMITTED write, bypassing the read-push gate
+   * (XIN-1792 P1-6). `gatedSend` CLOSES a `pendingReauth`/terminal socket instead of
+   * sending — correct for peer op/snapshot/presence pushes, but WRONG for the
+   * author's ack of its OWN already-committed frame. A permission-epoch bump or
+   * revoke can flip a socket's auth AFTER its `guardMutation` passed and its append
+   * committed durably and broadcast to peers (the epoch decision is not atomic with
+   * the append); suppressing the ack THEN would leave the author believing a write
+   * FAILED that every peer applied — the false-negative durability signal the P1-6
+   * divergence describes. The write was authorized at commit time, so acknowledging
+   * it is honest, and any revocation still closes the socket right after via its own
+   * queued close. The ack carries only the author's frame counter + assigned seq (no
+   * peer data), so delivering it past the freeze leaks nothing. Routed through
+   * {@link enqueueOutbound} so it still honors the outbound ordering + backlog cap.
+   */
+  private sendCommittedAck(conn: Conn, ack: AckCtl): void {
+    void this.enqueueOutbound(conn, () => send(conn.socket, ack))
   }
 
   private closeConn(conn: Conn, code: number, reason: string): Promise<void> {
@@ -844,6 +896,26 @@ export class PptRelay {
 
   private canPushRead(conn: Conn): boolean {
     return conn.auth.readAllowed && !conn.auth.invalidated && conn.auth.pendingReauth !== true && conn.socket.readyState === WebSocket.OPEN
+  }
+
+  /**
+   * The refusal code for a connection already driven into a TERMINAL or invalidated
+   * authorization state, or `null` when it is not (XIN-1792 P1-4). A reauth failure,
+   * revocation, or doc-deletion sets `conn.auth` to `{ readAllowed:false, ... }` with
+   * a `terminalClose` and enqueues the socket close on the OUTBOUND chain — but a
+   * mutating/re-ack frame already queued on the INBOUND chain runs on a separate
+   * chain and would otherwise commit durably (or harvest a re-ack) in the window
+   * before that close is delivered. `guardMutation`/`identityGate` consult this
+   * BEFORE any durable append or store read so such a frame is refused, not applied
+   * after authority was withdrawn. Returns the `terminalClose.refused` code when the
+   * terminal state named one (e.g. `doc-deleted`), else `forbidden-role`. The
+   * `pendingReauth` (grace-window) state is handled by its own check in each gate.
+   */
+  private terminalRefusal(conn: Conn): RefusedCode | null {
+    if (conn.auth.terminalClose) return conn.auth.terminalClose.refused ?? 'forbidden-role'
+    if (conn.auth.invalidated) return 'forbidden-role'
+    if (!conn.auth.readAllowed && conn.auth.pendingReauth !== true) return 'forbidden-role'
+    return null
   }
 
   /**
@@ -1662,6 +1734,10 @@ export class PptRelay {
             snapshotVersion: snapshot?.snapshotVersion ?? 0,
             epoch,
             role: conn.role,
+            // Deliver the server-minted actor the client MUST author under (XIN-1792
+            // P0-1). `ready` is the robust surface: it survives a reauth and reaches
+            // the client on every (re)join without re-fetching the token.
+            ...(conn.actor !== undefined ? { actor: conn.actor } : {}),
           })
         }
         return true
@@ -1736,6 +1812,16 @@ export class PptRelay {
    * (possibly downgraded-to-reader) connection is still re-acked (round-7 / D3).
    */
   private async identityGate(conn: Conn): Promise<RefusedCode | null> {
+    // A connection already driven into a TERMINAL/invalidated state must not re-ack
+    // or drive a store read for a frame that is already queued on the inbound chain
+    // (XIN-1792 P1-4). Both reauth-failure paths set a terminal state (readAllowed
+    // false + a `terminalClose`) AND clear `pendingReauth` while the close is merely
+    // QUEUED on the outbound chain — so the `pendingReauth` check below no longer
+    // catches them, and a frame already on the inbound chain would otherwise commit
+    // (or harvest a re-ack) after the grace window closed. Refused BEFORE any store
+    // read for the same reason `identityGate` exists.
+    const terminal = this.terminalRefusal(conn)
+    if (terminal) return terminal
     // A socket awaiting in-place re-verification can NEITHER read NOR write until
     // a fresh ticket clears pendingReauth (XIN-1739 P0-1b). `canPushRead` already
     // blocks the push/read path; block the mutation/re-ack path here too so an
@@ -1771,6 +1857,13 @@ export class PptRelay {
    */
   private async guardMutation(conn: Conn, frameEpoch: number, rawBytes: number, maxBytes: number): Promise<RefusedCode | null> {
     if (rawBytes > maxBytes) return 'too-large'
+    // Refuse a mutation from a connection already in a TERMINAL/invalidated state
+    // BEFORE the durable append (XIN-1792 P1-4). A reauth failure / revocation sets
+    // `terminalClose` and clears `pendingReauth` while the socket close is only
+    // queued on the outbound chain, so a frame already on the inbound chain would
+    // otherwise persist durably (and broadcast) after the grace window closed.
+    const terminal = this.terminalRefusal(conn)
+    if (terminal) return terminal
     // Awaiting re-verification: no write is authorized until a fresh ticket clears
     // pendingReauth (XIN-1739 P0-1b). Checked before the epoch/role gate so a
     // share-derived writer whose membership claim expired cannot persist during the
@@ -1923,11 +2016,20 @@ export class PptRelay {
   /**
    * The room's live Lamport clock high-water for the RELATIVE op-metadata bound
    * (XIN-1789 P1-2/P1-3). Seeded ONCE per room from the durable snapshot state's
-   * `lamport` — so a fresh joiner inheriting the serialized clock is never over-cap —
-   * and thereafter advanced in-process by each accepted op (see the post-commit
-   * advance in {@link handleOps}). A generous {@link OP_CLOCK_SLACK} absorbs the gap
-   * between the seeded snapshot clock and the un-snapshotted tail. The snapshot read
-   * failing is RETRYABLE: the caller must not admit a frame against an unknown clock.
+   * `lamport` AND the durable op tail ABOVE the snapshot's coverage (XIN-1792 P1-2),
+   * then advanced in-process by each accepted op (see the post-commit advance in
+   * {@link handleOps}). A generous {@link OP_CLOCK_SLACK} absorbs the gap between the
+   * seeded clock and any un-serialized offline work.
+   *
+   * Seeding from the SNAPSHOT ALONE was insufficient: the room clock is dropped when
+   * the last socket leaves ({@link removeFromRoom}) and a frame may legitimately sit
+   * up to `OP_CLOCK_SLACK` above the snapshot's clock, so after a room empties and
+   * rejoins the seed would regress to the snapshot value while clients that applied
+   * the tail are at `snapshotLamport + slack` — their next honest mint is `+1` beyond
+   * the bound and PERMANENTLY refused. Folding the tail's max `l`/`sd[0]` into the
+   * seed makes the bound track what the room has actually observed. The snapshot /
+   * tail reads failing is RETRYABLE: the caller must not admit a frame against an
+   * unknown clock.
    */
   private async ensureRoomLamport(docId: string): Promise<number> {
     if (!this.roomLamportSeeded.has(docId)) {
@@ -1935,6 +2037,25 @@ export class PptRelay {
       try {
         const snap = await this.store.getSnapshot(docId)
         seed = snap?.state?.lamport ?? 0
+        // The snapshot clock only covers ops <= coveredSeq; ops above it (the
+        // un-snapshotted tail) may carry a higher `l`/`sd[0]` that the room already
+        // accepted. Page the tail and fold its max clock into the seed so a rejoin
+        // after a room eviction never regresses below what clients hold (P1-2).
+        let cursor = snap?.coveredSeq ?? 0
+        for (;;) {
+          const page = await this.store.opsSince(docId, cursor, this.limits.replayPageSize)
+          if (page.length === 0) break
+          for (const op of page) {
+            const ops = Array.isArray((op.frame as { ops?: unknown })?.ops)
+              ? (op.frame as { ops: unknown[] }).ops
+              : []
+            const clock = maxFrameClock(ops)
+            if (clock > seed) seed = clock
+          }
+          const last = page[page.length - 1]!.seq
+          if (last <= cursor) break
+          cursor = last
+        }
       } catch (err) {
         throw new RetryableStorageError('room clock seed read failed', { cause: err })
       }
@@ -1973,7 +2094,7 @@ export class PptRelay {
     } catch {
       /* keep the re-ack: the frame is already durable regardless of this read */
     }
-    void this.gatedSend(conn, { ctl: 'ack', k: frame.k ?? 0, q: seq, snapshotVersion })
+    void this.sendCommittedAck(conn, { ctl: 'ack', k: frame.k ?? 0, q: seq, snapshotVersion })
   }
 
   private async handleOps(conn: Conn, frame: OpsFrame, rawBytes: number): Promise<void> {
@@ -2109,59 +2230,68 @@ export class PptRelay {
       }
     }
     // ── Trust boundary for a genuinely NEW write (XIN-1789 D1 / P1-1/1-2/1-3) ──
-    // Everything from here runs ONLY for a frame that is not a known duplicate, so an
-    // idempotent resend (even one flushed under a freshly minted actor) has already
-    // re-acked above and never reaches these checks.
-    //
-    // Actor binding. When the credential carried a server-minted actor claim
-    // (`actorBound`), the connection's actor is FIXED at issuance from the
-    // authenticated uid: refuse any op whose `a` differs, so the client can neither
-    // choose nor forge which actor its ops are attributed to (P0-2 impersonation /
-    // co-editor censorship). On a legacy credential (no actor claim) fall back to the
-    // pre-D1 behavior — pin the actor on this first frame and refuse a later switch.
-    if (conn.actorBound) {
-      if (frameActor !== conn.actor) {
-        this.refuse(conn, 'protocol-version', { k, frameId, message: 'op actor is not the authenticated actor' })
+    // These gates apply ONLY when the frameId is UNKNOWN (`known === null`). A frame
+    // whose frameId is already in the ledger is a duplicate, even when we could not
+    // payload-verify it here (a NULL-hash row whose op was pruned, XIN-1792 P2-3):
+    // running the per-actor `s`-continuity gate on it would refuse it `protocol-version`
+    // (its `s` is behind the already-advanced `nextS`) BEFORE `appendOp`'s unique
+    // `(docId, frameId)` reconciliation could re-ack it. `appendOp` is the authoritative
+    // dedup and STILL enforces the actor: the canonical payload hash includes `a`, so a
+    // resend re-attributed to a different actor mismatches the stored row and is refused
+    // `DuplicateFramePayloadError` there — no gate is bypassed, only reordered after the
+    // dedup that owns it.
+    if (known === null) {
+      // Actor binding. When the credential carried a server-minted actor claim
+      // (`actorBound`), the connection's actor is FIXED at issuance from the
+      // authenticated uid: refuse any op whose `a` differs, so the client can neither
+      // choose nor forge which actor its ops are attributed to (P0-2 impersonation /
+      // co-editor censorship). On a legacy credential (no actor claim) fall back to the
+      // pre-D1 behavior — pin the actor on this first frame and refuse a later switch.
+      if (conn.actorBound) {
+        if (frameActor !== conn.actor) {
+          this.refuse(conn, 'protocol-version', { k, frameId, message: 'op actor is not the authenticated actor' })
+          return
+        }
+      } else if (conn.actor === undefined) {
+        conn.actor = frameActor
+      } else if (conn.actor !== frameActor) {
+        this.refuse(conn, 'protocol-version', { k, frameId, message: 'ops actor does not match the connection actor' })
         return
       }
-    } else if (conn.actor === undefined) {
-      conn.actor = frameActor
-    } else if (conn.actor !== frameActor) {
-      this.refuse(conn, 'protocol-version', { k, frameId, message: 'ops actor does not match the connection actor' })
-      return
-    }
-    // Relative op-metadata bounds (P1-2 / P1-3). `l` (Lamport) and a `txt` op's seed
-    // generation `sd[0]` are both room-clock values the engine folds in via
-    // `lamport = max(lamport, value)`. An absolute cap admits a value far above the
-    // room's live clock that pins it at a ceiling and invalidates every legitimate
-    // successor; bound them RELATIVE to the room's live clock instead. Seeded from the
-    // durable snapshot state, so a fresh joiner inheriting the serialized clock is
-    // never over-cap.
-    let roomLamport: number
-    try {
-      roomLamport = await this.ensureRoomLamport(conn.docId)
-    } catch (err) {
-      const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
-      this.refuse(conn, code, { k, frameId, message: 'room clock unavailable' })
-      return
-    }
-    const frameClock = maxFrameClock(frame.ops)
-    if (frameClock > roomLamport + OP_CLOCK_SLACK) {
-      this.refuse(conn, 'protocol-version', { k, frameId, message: 'op clock exceeds the room clock bound' })
-      return
-    }
-    // Per-actor `s` continuity (P1-1), server-minted actors only. A fresh session's
-    // Bento `SyncState` mints `s` contiguously from 1; require the frame's ops to be
-    // exactly `nextS, nextS+1, …` so one wire-legal skip/reorder/repeat can no longer
-    // manufacture an unfillable per-actor gap that freezes room GC forever. A legacy
-    // (first-frame-pinned) actor's `s` sequence is not server-trusted, so it is not
-    // gated here. `nextS` advances only after the write is durable (below).
-    if (conn.actorBound) {
-      const sValues = (frame.ops as Array<{ s?: unknown }>).map((op) => op.s)
-      const contiguous = sValues.every((s, i) => s === conn.nextS + i)
-      if (!contiguous) {
-        this.refuse(conn, 'protocol-version', { k, frameId, message: 'op sequence is not contiguous for this actor' })
+      // Relative op-metadata bounds (P1-2 / P1-3). `l` (Lamport) and a `txt` op's seed
+      // generation `sd[0]` are both room-clock values the engine folds in via
+      // `lamport = max(lamport, value)`. An absolute cap admits a value far above the
+      // room's live clock that pins it at a ceiling and invalidates every legitimate
+      // successor; bound them RELATIVE to the room's live clock instead. Seeded from the
+      // durable snapshot state AND the un-snapshotted tail (XIN-1792 P1-2), so a fresh
+      // joiner or a room rejoined after eviction inheriting the serialized clock is
+      // never over-cap.
+      let roomLamport: number
+      try {
+        roomLamport = await this.ensureRoomLamport(conn.docId)
+      } catch (err) {
+        const code = isRetryableStorageError(err) ? 'storage-retry' : 'storage-failed'
+        this.refuse(conn, code, { k, frameId, message: 'room clock unavailable' })
         return
+      }
+      const frameClock = maxFrameClock(frame.ops)
+      if (frameClock > roomLamport + OP_CLOCK_SLACK) {
+        this.refuse(conn, 'protocol-version', { k, frameId, message: 'op clock exceeds the room clock bound' })
+        return
+      }
+      // Per-actor `s` continuity (P1-1), server-minted actors only. A fresh session's
+      // Bento `SyncState` mints `s` contiguously from 1; require the frame's ops to be
+      // exactly `nextS, nextS+1, …` so one wire-legal skip/reorder/repeat can no longer
+      // manufacture an unfillable per-actor gap that freezes room GC forever. A legacy
+      // (first-frame-pinned) actor's `s` sequence is not server-trusted, so it is not
+      // gated here. `nextS` advances only after the write is durable (below).
+      if (conn.actorBound) {
+        const sValues = (frame.ops as Array<{ s?: unknown }>).map((op) => op.s)
+        const contiguous = sValues.every((s, i) => s === conn.nextS + i)
+        if (!contiguous) {
+          this.refuse(conn, 'protocol-version', { k, frameId, message: 'op sequence is not contiguous for this actor' })
+          return
+        }
       }
     }
     // Not a known duplicate (or a NULL-hash row we could not verify as one): enforce
@@ -2290,7 +2420,7 @@ export class PptRelay {
     // room order before its own ack, so advancing then is correct and lets it
     // snapshot its own latest write.
     if (this.canAdvanceDeliveredThroughFromAuthor(conn, duplicate)) this.markDeliveredThrough(conn, seq)
-    void this.gatedSend(conn, { ctl: 'ack', k: frame.k ?? 0, q: seq, snapshotVersion })
+    void this.sendCommittedAck(conn, { ctl: 'ack', k: frame.k ?? 0, q: seq, snapshotVersion })
     // Broadcast to peers only for a first-seen frame (no echo, no double-apply).
     if (!duplicate) this.broadcast(conn, { ctl: 'op', q: seq, frame })
     // Soft snapshot trigger (XIN-1759 Part B): a first-seen append grew the room, so

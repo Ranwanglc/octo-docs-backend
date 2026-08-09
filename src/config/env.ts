@@ -845,6 +845,15 @@ export const config = {
       // enqueue an unbounded backlog that keeps persisting after the socket is
       // gone (XIN-1736 P1-F). Sized well above a legitimate in-flight burst.
       maxInboundQueue: numMin('PPT_RELAY_MAX_INBOUND_QUEUE', 256, 1),
+      // Depth cap for a connection's OUTBOUND ordering chain (XIN-1792 P1-5). A
+      // non-reading peer's send buffer is drained per-frame by `gatedSend`
+      // (bufferedAmount high-water), but frames still QUEUED on the outbound promise
+      // chain are not yet reflected there — a socket that floods (each shed inbound
+      // frame emits a `refused`) or a busy room broadcasting to a stalled peer would
+      // otherwise grow that queue unbounded in the process that also serves REST.
+      // Beyond this cap the peer is closed 4410 (resync) rather than buffered further,
+      // mirroring the inbound bound. Sized well above any legitimate in-flight fan-out.
+      maxOutboundQueue: numMin('PPT_RELAY_MAX_OUTBOUND_QUEUE', 2048, 1),
     },
   },
 } as const

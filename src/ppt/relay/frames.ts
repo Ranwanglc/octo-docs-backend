@@ -168,6 +168,16 @@ export interface ReadyCtl {
   snapshotVersion: number
   epoch: number
   role: string
+  /**
+   * The server-minted Bento actor this connection MUST author under (XIN-1792 P0-1).
+   * Delivered here as the robust surface — it survives a reauth and is available on
+   * every (re)join without re-fetching the collab token — so a client seeds its
+   * replica identity from the wire rather than by decoding the opaque JWT. The relay
+   * refuses any `op.a` that differs (permanent `protocol-version`), so a client that
+   * never learned this value would have every `ops` frame refused. Omitted only for a
+   * legacy connection that carries no server-minted actor (first-frame-pinned).
+   */
+  actor?: string
 }
 export interface AckCtl {
   ctl: 'ack'

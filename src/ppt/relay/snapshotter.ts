@@ -37,6 +37,24 @@ import type { PersistedOp, PptRelayStore, RelaySnapshot } from './store.js'
 export const SNAPSHOT_REDUCER_ACTOR = '@relay'
 
 /**
+ * How far (in room seqs) the un-materialized op tail may grow above the covered
+ * watermark before a permanently-buffered op is AGED OUT to unfreeze GC (XIN-1792
+ * P1-3). A wire-legal `set`/`txt`/`ord` op against an element that NO `ins` in the
+ * entire durable log ever creates parks in the engine's `pending` buffer forever;
+ * `reduceProving` then never advances the covered watermark past it, so `coveredSeq`
+ * pins at its old value, nothing prunes, `roomBytes` climbs to the hard cap, and the
+ * room bricks read-only with a PERMANENT `room-full`. This bound trades that
+ * permanent brick for a bounded, audited drop: once the frozen tail exceeds this many
+ * seqs the buffered op is provably not going to be filled by anything already durable
+ * (the whole tail was reduced and it is still parked), so the snapshotter persists the
+ * whole-tail materialized `(doc, state)` — which excludes the buffered ops — and
+ * prunes through it, logging what was dropped. Sized far above any legitimate
+ * cross-actor out-of-order window (a peer's `ins` for a referenced element lands
+ * within a handful of ops in room order), so a genuine transient buffer is never aged.
+ */
+export const DEFAULT_MAX_BUFFERED_OP_LAG = 4096
+
+/**
  * Assert the vendored engine's sync version matches the backend's `BENTO_SYNC_V`
  * (Jeff constraint #1 — front and back MUST run the same kernel version/build, or
  * Option 2's single-reducer guarantee breaks). Called once at snapshotter
@@ -206,7 +224,11 @@ export interface SnapshotRunResult {
  * are atomic w.r.t. appends and other snapshot jobs on the same room.
  */
 export class PptSnapshotter {
-  constructor(private readonly store: PptRelayStore) {
+  constructor(
+    private readonly store: PptRelayStore,
+    /** Seq lag above which a permanently-buffered op is aged out (XIN-1792 P1-3). */
+    private readonly maxBufferedOpLag: number = DEFAULT_MAX_BUFFERED_OP_LAG,
+  ) {
     assertSyncVersionAligned()
   }
 
@@ -318,9 +340,35 @@ export class PptSnapshotter {
     const probe = reduceProving(baseDoc, existing?.state ?? null, frames, coveredSeq)
     const safeSeq = probe.provenSeq
     if (safeSeq <= coveredSeq) {
-      // The boundary op itself is still buffered — nothing new can be safely folded
-      // in yet. Leave the whole tail durable (it is the proof of the buffered op) and
-      // only re-attempt the idempotent prune of the already-covered prefix.
+      // The boundary op itself is still buffered — nothing new can normally be safely
+      // folded in yet, so leave the whole tail durable (it is the proof of the
+      // buffered op) and only re-attempt the idempotent prune of the already-covered
+      // prefix. BUT a GHOST-TARGET op (a wire-legal `set`/`txt`/`ord` against an
+      // element no `ins` in the durable log ever creates) parks in `pending` FOREVER,
+      // so this branch would otherwise pin `coveredSeq` forever and brick the room
+      // read-only at `room-full` (XIN-1792 P1-3). Once the frozen tail has grown past
+      // `maxBufferedOpLag` seqs the buffered op is provably not fillable from anything
+      // durable — the whole tail was just reduced and it is still parked — so AGE it
+      // out: persist the whole-tail materialized `(doc, state)` (which excludes the
+      // buffered ops) at `targetSeq` and prune through it, recording an audit log of
+      // what was dropped. This bounds a permanent brick to a bounded, audited drop of
+      // an op that could never materialize.
+      const bufferedLag = highWater - coveredSeq
+      if (probe.engine.bufferedOps.length > 0 && bufferedLag >= this.maxBufferedOpLag) {
+        const dropped = probe.engine.bufferedOps
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[ppt-relay] doc ${docId}: aging out ${dropped.length} permanently-buffered op(s) to unfreeze GC ` +
+            `(XIN-1792 P1-3; frozen tail=${bufferedLag} seqs > lag cap ${this.maxBufferedOpLag}); dropped=` +
+            JSON.stringify(dropped),
+        )
+        const doc = probe.doc
+        const state = probe.engine.toJSON()
+        const saved = await this.store.saveSnapshot({ docId, coveredSeq: targetSeq, doc, state })
+        const prunableSeq = saved.coveredSeq ?? targetSeq
+        const freedBytes = await this.store.pruneOpsThrough(docId, prunableSeq)
+        return { snapshotVersion: saved.snapshotVersion, coveredSeq: saved.coveredSeq ?? targetSeq, prunedThroughSeq: prunableSeq, freedBytes }
+      }
       return this.reattemptPrune(docId, coveredSeq)
     }
     // Persist the reduction of ONLY the proven-materialized prefix. When the whole

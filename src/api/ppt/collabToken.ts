@@ -43,6 +43,27 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
   }
   const docId = docIdRaw.trim()
 
+  // Stable per-client session id (XIN-1792 P0-2 / D3 owner contract). The client
+  // persists ONE id across reconnects (e.g. in sessionStorage) and sends the SAME
+  // value on every collab-token request for this deck+tab; the server derives the
+  // Bento actor from `(uid, docId, clientSessionId)` so the actor is STABLE across
+  // reconnects rather than a fresh random per issuance. A CRDT actor identifies a
+  // replica, so a churning actor discards unsent work on every blip (P0-2) — a stable
+  // client session id is what pins it. Required and bounded (it is an opaque token,
+  // never unbounded); its content is otherwise unconstrained (mixed into an HMAC).
+  const sessionRaw = body.clientSessionId
+  if (typeof sessionRaw !== 'string' || sessionRaw.trim() === '') {
+    throw new PptApiError('VALIDATION_ERROR', 'clientSessionId is required', {
+      details: { field: 'clientSessionId' },
+    })
+  }
+  const clientSessionId = sessionRaw.trim()
+  if (clientSessionId.length > 200) {
+    throw new PptApiError('VALIDATION_ERROR', 'clientSessionId exceeds 200 chars', {
+      details: { field: 'clientSessionId' },
+    })
+  }
+
   // Shared load + role resolution (throws NOT_FOUND / CONFLICT /
   // UNSUPPORTED_DOCUMENT_TYPE); `role` may be 'none'. `spaceMember` is the SAME
   // membership decision the effective role was resolved with (XIN-1739): the
@@ -107,10 +128,13 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
     permission_epoch: meta.permission_epoch,
     snapshotVersion,
     spaceMember,
-    // Bind the collab session to an actor derived from the authenticated uid, so the
-    // relay can enforce `op.a === server-minted actor` and the client can neither
-    // choose nor forge which actor its ops are attributed to (XIN-1789 D1 / P0-2).
-    actor: mintCollabActor(uid, docId),
+    // Bind the collab session to an actor derived from the authenticated uid AND a
+    // client-persisted session id, so the relay can enforce `op.a === server-minted
+    // actor`, the client can neither choose nor forge which actor its ops are
+    // attributed to (XIN-1789 D1), and the actor is STABLE across reconnects for the
+    // same clientSessionId (XIN-1792 P0-2). The actor is echoed back in the response
+    // (`result.actor`, P0-1) so the client authors under it.
+    actor: mintCollabActor(uid, docId, clientSessionId),
     ...(displayName !== '' ? { name: displayName } : {}),
   })
   sendPptData(res, result)

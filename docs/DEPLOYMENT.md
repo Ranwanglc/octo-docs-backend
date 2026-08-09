@@ -22,6 +22,35 @@ The service is a single process that exposes **two** listeners:
 > explicit shared transport or affinity design; until then, deploy exactly one
 > backend replica for PPT collaboration.
 
+> **PPT collab relay — client wire contract (R4-B1, XIN-1792).** A client of the
+> Bento relay MUST honor the following, all enforced server-side (a violation is a
+> PERMANENT `protocol-version` refusal unless noted):
+>
+> - **Server-minted actor (required).** The client does NOT choose its Bento
+>   `SyncEngine` actor. It sends a stable `clientSessionId` (persisted across
+>   reconnects, e.g. in `sessionStorage`) in the `POST /api/v1/ppt/docs/collab-token`
+>   body; the server derives the actor from `(uid, docId, clientSessionId)` and
+>   returns it as `data.actor` AND echoes it on the relay `ready` frame (`ready.actor`).
+>   The client MUST construct its engine under exactly that actor. Every `op.a` is
+>   checked against it; a mismatch is refused permanently.
+> - **Stable session actor across reconnects.** The same `clientSessionId` yields the
+>   same actor, so the client keeps ONE engine/replica identity across a reconnect and
+>   a byte-identical resend of a queued frame re-acks. A fresh random session id on
+>   every reconnect would discard unsent work — do not do that.
+> - **Byte-identical idempotent resend.** Re-send a queued frame with the SAME
+>   `frameId` and the SAME ops (including `a`/`s`/`l`). A reused `frameId` carrying
+>   different ops is refused.
+> - **Per-actor `s` contiguity.** Under the server-minted actor, a frame's ops' `s`
+>   values must be exactly `nextS, nextS+1, …` (starting at 1 for a fresh session). A
+>   skip/reorder/repeat is refused.
+> - **Relative clock bound.** An op's `l` (and a `txt` op's seed `sd[0]`) must be
+>   within `OP_CLOCK_SLACK` (2^20) of the room's live Lamport clock; a value far above
+>   it is refused.
+>
+> `COLLAB_TOKEN_SECRET` signs the relay token, signs the one-time ticket, AND is the
+> HMAC key for the minted actor — one secret, three uses (the asymmetric-key TODO now
+> guards all three).
+
 ---
 
 ## 1. Image build

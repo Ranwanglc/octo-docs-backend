@@ -11,7 +11,7 @@ import { config } from '../src/config/env.js'
 import { PptRelay, type RelayLimits } from '../src/ppt/relay/pptRelay.js'
 import { InMemoryPptRelayStore, type PptRelayStore, RetryableStorageError, canonicalPayloadHash } from '../src/ppt/relay/store.js'
 import { isRetryable, STORAGE_RETRY_BACKOFF_MS } from '../src/ppt/relay/frames.js'
-import { issuePptCollabToken, PPT_RELAY_TICKET_AUD } from '../src/auth/pptCollabToken.js'
+import { issuePptCollabToken, mintCollabActor, PPT_RELAY_TICKET_AUD } from '../src/auth/pptCollabToken.js'
 import type { ResolvedRole, Role } from '../src/permission/role.js'
 import type { BentoDoc } from '../src/ppt/bentoDoc.js'
 
@@ -445,21 +445,63 @@ describe('PPT relay: op actor bound to authenticated uid (XIN-1783 D1)', () => {
     expect(await h.store.currentSeq(DOC)).toBe(0)
   })
 
-  it('still re-acks a legitimate idempotent resend that carries a freshly-minted actor', async () => {
+  it('re-acks a byte-identical idempotent resend under the stable session actor', async () => {
+    const h = await setup()
+    // XIN-1792 P0-2: the actor is derived from (uid, docId, clientSessionId) and is
+    // STABLE across reconnects, so a page-reload → offline-queue flush resends the
+    // SAME frame under the SAME actor. The harness pins the session actor here.
+    const w = await h.connect({ uid: 'u_w', role: 'writer', actor: 'u-w-actor' })
+    await helloReady(w)
+    // Original write commits under the session actor.
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'dup', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor', s: 1, l: 1, k: 'x', v: 1 }] })
+    expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    // Reload → offline queue flush → the SAME frameId is resent BYTE-IDENTICALLY under
+    // the SAME stable session actor. It is already durable, so it MUST re-ack its
+    // stored seq (the re-ack precedes the actor/continuity checks).
+    const w2 = await h.connect({ uid: 'u_w', role: 'writer', actor: 'u-w-actor' })
+    await helloReady(w2)
+    w2.send({ t: 'ops', pv: 2, k: 1, frameId: 'dup', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor', s: 1, l: 1, k: 'x', v: 1 }] })
+    expect(await w2.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+  })
+
+  it('refuses a resend that reuses a frameId with a DIFFERENT actor (no silent mis-attribution)', async () => {
+    // XIN-1792 P1-1: the dedup hash includes the actor `a` again. A frame re-sent
+    // under a DIFFERENT actor is NOT the same durable write (LWW `[l,a]` and `vv` are
+    // actor-keyed), so re-acking the original actor's row would falsely tell the
+    // client its new-actor ops are durable while the server/peers hold the old-actor
+    // version — a silent divergence. The reused frameId with different ops is refused.
     const h = await setup()
     const w = await h.connect({ uid: 'u_w', role: 'writer', actor: 'u-w-actor-1' })
     await helloReady(w)
-    // Original write commits under the session's first minted actor.
     w.send({ t: 'ops', pv: 2, k: 1, frameId: 'dup', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor-1', s: 1, l: 1, k: 'x', v: 1 }] })
     expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 1 })
-    // Reload → offline queue flush → the SAME frameId is resent, now under a fresh
-    // minted actor. It is already durable, so it MUST re-ack its stored seq, not be
-    // refused: the dedup identity is actor-independent and the re-ack precedes the
-    // actor check.
     const w2 = await h.connect({ uid: 'u_w', role: 'writer', actor: 'u-w-actor-2' })
     await helloReady(w2)
     w2.send({ t: 'ops', pv: 2, k: 1, frameId: 'dup', epoch: 0, ops: [{ op: 'set', a: 'u-w-actor-2', s: 1, l: 1, k: 'x', v: 1 }] })
-    expect(await w2.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    expect(await w2.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
+  })
+
+  it('P0-1 (E2E): delivers the server-minted actor in `ready`; a client authoring under only the delivered actor is accepted', async () => {
+    // The coverage gap the review flagged: previously the harness pre-seeded the actor
+    // into the credential AND the client's ops, assuming away the step a real client
+    // cannot perform (learning WHICH actor to author under). Drive the REAL production
+    // derivation (`mintCollabActor`, the exact call `collabTokenHandler` makes) and let
+    // the client discover its actor ONLY from the `ready` frame — never decoding the JWT.
+    const h = await setup()
+    const actor = mintCollabActor('u_w', DOC, 'client-session-xyz')
+    const w = await h.connect({ uid: 'u_w', role: 'writer', actor })
+    w.send({ t: 'hello', pv: 2, since: 0 })
+    const replay = await w.recvUntil((m) => m.ctl === 'ready')
+    const ready = replay[replay.length - 1] as { ctl: string; actor?: string }
+    // P0-1 delivery: the required actor is on the wire.
+    expect(ready.actor).toBe(actor)
+    // Authoring under the DELIVERED actor is accepted end-to-end…
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'e2e-ok', epoch: 0, ops: [{ op: 'set', a: ready.actor, s: 1, l: 1, k: 'x', v: 1 }] })
+    expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    // …while a client that mints its OWN actor (every pre-P0-1 client) is permanently
+    // refused — which is precisely why the delivery half is required to unblock clients.
+    w.send({ t: 'ops', pv: 2, k: 2, frameId: 'e2e-self', epoch: 0, ops: [{ op: 'set', a: 'self-chosen-actor', s: 1, l: 2, k: 'x', v: 2 }] })
+    expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
   })
 })
 
@@ -517,6 +559,30 @@ describe('PPT relay: op-metadata bounds are relative, not absolute (XIN-1783 P1-
       { op: 'txt', a: 'u-w-actor', s: 1, l: 1, el: 'e1', sd: [Number.MAX_SAFE_INTEGER, 'u-w-actor'], base: 'x', ins: [{ at: 'x', toks: ['a'] }] },
     ] })
     expect(await w.recv()).toMatchObject({ ctl: 'refused', code: 'protocol-version' })
+  })
+
+  it('P1-2 (XIN-1792): the room clock re-seeds from the un-snapshotted TAIL after a room eviction', async () => {
+    const SLACK = 2 ** 20
+    const h = await setup()
+    // A first writer pushes the room clock up to SLACK via a slack-consuming op, then
+    // a legitimate successor just above it — both accepted while the room is live.
+    const w1 = await h.connect({ uid: 'u1', role: 'writer', actor: 'u1-actor' })
+    await helloReady(w1)
+    w1.send({ t: 'ops', pv: 2, k: 1, frameId: 't1', epoch: 0, ops: [{ op: 'set', a: 'u1-actor', s: 1, l: SLACK, k: 'x', v: 1 }] })
+    expect(await w1.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+    w1.send({ t: 'ops', pv: 2, k: 2, frameId: 't2', epoch: 0, ops: [{ op: 'set', a: 'u1-actor', s: 2, l: SLACK + 1, k: 'x', v: 2 }] })
+    expect(await w1.recv()).toMatchObject({ ctl: 'ack', q: 2 })
+    // Evict the room: the last socket leaves, so the process-local room clock is dropped
+    // and must re-seed on the next join. No snapshot was taken, so seeding from the
+    // snapshot ALONE would regress to 0 and permanently refuse an honest successor.
+    w1.close()
+    await waitFor(async () => (h.relay.roomSize(DOC) === 0 ? true : null))
+    const w2 = await h.connect({ uid: 'u2', role: 'writer', actor: 'u2-actor' })
+    await helloReady(w2)
+    // An honest op just above the tail's high-water is ACCEPTED because the clock
+    // re-seeded from the durable tail (max l = SLACK+1), not from the (absent) snapshot.
+    w2.send({ t: 'ops', pv: 2, k: 1, frameId: 't3', epoch: 0, ops: [{ op: 'set', a: 'u2-actor', s: 1, l: SLACK + 2, k: 'x', v: 3 }] })
+    expect(await w2.recv()).toMatchObject({ ctl: 'ack' })
   })
 })
 

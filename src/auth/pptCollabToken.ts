@@ -99,6 +99,21 @@ export interface PptCollabTokenResult {
   pptWsUrl?: string
   /** Trusted display name; omitted when the directory supplied none. */
   name?: string
+  /**
+   * The server-minted Bento actor id this session authors under (XIN-1792 P0-1 —
+   * the DELIVERY half of the D1 actor contract). The relay REQUIRES every `op.a` to
+   * equal this value and refuses any mismatch PERMANENTLY (`protocol-version`), so a
+   * client MUST author its Bento `SyncEngine` under exactly this actor — it can no
+   * longer mint its own. Returned here (and echoed in the relay `ready` frame) so the
+   * client seeds its replica identity WITHOUT decoding the opaque JWT, exactly as
+   * `epoch`/`snapshotVersion` are. Stable across reconnects for a fixed
+   * `clientSessionId` (XIN-1792 P0-2), so the client reuses the same actor after a
+   * blip. Populated whenever the token binds a server-minted actor — which the
+   * production `collab-token` endpoint always does (it mints one from the caller's
+   * `clientSessionId`); omitted only by low-level callers that sign a legacy
+   * actor-less token.
+   */
+  actor?: string
 }
 
 export interface IssuePptCollabInput {
@@ -121,17 +136,30 @@ export interface IssuePptCollabInput {
 }
 
 /**
- * Mint the server-side Bento actor id for a collab session (XIN-1789 D1). The actor
- * is derived from the authenticated `uid` (+ `docId` + a fresh per-session nonce) so
- * the CLIENT can never choose or forge it: it is an HMAC over the shared collab
- * secret, truncated into the wire-accepted actor charset (`[a-z0-9-]`, see
- * {@link isValidActorId}). A fresh nonce per issuance means each collab-token grant
- * is its own session with its own actor — so a page reload mints a new actor, which
- * the relay's idempotent-resend path tolerates (a re-ack keys off `frameId`, not the
- * actor). Hex output is a subset of the accepted charset; 32 hex chars (128 bits) is
+ * Mint the server-side Bento actor id for a collab session (XIN-1789 D1 / XIN-1792
+ * P0-2). The actor is derived from the authenticated `uid` (+ `docId` + a STABLE
+ * client-supplied `session` id) so the CLIENT can never choose or forge WHICH actor
+ * its ops are attributed to (the value is an HMAC over the shared collab secret,
+ * truncated into the wire-accepted actor charset `[a-z0-9-]`, see
+ * {@link isValidActorId}), yet the actor is STABLE for a given `(uid, docId,
+ * session)` triple.
+ *
+ * `session` is a REQUIRED, caller-supplied identifier the client persists across
+ * reconnects (XIN-1792 P0-2). A Bento actor is the identity of a CRDT *replica* — it
+ * is embedded in the replica's durable structures (`vv` keys, LWW stamps `[l,a]`, RGA
+ * token ids `s<l>.<a>.<i>`) and fixed at engine construction. Minting a fresh random
+ * actor per issuance (the pre-P0-2 default) yielded one actor per WS connection and a
+ * new one on every reconnect, so a network blip either permanently refused the
+ * client's ops (its engine kept an actor the relay no longer accepts) or discarded
+ * every op minted under the old actor that was not yet durable. Deriving from a
+ * client-persisted session id makes the actor a property of the SESSION, not the
+ * connection: the same session id reconnects to the same actor, so a byte-identical
+ * idempotent resend re-acks and unsent work survives a reconnect.
+ *
+ * Hex output is a subset of the accepted charset; 32 hex chars (128 bits) is
  * collision-safe and well under the 64-char cap.
  */
-export function mintCollabActor(uid: string, docId: string, session: string = randomUUID()): string {
+export function mintCollabActor(uid: string, docId: string, session: string): string {
   return createHmac('sha256', config.collabToken.secret)
     .update(`${uid}\u0000${docId}\u0000${session}`)
     .digest('hex')
@@ -192,6 +220,11 @@ export function issuePptCollabToken(input: IssuePptCollabInput): PptCollabTokenR
   }
   if (config.ppt.relay.publicWsUrl !== '') result.pptWsUrl = config.ppt.relay.publicWsUrl
   if (name !== undefined) result.name = name
+  // Deliver the server-minted actor to the client (XIN-1792 P0-1): the relay refuses
+  // any op whose `a` differs, so a client that never learns this value would have
+  // every `ops` frame permanently refused. Seeded here alongside the token, and
+  // re-delivered on the relay `ready` frame.
+  if (actor !== undefined) result.actor = actor
   return result
 }
 
