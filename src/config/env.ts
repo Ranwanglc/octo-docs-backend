@@ -113,7 +113,6 @@ export function parseTrustProxy(raw: string): boolean | number | string {
 
 /** Dev-only fallback secret; must never reach production. */
 const DEV_SIGNING_SECRET = 'dev-only-change-me'
-const MIN_PRODUCTION_SIGNING_SECRET_BYTES = 32
 
 /**
  * Fail-fast guard: in production the attachment signing secret must be a real
@@ -126,17 +125,6 @@ export function requireSafeSigningSecret(secret: string): string {
   if (secret === DEV_SIGNING_SECRET && process.env.NODE_ENV === 'production') {
     throw new Error(
       'ATTACHMENT_SIGNING_SECRET must be overridden in production (refusing to run with the dev default)',
-    )
-  }
-  return secret
-}
-
-export function requireSafeCollabTokenSecret(secret: string): string {
-  if (process.env.NODE_ENV !== 'production') return secret
-  const bytes = Buffer.byteLength(secret, 'utf8')
-  if (secret.trim() === '' || secret === DEV_SIGNING_SECRET || bytes < MIN_PRODUCTION_SIGNING_SECRET_BYTES) {
-    throw new Error(
-      `COLLAB_TOKEN_SECRET must be set to at least ${MIN_PRODUCTION_SIGNING_SECRET_BYTES} bytes in production (refusing to run with a missing, weak, or dev default secret)`,
     )
   }
   return secret
@@ -212,6 +200,15 @@ export function resolveCardDisplayTimeZone(raw: string): string {
   }
   return value
 }
+
+/**
+ * Master on/off switch for the R4-B1 PPT collab relay (default OFF), read ONCE
+ * here so it can gate both the `relay.enabled` value AND the production
+ * validation of the relay's own env (e.g. PPT_RELAY_PUBLIC_WS_URL) — a disabled
+ * relay must be truly inert at boot, never fail startup for a knob it will not
+ * consult (XIN-1825 P1-2). `strictBool` so an operator typo fails startup loudly.
+ */
+const PPT_RELAY_ENABLED = strictBool('PPT_RELAY_ENABLED', false)
 
 export const config = {
   hostname: str('HOSTNAME', 'octo-docs-local'),
@@ -316,7 +313,12 @@ export const config = {
   },
 
   collabToken: {
-    secret: requireSafeCollabTokenSecret(str('COLLAB_TOKEN_SECRET', DEV_SIGNING_SECRET)),
+    // COLLAB_TOKEN_SECRET is read verbatim (dev default outside prod). A
+    // production strength gate (non-dev-default + a minimum byte length) is a
+    // SERVICE-WIDE config hardening that fails startup for every document type,
+    // so it does not belong on this default-off PPT feature branch; it is split
+    // out into a standalone config PR a deploy owner reviews (XIN-1825 P1-1).
+    secret: str('COLLAB_TOKEN_SECRET', DEV_SIGNING_SECRET),
     ttlSeconds: num('COLLAB_TOKEN_TTL_SECONDS', 300),
     // Public, browser-reachable collab WS origin surfaced to clients as
     // `collabWsUrl` in the collab-token response (§4.4). Absolute ws://|wss://
@@ -794,7 +796,7 @@ export const config = {
       // still enforces the server-only room-relative clock bound; the actor/uid and
       // per-actor sequence gates are Half B). `strictBool` so an operator typo fails
       // startup loudly rather than silently turning the endpoint on.
-      enabled: strictBool('PPT_RELAY_ENABLED', false),
+      enabled: PPT_RELAY_ENABLED,
       // Bento CRDT sync protocol version the relay speaks (`SYNC_V`). A frame
       // whose `pv` is missing or != this is refused with `protocol-version`
       // BEFORE any decode/persist. Mirrors ppt_doc_state.bento_sync_pv. A protocol
@@ -807,8 +809,14 @@ export const config = {
       // Public, browser-reachable relay WS origin surfaced to clients as
       // `pptWsUrl` in the collab-token response (§7.1). Absolute ws://|wss://
       // only; REQUIRED in production (unset/malformed is fatal — see
-      // resolveCollabPublicWsUrl), soft (warn => omit) outside production.
-      publicWsUrl: resolveCollabPublicWsUrl(str('PPT_RELAY_PUBLIC_WS_URL', ''), 'PPT_RELAY_PUBLIC_WS_URL'),
+      // resolveCollabPublicWsUrl) ONLY when the relay is enabled. When the relay
+      // is OFF (the default) its validation is SKIPPED so the disabled default is
+      // truly inert and cannot fail startup for a URL it will never surface
+      // (XIN-1825 P1-2); the raw value is carried through unvalidated but is never
+      // consulted while `enabled` is false.
+      publicWsUrl: PPT_RELAY_ENABLED
+        ? resolveCollabPublicWsUrl(str('PPT_RELAY_PUBLIC_WS_URL', ''), 'PPT_RELAY_PUBLIC_WS_URL')
+        : str('PPT_RELAY_PUBLIC_WS_URL', '').trim(),
       // Bento default relay limits (§7.3). Starting values ported from Bento's
       // upstream sync worker; load-test before production. Enforced as hard
       // refusals: `too-large` (permanent), `rate-limited` (retryable),
@@ -825,7 +833,8 @@ export const config = {
       // op/blob caps. Previously only `ops`/`snap` were byte-capped, leaving these
       // frames an unbounded ingress a client could flood (XIN-1660 hardening).
       maxEphemeralFrameBytes: numMin('PPT_RELAY_MAX_EPHEMERAL_FRAME_BYTES', 64 * 1024, 1),
-      maxLiveBufferFrames: numMin('PPT_RELAY_MAX_LIVE_BUFFER_FRAMES', 4096, 1),      maxLiveBufferBytes: numMin('PPT_RELAY_MAX_LIVE_BUFFER_BYTES', 8 * 1024 * 1024, 1),
+      maxLiveBufferFrames: numMin('PPT_RELAY_MAX_LIVE_BUFFER_FRAMES', 4096, 1),
+      maxLiveBufferBytes: numMin('PPT_RELAY_MAX_LIVE_BUFFER_BYTES', 8 * 1024 * 1024, 1),
       // Page bounds for replay: each `openReplay` cursor reads at most this many
       // op rows and bytes per page, sends that page, then fetches the next.
       replayPageSize: numMin('PPT_RELAY_REPLAY_PAGE_SIZE', 1000, 1),

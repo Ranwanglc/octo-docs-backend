@@ -430,5 +430,6 @@ CREATE TABLE ppt_collab_frame (
   seq         BIGINT      NOT NULL,                         -- room seq this frame was assigned (retained past prune)
   payload_hash CHAR(64)   NULL,                             -- sha256(hex) of the CANONICAL ops payload (frame.ops, stable key order); NULL rows are verified against frame_json when the op row exists, else fail closed
   recorded_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), -- when the mapping was recorded (append time)
-  PRIMARY KEY (doc_id, frame_id)
+  PRIMARY KEY (doc_id, frame_id),
+  KEY idx_ppt_collab_frame_doc_seq (doc_id, seq)           -- range key for the retention prune `WHERE doc_id=? AND seq<=?` (XIN-1825 P2-1); without it the DELETE range-scans the whole (doc_id) PK partition and next-key-locks every row it examines
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

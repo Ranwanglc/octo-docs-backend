@@ -49,7 +49,7 @@ import { fetchExternalImage } from '../src/util/fetchExternalImage.js'
 import { docAttachmentRepo } from '../src/db/repos/docAttachmentRepo.js'
 import { query } from '../src/db/pool.js'
 import { buildSchema, SCHEMA_VERSION } from '../src/schema/index.js'
-import { requireSafeCollabTokenSecret, requireSafeSigningSecret } from '../src/config/env.js'
+import { requireSafeSigningSecret } from '../src/config/env.js'
 import { verifySignedUrl } from '../src/storage/objectStore.js'
 
 interface MockRes {
@@ -497,19 +497,6 @@ describe('signing-secret fail-fast (§3.5 / production)', () => {
   it('keeps the dev default working outside production', () => {
     process.env.NODE_ENV = 'test'
     expect(requireSafeSigningSecret(DEV_DEFAULT)).toBe(DEV_DEFAULT)
-  })
-
-  it('rejects missing, weak, and dev-default collab relay secrets in production', () => {
-    process.env.NODE_ENV = 'production'
-    expect(() => requireSafeCollabTokenSecret('')).toThrow(/COLLAB_TOKEN_SECRET/)
-    expect(() => requireSafeCollabTokenSecret(DEV_DEFAULT)).toThrow(/COLLAB_TOKEN_SECRET/)
-    expect(() => requireSafeCollabTokenSecret('short-secret')).toThrow(/COLLAB_TOKEN_SECRET/)
-  })
-
-  it('accepts a strong collab relay secret in production', () => {
-    process.env.NODE_ENV = 'production'
-    const strong = '0123456789abcdef0123456789abcdef'
-    expect(requireSafeCollabTokenSecret(strong)).toBe(strong)
   })
 })
 

@@ -16,6 +16,7 @@
  *    `pruneOpsThrough` runs only after that write is durable.
  */
 import { createHash } from 'node:crypto'
+import { config } from '../../config/env.js'
 import type { BentoDoc } from '../bentoDoc.js'
 import type { SyncStateJSON } from '../sync/slidesSync.js'
 
@@ -460,11 +461,25 @@ export class InMemoryPptRelayStore implements PptRelayStore {
       }
       return true
     })
-    // Deliberately DO NOT drop `byFrameId` for pruned frames: idempotent-resend
-    // dedup must survive GC (XIN-1655 C1). A frame re-sent after its op row is
-    // pruned still re-acks its original seq via the retained mapping rather than
-    // being minted a fresh seq and rebroadcast. This mirrors the DB store's
-    // `ppt_collab_frame` dedup ledger.
+    // Retain `byFrameId` PAST the op prune so idempotent-resend dedup survives GC
+    // (XIN-1655 C1): a frame re-sent after its op row is pruned still re-acks its
+    // original seq via the retained mapping rather than being minted a fresh seq
+    // and rebroadcast. But the ledger cannot grow forever — so mirror the DB
+    // store's retention prune (XIN-1821 P1-4 / XIN-1825 P2-2): reclaim only
+    // mappings FAR behind coverage (`seq <= coveredSeq - ledgerRetentionFrames`),
+    // keeping every recent frame an idempotent resend could target. A resend older
+    // than the window is re-minted a fresh seq and rebroadcast, but the op's
+    // `(a,s)` is `<= vv[a]` so every replica's reducer drops it — inert, never a
+    // divergence. Keeping this in lockstep with the DB store also means the
+    // relay-level tests (which run against THIS store) actually exercise the
+    // post-retention resend branch, instead of asserting a claim the DB store
+    // makes but no test executes.
+    const retainThroughSeq = coveredSeq - config.ppt.relay.ledgerRetentionFrames
+    if (retainThroughSeq > 0) {
+      for (const [frameId, identity] of r.byFrameId) {
+        if (identity.seq <= retainThroughSeq) r.byFrameId.delete(frameId)
+      }
+    }
     return freed
   }
 

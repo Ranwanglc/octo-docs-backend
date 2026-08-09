@@ -318,6 +318,7 @@ vi.mock('../src/db/pool.js', () => ({
 
 import { DbPptRelayStore } from '../src/ppt/relay/dbStore.js'
 import { canonicalPayloadHash } from '../src/ppt/relay/store.js'
+import { config } from '../src/config/env.js'
 import { transaction } from '../src/db/pool.js'
 import { pptCollabFrameRepo } from '../src/db/repos/pptCollabFrameRepo.js'
 import { SnapshotColumnOverflowError, SNAPSHOT_COLUMN_MAX_BYTES } from '../src/db/repos/pptLiveSnapshotRepo.js'
@@ -448,6 +449,30 @@ describe('DbPptRelayStore — append monotonicity & first-writer race (B1 / P0-2
     await transaction((tx) => pptCollabFrameRepo.pruneLedgerThroughTx(tx as Tx, D, 0))
     await transaction((tx) => pptCollabFrameRepo.pruneLedgerThroughTx(tx as Tx, D, -5))
     expect(db.frames.get(D)!.size).toBe(2)
+  })
+
+  it('pruneOpsThrough drives the ACTIVE retention branch: computes coveredSeq - ledgerRetentionFrames and reclaims only far-behind ledger rows (XIN-1825 P2-3)', async () => {
+    // The other retention tests call pruneLedgerThroughTx DIRECTLY with a hand-passed
+    // seq, so nothing exercised `pruneOpsThrough`'s own `coveredSeq - config` math on a
+    // path where it actually deletes (a transposed sign / wrong config key would pass).
+    // Drive it end-to-end through the store with a tiny window.
+    const original = config.ppt.relay.ledgerRetentionFrames
+    ;(config.ppt.relay as { ledgerRetentionFrames: number }).ledgerRetentionFrames = 2
+    try {
+      const store = new DbPptRelayStore()
+      for (const f of ['f1', 'f2', 'f3', 'f4', 'f5']) await store.appendOp(D, f, { f })
+      expect(db.frames.get(D)!.size).toBe(5)
+      await store.saveSnapshot({ docId: D, coveredSeq: 5, doc: deck() })
+      // retainThroughSeq = coveredSeq(5) - ledgerRetentionFrames(2) = 3 -> f1/f2/f3 go.
+      await store.pruneOpsThrough(D, 5)
+      expect(await store.frameIdentity(D, 'f1')).toBeNull()
+      expect(await store.frameIdentity(D, 'f2')).toBeNull()
+      expect(await store.frameIdentity(D, 'f3')).toBeNull()
+      expect((await store.frameIdentity(D, 'f4'))?.seq).toBe(4) // within window, kept
+      expect((await store.frameIdentity(D, 'f5'))?.seq).toBe(5)
+    } finally {
+      ;(config.ppt.relay as { ledgerRetentionFrames: number }).ledgerRetentionFrames = original
+    }
   })
 
   it('legacy pruned frame identities with NULL payload_hash fail closed instead of wildcard re-acking', async () => {

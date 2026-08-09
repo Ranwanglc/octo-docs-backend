@@ -369,6 +369,17 @@ export const MAX_OP_CLOCK = 2 ** 45
  * headroom for any real editing session (a slide deck never mints a million offline
  * ops) while still refusing a poison value orders of magnitude above the live clock
  * long before it reaches {@link MAX_OP_CLOCK}.
+ *
+ * RESIDUAL (XIN-1825 P2-4, documented not fixed): this relative bound is a RATCHET,
+ * not a ceiling. Each accepted frame carrying `l = roomLamport + OP_CLOCK_SLACK`
+ * lifts the room clock by up to `OP_CLOCK_SLACK`, so a client can walk the clock
+ * toward {@link MAX_OP_CLOCK} in ~`MAX_OP_CLOCK / OP_CLOCK_SLACK` (= 2^25 ≈ 33.5M)
+ * accepted frames. The per-connection rate limit (`maxFramesPerWindow`) bounds ONE
+ * socket's rate, but there is no per-room/per-doc connection cap, so the wall-clock
+ * cost divides by the socket count. This lifts the original P0-2 single-frame brick
+ * to a 33.5M-frame walk — a large, real improvement, not a closed hole. Bounding
+ * total room-clock GROWTH per accepted op (rather than only per-op distance from the
+ * live clock) would close it; deferred with the Half B op-metadata trust boundary.
  */
 export const OP_CLOCK_SLACK = 2 ** 20
 

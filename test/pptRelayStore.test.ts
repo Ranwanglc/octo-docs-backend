@@ -2,6 +2,7 @@ import './helpers/pptRelayEnv.js'
 
 import { describe, it, expect } from 'vitest'
 import { InMemoryPptRelayStore } from '../src/ppt/relay/store.js'
+import { config } from '../src/config/env.js'
 import type { BentoDoc } from '../src/ppt/bentoDoc.js'
 
 /**
@@ -93,5 +94,38 @@ describe('InMemoryPptRelayStore invariants (§7.3)', () => {
     expect(resend.duplicate).toBe(true)
     expect(resend.seq).toBe(1)
     expect(await s.currentSeq('d1')).toBe(2) // no new seq minted
+  })
+
+  it('ledger retention prune (P1-4 / XIN-1825 P2-2, in-memory parity): a resend OLDER than the retention window is re-minted + rebroadcast, a recent one still re-acks', async () => {
+    // The DB store retention-prunes its dedup ledger; the in-memory store must
+    // mirror it or the relay-level tests (which run against THIS store) never
+    // execute the post-retention resend branch. Drive it with a tiny window.
+    const original = config.ppt.relay.ledgerRetentionFrames
+    ;(config.ppt.relay as { ledgerRetentionFrames: number }).ledgerRetentionFrames = 2
+    try {
+      const s = new InMemoryPptRelayStore()
+      for (const f of ['f1', 'f2', 'f3', 'f4', 'f5']) await s.appendOp('d1', f, { f })
+      // Snapshot covers all 5; the prune reclaims ledger mappings with
+      // seq <= coveredSeq - 2 = 3 (f1/f2/f3) and keeps f4/f5 (the recent frames an
+      // idempotent resend could still target).
+      await s.saveSnapshot({ docId: 'd1', coveredSeq: 5, doc: deck() })
+      await s.pruneOpsThrough('d1', 5)
+
+      // f4 is within the window -> still re-acked at its ORIGINAL seq (duplicate).
+      const recent = await s.appendOp('d1', 'f4', { f: 'f4' })
+      expect(recent.duplicate).toBe(true)
+      expect(recent.seq).toBe(4)
+      expect(await s.currentSeq('d1')).toBe(5) // no seq minted for a live re-ack
+
+      // f1 fell out of the window -> its mapping was reclaimed, so the resend is a
+      // FRESH seq + rebroadcast, NOT a re-ack. (The reducer drops it downstream as a
+      // duplicate `op.s <= vv[a]`; here we pin the store's post-retention behavior.)
+      const stale = await s.appendOp('d1', 'f1', { f: 'f1' })
+      expect(stale.duplicate).toBe(false)
+      expect(stale.seq).toBe(6)
+      expect(await s.currentSeq('d1')).toBe(6)
+    } finally {
+      ;(config.ppt.relay as { ledgerRetentionFrames: number }).ledgerRetentionFrames = original
+    }
   })
 })

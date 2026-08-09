@@ -52,8 +52,14 @@ export const SNAPSHOT_COLUMN_MAX_BYTES = 16_777_215
  * could not be persisted intact (XIN-1821 P1-3). Non-retryable by construction (it is
  * not a transient lock error), so the relay's forced-snapshot path surfaces it as a
  * permanent `room-full` (the deck is at storage capacity) rather than retrying forever,
- * and the soft path leaves the op log durable. OPERATOR: alert on this — the deck's
- * materialized state has outgrown the column and needs a schema/segmentation change.
+ * and the soft path leaves the op log durable. OPERATOR SIGNAL (XIN-1825 P2-7): unlike
+ * `ppt_relay_aged_op_drop`, this is NOT yet wired to a structured operator-alert channel
+ * — today it is observable only as the `room-full` refusal (forced path) or a
+ * `console.warn` (soft path). Wiring it through the same `onAgedOpDrop`-style handler is
+ * deferred; the guard's job here is to make the failure LOUD-and-safe (a refusal, never a
+ * silent truncate-then-prune), which it does regardless of that channel. When it fires,
+ * the deck's materialized state has outgrown the column and needs a schema/segmentation
+ * change.
  */
 export class SnapshotColumnOverflowError extends Error {
   constructor(

@@ -17,8 +17,21 @@
  * add ZERO new IO and stay byte-identical to the pre-feature result. A verified
  * bot's membership is implied by the cross-space gate (req.spaceId ===
  * meta.space_id, enforced before this runs); a human's is resolved via
- * isSpaceMember, which fails closed to `false` on any lookup error, so the share
- * path can only open access on a confirmed membership, never on a failure.
+ * isSpaceMember, which itself fails closed to `false` on a transport / lookup
+ * error (see isSpaceMember), so the share path can only open access on a
+ * confirmed membership, never on a failure.
+ *
+ * Membership-lookup ERROR handling differs by caller, deliberately:
+ *   - `resolveEffectiveRole` (the legacy REST guard + the three transactional
+ *     write services) lets an unexpected throw PROPAGATE, byte-identical to
+ *     merge-base — an identity-service failure surfaces as a 5xx rather than
+ *     silently degrading an `anyone_in_space` share writer to 403.
+ *   - `resolveEffectiveRoleWithMembership` (the PPT relay ticket path only) fails
+ *     CLOSED to `member=false` and LOGS: the ticket must resolve to a concrete
+ *     boolean it can sign, and a live downgrade recheck must match issuance, so a
+ *     throw there would break issuance/reauth rather than degrade gracefully.
+ * The fail-closed swallow is thus SCOPED to the relay caller (XIN-1825 P1-3),
+ * not shared with the legacy doc/sheet/board paths.
  */
 import { effectiveRole, SHARE_SCOPE_ANYONE } from './shareScope.js'
 import { roleAtLeast, type ResolvedRole } from './role.js'
@@ -89,9 +102,19 @@ export async function resolveEffectiveRoleWithMembership(
     member = caller.isBot
       ? true
       : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
-  } catch {
-    // Fail-closed: a lookup error never widens access, and the SAME false drives
-    // both the role and the claim so they stay consistent.
+  } catch (err) {
+    // Fail-closed, SCOPED to the relay ticket path: a lookup error never widens
+    // access, and the SAME false drives both the role and the token claim so they
+    // stay consistent (a ticket must carry a concrete, signable boolean; a throw
+    // here would break issuance/reauth instead of degrading gracefully). The
+    // legacy `resolveEffectiveRole` below does NOT swallow — it lets the error
+    // propagate as at merge-base. Logged so the swallow is never silent
+    // (XIN-1825 P1-3).
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[permission] isSpaceMember lookup failed (uid=${uid} space=${meta.space_id}); relay ticket path failing closed to non-member`,
+      err,
+    )
     member = false
   }
   return { role: effectiveRole(direct, member, meta.share_scope, meta.share_role), spaceMember: member }
@@ -103,5 +126,17 @@ export async function resolveEffectiveRole(
   meta: ShareResolvable,
   caller: ShareCaller = {},
 ): Promise<ResolvedRole> {
-  return (await resolveEffectiveRoleWithMembership(uid, direct, meta, caller)).role
+  // Legacy REST guard + the three transactional write services. Membership is
+  // resolved WITHOUT the relay path's fail-closed swallow, so an unexpected
+  // identity-service throw PROPAGATES (byte-identical to merge-base) rather than
+  // silently degrading an `anyone_in_space` share writer to 403. `isSpaceMember`
+  // still fails closed to `false` on a transport error at its own source, so the
+  // normal outage path is unchanged; only a genuinely unexpected throw surfaces.
+  if (meta.share_scope !== SHARE_SCOPE_ANYONE || roleAtLeast(direct, 'writer')) {
+    return direct
+  }
+  const member = caller.isBot
+    ? true
+    : await getOctoIdentity().isSpaceMember(uid, meta.space_id, caller.token ?? '')
+  return effectiveRole(direct, member, meta.share_scope, meta.share_role)
 }
