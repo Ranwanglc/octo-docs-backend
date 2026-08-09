@@ -111,6 +111,7 @@ async function setup(
     epochProvider?: (documentName: string) => Promise<number>
     docStatusProvider?: (docId: string) => Promise<'live' | 'deleted'>
     baseDocProvider?: (docId: string) => Promise<import('../src/ppt/bentoDoc.js').BentoDoc | null>
+    onAgedOpDrop?: import('../src/ppt/relay/snapshotter.js').AgedOpDropHandler
   } = {},
 ): Promise<Harness> {
   const store = opts.store ?? new InMemoryPptRelayStore()
@@ -124,6 +125,7 @@ async function setup(
     roleProvider: opts.roleProvider ?? (async ({ uid }) => roleMap.get(uid) ?? 'writer'),
     docStatusProvider: opts.docStatusProvider ?? (async () => docStatus),
     ...(opts.baseDocProvider ? { baseDocProvider: opts.baseDocProvider } : {}),
+    ...(opts.onAgedOpDrop ? { onAgedOpDrop: opts.onAgedOpDrop } : {}),
     limits: opts.limits,
   })
   const server: HttpServer = createServer()
@@ -1226,6 +1228,66 @@ describe('PPT relay: byte-accurate limits + binding blob cap (non-blocking)', ()
     // 0, but seeding from durable state pushes it over the room cap.
     w.send({ t: 'ops', pv: 2, k: 1, frameId: 'over', epoch: 0, ops: [{ op: 'set', a: 'u-test', s: 1, l: 1, k: 'p', v: 'z'.repeat(50) }] })
     expect(await w.recv()).toMatchObject({ code: 'room-full', retryable: false })
+  })
+
+  it('XIN-1819 B1: a byte-exhausted, ghost-pinned room unfreezes on the forced snapshot instead of bricking room-full', async () => {
+    // Reproduce Jerry-Xin's byte-exhaustion brick end-to-end. A single ghost-target op
+    // (a wire-legal `set` against an element no `ins` ever creates) parks in the engine
+    // `pending` buffer forever, pinning `provenSeq` at `coveredSeq`. Large legitimate
+    // frames then fill the room BYTE budget while the frozen tail is only a handful of
+    // seqs — FAR below the (default 4096) seq-lag age-out cap. Pre-fix, the forced
+    // `room-full` snapshot reclaims nothing (age-out is seq-lag-only) and the room is
+    // refused `room-full` PERMANENTLY. With the byte-aware unfreeze trigger the forced
+    // path ages the ghost op out, prunes the tail, and the write is accepted.
+    const drops: Array<{ trigger: string; bufferedLag: number; lagCap: number; dropped: Array<{ a: string; s: number }> }> = []
+    const h = await setup({
+      baseDocProvider: async () => deck('genesis'),
+      onAgedOpDrop: (e) => drops.push(e),
+      limits: {
+        maxFrameBytes: 200_000,
+        maxSingleBlobBytes: 200_000,
+        maxRoomFrameBytes: 180_000,
+        maxFramesPerWindow: 1000,
+        // Disable the SOFT trigger so only the forced (`room-full`) path acts — the soft
+        // path would ghost-pin and reclaim nothing anyway, but this keeps the test
+        // deterministic (no fire-and-forget snapshot racing the sends).
+        snapshotSoftThresholdBytes: 100_000_000,
+      },
+    })
+    const w = await h.connect({ uid: 'u_w', role: 'writer' })
+    await helloReady(w)
+
+    // seq 1: the ghost-target op — parks in `pending` forever, freezes GC.
+    w.send({ t: 'ops', pv: 2, k: 1, frameId: 'ghost', epoch: 0, ops: [{ op: 'set', a: 'ghost-actor', s: 1, l: 1, el: 'ghost-el', k: 'x', v: 1 }] })
+    expect(await w.recv()).toMatchObject({ ctl: 'ack', q: 1 })
+
+    // seqs 2..4: large legitimate doc-level frames (~50 KiB each) that materialize
+    // cleanly, driving room bytes toward the 180 KiB cap at a frozen tail of ≈4 seqs.
+    // The author's per-actor `s` is contiguous from 1 so nothing gap-buffers — only the
+    // ghost op stays parked, so it is the sole aged-out drop.
+    const big = 'x'.repeat(50_000)
+    for (let i = 2; i <= 4; i++) {
+      w.send({ t: 'ops', pv: 2, k: i, frameId: `big${i}`, epoch: 0, ops: [{ op: 'set', a: 'author', s: i - 1, l: i, k: `pad${i}`, v: big }] })
+      expect(await w.recv()).toMatchObject({ ctl: 'ack', q: i })
+    }
+
+    // seq 5: this frame would exceed the byte cap → forced snapshot. Pre-fix this is a
+    // PERMANENT `room-full` (nothing reclaimed below the lag cap); post-fix the byte-
+    // aware age-out unfreezes the room and the write is accepted.
+    w.send({ t: 'ops', pv: 2, k: 5, frameId: 'big5', epoch: 0, ops: [{ op: 'set', a: 'author', s: 4, l: 5, k: 'pad5', v: big }] })
+    const res = await w.recvUntil((m) => m.ctl === 'ack' || m.ctl === 'refused')
+    const last = res.at(-1)!
+    expect(last.ctl).toBe('ack') // the room RECLAIMED — not a permanent room-full brick
+    expect(last.q).toBe(5)
+
+    // The ghost op was aged out via the BYTE-budget trigger, below the seq-lag cap,
+    // and escalated with its (actor, s) for reconciliation.
+    expect(drops).toHaveLength(1)
+    expect(drops[0]!.trigger).toBe('byte-budget')
+    expect(drops[0]!.bufferedLag).toBeLessThan(drops[0]!.lagCap)
+    expect(drops[0]!.dropped).toEqual([{ a: 'ghost-actor', s: 1 }])
+    // The op log was pruned through the forced snapshot: the covered prefix is gone.
+    expect((await h.store.opsSince(DOC, 0)).every((o) => o.seq > 4)).toBe(true)
   })
 })
 

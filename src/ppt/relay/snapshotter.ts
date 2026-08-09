@@ -92,10 +92,19 @@ export type AgedOpDropHandler = (event: {
   docId: string
   /** Room seq the compacting snapshot was persisted at. */
   targetSeq: number
-  /** Frozen-tail lag (seqs) that crossed the cap and triggered the drop. */
+  /** Frozen-tail lag (seqs) at the drop. */
   bufferedLag: number
-  /** The lag cap the tail exceeded. */
+  /** The seq-lag age-out cap ({@link DEFAULT_MAX_BUFFERED_OP_LAG}). */
   lagCap: number
+  /**
+   * What forced the age-out (XIN-1819 B1):
+   *   • `'seq-lag'`     — the frozen tail grew past `lagCap` seqs.
+   *   • `'byte-budget'` — a forced (`room-full`) snapshot could not advance because the
+   *                       tail is ghost-pinned and the room is at/over its byte budget,
+   *                       so the op was aged out BELOW the lag cap to keep the room from
+   *                       bricking read-only. `bufferedLag < lagCap` on this path.
+   */
+  trigger: 'seq-lag' | 'byte-budget'
   /** The dropped ops' `(actor, s)` identities. */
   dropped: AgedOpDrop[]
 }) => void
@@ -274,14 +283,15 @@ export function defaultAgedOpDropHandler(event: {
   targetSeq: number
   bufferedLag: number
   lagCap: number
+  trigger: 'seq-lag' | 'byte-budget'
   dropped: AgedOpDrop[]
 }): void {
   // eslint-disable-next-line no-console
   console.warn(
     `[ppt-relay] doc ${event.docId}: aged out ${event.dropped.length} permanently-buffered op(s) to unfreeze GC ` +
-      `(XIN-1792 P1-3 / XIN-1800 P1-2; frozen tail=${event.bufferedLag} seqs crossed lag cap ${event.lagCap} at ` +
-      `seq ${event.targetSeq}); these ops may still be filled by a FUTURE durable dependency on live peers — ` +
-      `reconcile/alert: dropped=${JSON.stringify(event.dropped)}`,
+      `(XIN-1792 P1-3 / XIN-1800 P1-2 / XIN-1819 B1; trigger=${event.trigger}, frozen tail=${event.bufferedLag} seqs, ` +
+      `lag cap ${event.lagCap} at seq ${event.targetSeq}); these ops may still be filled by a FUTURE durable dependency ` +
+      `on live peers — reconcile/alert: dropped=${JSON.stringify(event.dropped)}`,
   )
 }
 
@@ -323,10 +333,20 @@ export class PptSnapshotter {
    * Bento SyncState cannot be faithfully reduced (XIN-1770 — see the guard below).
    * A storage failure propagates to the caller, which classifies it (retryable →
    * `storage-retry`) — the snapshot is never acked as done when its write failed.
+   *
+   * `opts.forceUnfreeze` (XIN-1819 B1) is set by the relay's forced (`room-full`)
+   * snapshot path: it signals the room is at/over its byte budget and MUST reclaim
+   * rather than brick. On that path, if the tail is ghost-pinned (a permanently-
+   * buffered op holds `provenSeq` at `coveredSeq`), the buffered op(s) are aged out
+   * and the tail pruned REGARDLESS of seq lag — the byte-aware unfreeze trigger. The
+   * normal soft-snapshot path leaves `forceUnfreeze` unset, so it still only ages a
+   * buffered op once the frozen tail crosses `maxBufferedOpLag`; the materialization
+   * durability contract on the non-forced path is unchanged.
    */
   async advance(
     docId: string,
     baseDocProvider: ((docId: string) => Promise<BentoDoc | null>) | undefined,
+    opts?: { forceUnfreeze?: boolean },
   ): Promise<SnapshotRunResult | null> {
     const existing = await this.store.getSnapshot(docId)
     // Legacy doc-only boundary guard (XIN-1770). A snapshot row persisted before
@@ -420,10 +440,24 @@ export class PptSnapshotter {
       // prefix. BUT a GHOST-TARGET op (a wire-legal `set`/`txt`/`ord` against an
       // element no `ins` in the durable log ever creates) parks in `pending` FOREVER,
       // so this branch would otherwise pin `coveredSeq` forever and brick the room
-      // read-only at `room-full` (XIN-1792 P1-3). Once the frozen tail has grown to or
-      // past `maxBufferedOpLag` seqs the buffered op is not fillable by anything
-      // ALREADY durable — the whole tail was just reduced and it is still parked — so
-      // AGE it out: persist the whole-tail materialized `(doc, state)` (which excludes
+      // read-only at `room-full` (XIN-1792 P1-3). There are TWO age-out triggers:
+      //
+      //   • SEQ-LAG (XIN-1792 P1-3): once the frozen tail has grown to or past
+      //     `maxBufferedOpLag` seqs the buffered op is not fillable by anything ALREADY
+      //     durable — the whole tail was just reduced and it is still parked.
+      //   • BYTE-BUDGET (XIN-1819 B1): the seq-lag trigger is NOT byte-aware, so a room
+      //     that fills its `maxRoomFrameBytes` budget while the frozen tail is still
+      //     BELOW `maxBufferedOpLag` (≈51 large 1.9 MB frames reach a 96 MiB cap far
+      //     below the 4096-seq cap) would brick read-only PERMANENTLY: every forced
+      //     `room-full` snapshot re-enters this branch, `reattemptPrune` reclaims
+      //     nothing (the covered prefix is already gone), and the room refuses writes
+      //     for every participant. The relay's forced (`room-full`) path therefore sets
+      //     `opts.forceUnfreeze`, signalling the room is at/over its byte budget and
+      //     MUST reclaim: on that path a ghost-pinned tail is aged out regardless of
+      //     seq lag. The soft-snapshot path never sets it, so the normal materialization
+      //     durability contract (age only past the lag cap) is unchanged.
+      //
+      // Either way: persist the whole-tail materialized `(doc, state)` (which excludes
       // the buffered ops) at `targetSeq` and prune through it, ESCALATING what was
       // dropped on the operational channel. This bounds a permanent brick to a bounded
       // drop. RESIDUAL (XIN-1800 P1-2): "not fillable by anything ALREADY durable" is
@@ -432,8 +466,11 @@ export class PptSnapshotter {
       // this heuristic does not detect. That is why the drop is escalated, not merely
       // `console.warn`-ed, so a handler can persist the `(a,s)` pairs / alert.
       const bufferedLag = highWater - coveredSeq
-      if (probe.engine.bufferedOps.length > 0 && bufferedLag >= this.maxBufferedOpLag) {
+      const lagAged = bufferedLag >= this.maxBufferedOpLag
+      const byteAged = opts?.forceUnfreeze === true
+      if (probe.engine.bufferedOps.length > 0 && (lagAged || byteAged)) {
         const dropped: AgedOpDrop[] = probe.engine.bufferedOps.map((o) => ({ a: o.a, s: o.s }))
+        const trigger: 'seq-lag' | 'byte-budget' = lagAged ? 'seq-lag' : 'byte-budget'
         const doc = probe.doc
         const state = probe.engine.toJSON()
         const saved = await this.store.saveSnapshot({ docId, coveredSeq: targetSeq, doc, state })
@@ -443,7 +480,7 @@ export class PptSnapshotter {
         // already unfrozen even if the sink throws (swallowed — GC must never re-brick
         // because the alert channel was down).
         try {
-          this.onAgedOpDrop({ docId, targetSeq: prunableSeq, bufferedLag, lagCap: this.maxBufferedOpLag, dropped })
+          this.onAgedOpDrop({ docId, targetSeq: prunableSeq, bufferedLag, lagCap: this.maxBufferedOpLag, trigger, dropped })
         } catch {
           /* an operational-escalation failure must not abort GC */
         }

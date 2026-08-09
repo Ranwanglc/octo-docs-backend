@@ -39,6 +39,7 @@ export function productionAgedOpDropHandler(event: {
   targetSeq: number
   bufferedLag: number
   lagCap: number
+  trigger: 'seq-lag' | 'byte-budget'
   dropped: AgedOpDrop[]
 }): void {
   // eslint-disable-next-line no-console
@@ -50,6 +51,7 @@ export function productionAgedOpDropHandler(event: {
         targetSeq: event.targetSeq,
         bufferedLag: event.bufferedLag,
         lagCap: event.lagCap,
+        trigger: event.trigger,
         droppedCount: event.dropped.length,
         dropped: event.dropped,
       }),

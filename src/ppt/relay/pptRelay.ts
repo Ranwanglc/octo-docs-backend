@@ -2177,8 +2177,14 @@ export class PptRelay {
       // STILL cannot fit — or the tail could not be reduced (no snapshot produced) —
       // do we refuse `room-full`. A retryable storage failure surfaces as
       // `storage-retry` (the client re-sends), never a permanent `room-full`.
+      //
+      // `forceUnfreeze: true` (XIN-1819 B1): this IS the byte-exhausted path, so the
+      // snapshotter must age out a ghost-pinned tail regardless of seq lag. Without it,
+      // a room whose frozen tail sits below `maxBufferedOpLag` (a single ghost op +
+      // large legitimate frames reaches the 96 MiB cap at a tail of ~51 seqs) would
+      // reclaim nothing here and brick read-only PERMANENTLY for every participant.
       try {
-        await this.snapshotNow(conn.docId)
+        await this.snapshotNow(conn.docId, /* forceUnfreeze */ true)
       } catch (err) {
         if (isRetryableStorageError(err)) {
           this.refuse(conn, 'storage-retry', { k, frameId, message: 'room-full recovery snapshot deferred' })
@@ -2297,9 +2303,14 @@ export class PptRelay {
    * or directly from a handler already running in the chain for the forced path) so
    * it is atomic w.r.t. appends. Returns the run result, or null when there was
    * nothing to advance / no base doc available. Errors propagate to the caller.
+   *
+   * `forceUnfreeze` (XIN-1819 B1) is set ONLY by the `room-full` forced path: it tells
+   * the snapshotter the room is at/over its byte budget and must reclaim rather than
+   * brick, so a ghost-pinned tail is aged out regardless of seq lag. The soft path
+   * leaves it false — a byte-aware age-out is exclusively the room-full escape hatch.
    */
-  private async snapshotNow(docId: string): Promise<SnapshotRunResult | null> {
-    const res = await this.snapshotter.advance(docId, this.baseDocProvider)
+  private async snapshotNow(docId: string, forceUnfreeze = false): Promise<SnapshotRunResult | null> {
+    const res = await this.snapshotter.advance(docId, this.baseDocProvider, { forceUnfreeze })
     if (res && res.freedBytes > 0 && this.roomBytesSeeded.has(docId)) {
       const used = this.roomBytes.get(docId) ?? 0
       this.roomBytes.set(docId, Math.max(0, used - res.freedBytes))

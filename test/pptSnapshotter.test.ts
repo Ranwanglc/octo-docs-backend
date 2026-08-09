@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, vi } from 'vitest'
 import { InMemoryPptRelayStore } from '../src/ppt/relay/store.js'
-import { PptSnapshotter, reduceFrames, assertSyncVersionAligned, SNAPSHOT_REDUCER_ACTOR } from '../src/ppt/relay/snapshotter.js'
+import { PptSnapshotter, reduceFrames, assertSyncVersionAligned, SNAPSHOT_REDUCER_ACTOR, DEFAULT_MAX_BUFFERED_OP_LAG } from '../src/ppt/relay/snapshotter.js'
 import { productionAgedOpDropHandler } from '../src/ppt/relay/index.js'
 import { SYNC_V, SyncState } from '../src/ppt/sync/slidesSync.js'
 import { BENTO_SYNC_V, type BentoDoc } from '../src/ppt/bentoDoc.js'
@@ -416,6 +416,61 @@ describe('PptSnapshotter.advance: ghost-target GC-freeze aging (XIN-1792 P1-3)',
     expect(await store.getSnapshot(DOC)).toBeNull() // no snapshot advanced
   })
 
+  it('XIN-1819 B1: a byte-forced snapshot ages a ghost-pinned tail BELOW the lag cap so a byte-exhausted room unfreezes instead of bricking', async () => {
+    const store = new InMemoryPptRelayStore()
+    await seedGhost(store)
+    const events: Array<{ bufferedLag: number; lagCap: number; trigger: string; dropped: Array<{ a: string; s: number }> }> = []
+    // DEFAULT lag cap (4096) with only 2 seqs of tail: `bufferedLag` (2) is FAR below
+    // the cap, so the seq-lag age-out never fires — this is exactly the window where
+    // the room bricks read-only once its BYTE budget is exhausted. The relay's forced
+    // (`room-full`) path passes `forceUnfreeze` to signal the room is at/over its byte
+    // budget and must reclaim; the byte-aware trigger then ages the ghost-pinned op out
+    // regardless of seq lag.
+    const snapshotter = new PptSnapshotter(store, /* maxBufferedOpLag */ DEFAULT_MAX_BUFFERED_OP_LAG, (e) => events.push(e))
+    const res = await snapshotter.advance(DOC, baseDocProviderFor(genesisDeck()), { forceUnfreeze: true })
+
+    // The room RECLAIMS: the op log is pruned and a real (doc,state) snapshot covers
+    // seq 2 — no permanent brick, unlike the seq-lag-only path (which returns null and
+    // prunes nothing here, see the test above).
+    expect(res).not.toBeNull()
+    expect(res!.coveredSeq).toBe(2)
+    expect(res!.freedBytes).toBeGreaterThan(0)
+    expect(await store.opsSince(DOC, 0)).toEqual([])
+    const snap = await store.getSnapshot(DOC)
+    expect(snap!.coveredSeq).toBe(2)
+    expect(snap!.state).not.toBeNull()
+    // The materialized doc reflects the CLEAN op (title) but not the ghost-target op.
+    expect((snap!.doc as unknown as { title?: unknown }).title).toBe('hi')
+    // The drop is escalated as a byte-budget aging, below the lag cap, with the (a,s) pair.
+    expect(events).toHaveLength(1)
+    expect(events[0]!.trigger).toBe('byte-budget')
+    expect(events[0]!.bufferedLag).toBeLessThan(events[0]!.lagCap)
+    expect(events[0]!.lagCap).toBe(DEFAULT_MAX_BUFFERED_OP_LAG)
+    expect(events[0]!.dropped).toEqual([{ a: 'u1', s: 1 }])
+  })
+
+  it('XIN-1819 B1: forceUnfreeze does NOT weaken the normal (soft) path — a healthy transient buffer is never aged early', async () => {
+    // A byte-forced snapshot only ages when the tail is GHOST-PINNED (provenSeq cannot
+    // advance). If the ghost op's target actually exists, everything materializes and
+    // the tail prunes normally with NO drop — forceUnfreeze must not turn a healthy
+    // room's transient buffer into a spurious drop.
+    const store = new InMemoryPptRelayStore()
+    const cleanFrames = [
+      { seq: 1, ops: [{ op: 'set', a: 'u1', s: 1, l: 5, k: 'title', v: 'hi' }] },
+      { seq: 2, ops: [{ op: 'set', a: 'u1', s: 2, l: 6, k: 'subtitle', v: 'yo' }] },
+    ]
+    for (const f of cleanFrames) {
+      await store.appendOp(DOC, `f${f.seq}`, { t: 'ops', pv: 2, k: f.seq, frameId: `f${f.seq}`, epoch: 0, ops: f.ops })
+    }
+    const events: unknown[] = []
+    const snapshotter = new PptSnapshotter(store, DEFAULT_MAX_BUFFERED_OP_LAG, (e) => events.push(e))
+    const res = await snapshotter.advance(DOC, baseDocProviderFor(genesisDeck()), { forceUnfreeze: true })
+    expect(res).not.toBeNull()
+    expect(res!.coveredSeq).toBe(2)
+    expect(await store.opsSince(DOC, 0)).toEqual([]) // pruned via the normal proven path
+    expect(events).toHaveLength(0) // nothing aged — no ghost pin, no drop
+  })
+
   it('ages out a permanently-buffered op past the lag cap so GC unfreezes (bounded + audited)', async () => {
     const store = new InMemoryPptRelayStore()
     await seedGhost(store)
@@ -489,6 +544,7 @@ describe('PptSnapshotter.advance: ghost-target GC-freeze aging (XIN-1792 P1-3)',
         targetSeq: 2,
         bufferedLag: 3,
         lagCap: 2,
+        trigger: 'seq-lag',
         dropped: [{ a: 'u1', s: 1 }],
       })
       expect(spy).toHaveBeenCalledTimes(1)
@@ -497,11 +553,13 @@ describe('PptSnapshotter.advance: ghost-target GC-freeze aging (XIN-1792 P1-3)',
       const json = JSON.parse(line.slice(line.indexOf('{'))) as {
         event: string
         docId: string
+        trigger: string
         droppedCount: number
         dropped: Array<{ a: string; s: number }>
       }
       expect(json.event).toBe('ppt_relay_aged_op_drop')
       expect(json.docId).toBe(DOC)
+      expect(json.trigger).toBe('seq-lag')
       expect(json.droppedCount).toBe(1)
       expect(json.dropped).toEqual([{ a: 'u1', s: 1 }])
     } finally {
