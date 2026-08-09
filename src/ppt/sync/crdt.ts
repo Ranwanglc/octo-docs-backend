@@ -367,6 +367,29 @@ export class SyncEngine {
     return Object.keys(this.gap).filter((a) => this.gap[a].length)
   }
 
+  /**
+   * Every op currently BUFFERED — accepted by `applyOne` but not yet materialized
+   * into the doc/state. Two buffers hold such ops: `gap` (an op whose per-actor `s`
+   * is above the running contiguous sequence, awaiting its predecessor) and
+   * `pending` (an op whose target node does not exist yet, parked by `applyEffect`).
+   * Returns each as `{ a, s }` (actor, per-actor sequence).
+   *
+   * CRUCIAL for the snapshotter's prune safety: NEITHER buffer is serialized by
+   * {@link toJSON} (it emits `lamport/vv/regs/pos/births/tombs/txt/stash/limbo`
+   * only). An op sitting in either buffer is therefore LOST the moment the state is
+   * snapshotted — so the snapshotter must never advance the covered watermark (and
+   * prune the op log) past a frame whose op is still buffered here, or an
+   * acked-durable mutation is destroyed and the room diverges from live peers who
+   * applied it (XIN-1783 P0-1). This is the materialization probe the module doc
+   * comment (`snapshotter.ts`) refers to; read-only, never mutates engine state.
+   */
+  get bufferedOps(): { a: string; s: number }[] {
+    const out: { a: string; s: number }[] = []
+    for (const ops of Object.values(this.gap)) for (const o of ops) out.push({ a: o.a, s: o.s })
+    for (const ops of Object.values(this.pending)) for (const o of ops) out.push({ a: o.a, s: o.s })
+    return out
+  }
+
   /** dead iff the latest delete out-stamps the latest insert */
   dead(id: string): boolean {
     const t = this.tombs[id]

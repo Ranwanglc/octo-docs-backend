@@ -89,10 +89,15 @@ export function opsOfFrame(frame: unknown): Op[] {
  * snapshotter's watermark probe (which inspects {@link SyncEngine.bufferedOps}).
  * Neither `baseDoc` nor `baseState` is mutated — both are cloned first.
  */
-function reduceInto(
+/**
+ * Seed a fresh reduction engine + doc from a base. `baseState === null` is genesis:
+ * seed positions from the base deck's array order via `adopt` (the SAME seeding the
+ * frontend performs on a never-synced deck). A non-null `baseState` restores the
+ * engine verbatim. Neither input is mutated — both are cloned first.
+ */
+function seedReduction(
   baseDoc: BentoDoc,
   baseState: SyncStateJSON | null,
-  frames: ReducibleFrame[],
 ): { doc: BentoDoc; engine: SyncState } {
   const doc = clone(baseDoc)
   let engine: SyncState
@@ -102,12 +107,67 @@ function reduceInto(
     engine = new SyncState(SNAPSHOT_REDUCER_ACTOR)
     engine.adopt(doc)
   }
+  return { doc, engine }
+}
+
+function reduceInto(
+  baseDoc: BentoDoc,
+  baseState: SyncStateJSON | null,
+  frames: ReducibleFrame[],
+): { doc: BentoDoc; engine: SyncState } {
+  const { doc, engine } = seedReduction(baseDoc, baseState)
   // Ascending seq is the room's authoritative total order; the CRDT converges
   // regardless of interleaving, but applying in room order keeps a snapshot's
   // materialized array order deterministic and matches the frontend's live apply.
   const ordered = [...frames].sort((a, b) => a.seq - b.seq)
   for (const f of ordered) engine.apply(doc, f.ops)
   return { doc, engine }
+}
+
+/**
+ * The result of a materialization-proving reduction: the doc + engine after the
+ * WHOLE tail, plus `provenSeq` — the highest frame seq at which the running
+ * reduction held ZERO buffered ops ({@link SyncEngine.bufferedOps} empty).
+ */
+export interface ProvingReduction {
+  doc: BentoDoc
+  engine: SyncState
+  provenSeq: number
+}
+
+/**
+ * Reduce `baseDoc` + `baseState` through `frames` (ascending seq) and, at EACH
+ * frame boundary, check whether the running reduction has any buffered op (an op
+ * accepted by `applyOne` but parked in `gap`/`pending`, which `toJSON()` does NOT
+ * serialize). `provenSeq` is the highest boundary that held ZERO buffered ops —
+ * the highest prefix whose `(doc, state)` is byte-lossless to persist and whose op
+ * log is therefore safe to prune.
+ *
+ * Because frames are applied in seq order, the engine state after boundary frame
+ * `provenSeq` is IDENTICAL to independently reducing only `frames (seq <=
+ * provenSeq)` — so the watermark is proven against the SAME artifact that is
+ * persisted, not a wider whole-tail probe (XIN-1783 P0-1b). `provenSeq` starts at
+ * `coveredSeq`: the base state is buffer-clean by construction (a snapshot is only
+ * ever persisted at a proven boundary; legacy/version-drifted states are refused
+ * upstream), so the existing boundary is itself proven.
+ */
+export function reduceProving(
+  baseDoc: BentoDoc,
+  baseState: SyncStateJSON | null,
+  frames: ReducibleFrame[],
+  coveredSeq: number,
+): ProvingReduction {
+  const { doc, engine } = seedReduction(baseDoc, baseState)
+  const ordered = [...frames].sort((a, b) => a.seq - b.seq)
+  let provenSeq = coveredSeq
+  for (const f of ordered) {
+    engine.apply(doc, f.ops)
+    // An empty buffer set proves every op applied so far materialized into
+    // (doc, state); nothing sits in the non-serialized gap/pending buffers, so
+    // this prefix survives a snapshot round-trip losslessly.
+    if (engine.bufferedOps.length === 0) provenSeq = f.seq
+  }
+  return { doc, engine, provenSeq }
 }
 
 /**
@@ -234,31 +294,42 @@ export class PptSnapshotter {
     if (targetSeq <= coveredSeq) return this.reattemptPrune(docId, coveredSeq)
 
     const frames: ReducibleFrame[] = tail.map((op) => ({ seq: op.seq, ops: opsOfFrame(op.frame) }))
-    // Reduce the WHOLE tail once, then bind the covered watermark to what the engine
-    // PROVABLY applied. The vendored engine BUFFERS (never applies) an op whose
-    // per-actor `s` exceeds its running contiguous sequence + 1 — a gap left by a
-    // lower-`s` frame that was refused (too-large/malformed) while a higher-`s` frame
-    // committed (frames.ts validates each `s` only as a bounded positive int, so a
-    // gap CAN persist). A buffered op advances neither the applied doc nor the
-    // version vector and is absent from `toJSON()`, so folding the tail up to
-    // `targetSeq` into the persisted state and pruning `<= targetSeq` would DESTROY
-    // that acked-durable op and diverge the room from peers who applied it live
-    // (XIN-1772 P0-1). The post-reduction version vector is the proof of application:
-    // an op is applied iff `op.s <= vv[op.a]` (vv is the per-actor max CONTIGUOUS
-    // sequence). Refuse to advance past the earliest frame carrying an unapplied op.
-    const probe = reduceInto(baseDoc, existing?.state ?? null, frames)
-    const safeSeq = this.appliedContiguousSeq(frames, probe.engine.vv, targetSeq, coveredSeq)
+    // Reduce the WHOLE tail once, proving materialization at every frame boundary,
+    // and bind the covered watermark to the highest seq the engine PROVABLY
+    // materialized INTO THE STATE BEING PERSISTED (XIN-1783 P0-1 — the durability
+    // contract, expressed once, here). Two engine buffers hold an accepted-but-not-
+    // materialized op and NEITHER is serialized by `toJSON()`:
+    //   • `gap`     — an op whose per-actor `s` exceeds the running contiguous seq
+    //                 (a lower-`s` frame was refused/rolled back; frames.ts validates
+    //                 each `s` only as a bounded positive int, so a gap CAN persist).
+    //   • `pending` — an op whose target node does not exist yet (`set`/`txt`/`ord`
+    //                 against a not-yet-created element), parked by `applyEffect`.
+    // An op in either buffer advances neither the doc nor `toJSON()`, so folding a
+    // prefix that still holds one and pruning `<= that prefix` DESTROYS an acked-
+    // durable op and diverges the room from peers who applied it live. The previous
+    // watermark trusted the version vector (`op.s <= vv[op.a]`) — but `applyOne`
+    // advances `vv` BEFORE `applyEffect`, so a `pending`-parked op reads as "applied"
+    // (variant a); and it probed the WHOLE-tail vector while persisting a PREFIX
+    // reduction, so a gap filled above the boundary marked a frame below it "applied"
+    // (variant b). The proof below instead reports `provenSeq` = the highest boundary
+    // at which the running reduction held ZERO buffered ops, evaluated against the
+    // exact prefix that is persisted. `reduceProving` never advances past a frame
+    // with any buffered op, so it is STRUCTURALLY unable to exceed materialization.
+    const probe = reduceProving(baseDoc, existing?.state ?? null, frames, coveredSeq)
+    const safeSeq = probe.provenSeq
     if (safeSeq <= coveredSeq) {
-      // The boundary op itself is a gap — nothing new can be safely folded in yet.
-      // Leave the whole tail durable (it is the proof of the buffered op) and only
-      // re-attempt the idempotent prune of the already-covered prefix.
+      // The boundary op itself is still buffered — nothing new can be safely folded
+      // in yet. Leave the whole tail durable (it is the proof of the buffered op) and
+      // only re-attempt the idempotent prune of the already-covered prefix.
       return this.reattemptPrune(docId, coveredSeq)
     }
-    // Persist the reduction of ONLY the proven-applied prefix. When the whole tail
-    // applied cleanly (`safeSeq === targetSeq`, the common case) reuse the probe;
-    // otherwise re-reduce the prefix so the persisted state stops exactly at the
-    // proven-applied boundary and the unapplied tail is re-reduced next time (once
-    // its missing lower-`s` frame lands).
+    // Persist the reduction of ONLY the proven-materialized prefix. When the whole
+    // tail materialized cleanly (`safeSeq === targetSeq`, the common single-author
+    // case) reuse the probe's doc/engine — after the last frame the engine holds no
+    // buffered op, so its `(doc, state)` IS the prefix reduction. Otherwise re-reduce
+    // the prefix so the persisted state stops exactly at the proven-materialized
+    // boundary and the unmaterialized tail is re-reduced next time (once its missing
+    // dependency lands).
     const { doc, engine } =
       safeSeq === targetSeq
         ? probe
@@ -273,39 +344,6 @@ export class PptSnapshotter {
     const prunableSeq = saved.coveredSeq ?? safeSeq
     const freedBytes = await this.store.pruneOpsThrough(docId, prunableSeq)
     return { snapshotVersion: saved.snapshotVersion, coveredSeq: saved.coveredSeq ?? safeSeq, prunedThroughSeq: prunableSeq, freedBytes }
-  }
-
-  /**
-   * The highest tail seq the reduction PROVABLY applied: `targetSeq` when every op
-   * applied, otherwise the highest seq strictly below the earliest frame carrying an
-   * unapplied op. An op is applied iff `op.s <= vv[op.a]` (the post-reduction version
-   * vector is the per-actor max CONTIGUOUS sequence; a gapped op leaves `vv[a]` below
-   * its `s`). `frames` is ascending. Returns `coveredSeq` when even the first tail
-   * frame carries an unapplied op (nothing safe to advance). Consulting only the
-   * public `vv` keeps the vendored engine untouched (XIN-1772 P0-1).
-   */
-  private appliedContiguousSeq(
-    frames: ReducibleFrame[],
-    vv: Record<string, number>,
-    targetSeq: number,
-    coveredSeq: number,
-  ): number {
-    const frameApplied = (f: ReducibleFrame): boolean =>
-      f.ops.every((o) => typeof o.a === 'string' && typeof o.s === 'number' && o.s <= (vv[o.a] ?? 0))
-    let earliestUnapplied = Infinity
-    for (const f of frames) {
-      if (!frameApplied(f)) {
-        earliestUnapplied = f.seq
-        break
-      }
-    }
-    if (earliestUnapplied === Infinity) return targetSeq
-    let safe = coveredSeq
-    for (const f of frames) {
-      if (f.seq >= earliestUnapplied) break
-      if (f.seq > safe) safe = f.seq
-    }
-    return safe
   }
 
   /**
