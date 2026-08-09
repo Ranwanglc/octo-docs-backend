@@ -27,7 +27,7 @@ import { pptAuthMiddleware, pptSpaceContextMiddleware } from './auth.js'
 import { pptLiveSnapshotRepo } from '../../db/repos/pptLiveSnapshotRepo.js'
 import { parseDocumentName, isDocTypeConsistentWithName } from '../../permission/documentName.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
-import { issuePptCollabToken } from '../../auth/pptCollabToken.js'
+import { issuePptCollabToken, mintCollabActor } from '../../auth/pptCollabToken.js'
 import type { Role } from '../../permission/role.js'
 
 /** POST /docs/collab-token — issue relay token + one-time WS ticket. */
@@ -107,6 +107,10 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
     permission_epoch: meta.permission_epoch,
     snapshotVersion,
     spaceMember,
+    // Bind the collab session to an actor derived from the authenticated uid, so the
+    // relay can enforce `op.a === server-minted actor` and the client can neither
+    // choose nor forge which actor its ops are attributed to (XIN-1789 D1 / P0-2).
+    actor: mintCollabActor(uid, docId),
     ...(displayName !== '' ? { name: displayName } : {}),
   })
   sendPptData(res, result)

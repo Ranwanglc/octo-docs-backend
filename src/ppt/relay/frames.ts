@@ -344,17 +344,32 @@ function isNonEmptyString(v: unknown): v is string {
 export const ACTOR_ID_PATTERN = /^[a-z0-9-]{1,64}$/
 
 /**
- * Upper bound for a Bento op's Lamport clock `l` (XIN-1772 P0-2). The engine does
- * `lamport = max(lamport, op.l)` on apply and mints local ops with `lamport++`, so
- * a single frame carrying `l = Number.MAX_SAFE_INTEGER` pins the room clock at the
- * ceiling: `stamp()`'s `++` can no longer advance it, every subsequent op ties on
- * Lamport, and LWW degrades to bare actor-id tiebreaks — persisted into the durable
- * state. Bounding `l` FAR below `MAX_SAFE_INTEGER` leaves an astronomically large
- * runway for a real editing session (2^45 ≈ 3.5e13 ops) while refusing the poison
- * value on the wire. `s` (per-actor sequence) shares the same ceiling for the same
- * reason — a crafted huge `s` manufactures an unfillable per-actor gap.
+ * Coarse structural ceiling for a Bento op's clock fields `s`/`l` (XIN-1772 P0-2).
+ * This is now only a DEFENSE-IN-DEPTH sanity bound that keeps a wire value from
+ * being an absurd near-`MAX_SAFE_INTEGER` integer; the MEANINGFUL, room-aware
+ * enforcement moved to the relay (XIN-1789 P1-1/P1-2/P1-3): per-actor `s` continuity
+ * ({@link OpsFrame} `s` must be contiguous under the connection's server-minted
+ * actor) and a bound on `l`/`sd[0]` RELATIVE to the room's live Lamport clock (a
+ * value above `roomLamport + {@link OP_CLOCK_SLACK}` is refused). An absolute cap
+ * alone was insufficient: a wire-legal value FAR below this ceiling but far ABOVE the
+ * room's live clock still pins the Lamport clock and invalidates every legitimate
+ * successor, and a fresh joiner inheriting a serialized clock could be over an
+ * absolute cap through no fault of its own. 2^45 (≈3.5e13) leaves an astronomically
+ * large runway for the coarse bound while the relative bound does the real work.
  */
 export const MAX_OP_CLOCK = 2 ** 45
+
+/**
+ * Slack above the room's live Lamport clock the relay admits on an incoming `l` /
+ * text seed `sd[0]` (XIN-1789 P1-2/P1-3). A legitimate client may be ahead of the
+ * server's last-observed clock by the ops it minted while offline plus the concurrent
+ * peer ops it applied but the relay has not yet serialized — so the bound must not be
+ * `<= roomLamport`. 2^20 (≈1e6) is generous headroom for any real editing session
+ * (a slide deck never mints a million offline ops) while still refusing a poison
+ * value orders of magnitude above the live clock long before it reaches
+ * {@link MAX_OP_CLOCK}.
+ */
+export const OP_CLOCK_SLACK = 2 ** 20
 
 /** True for a wire-legal client actor id: `[a-z0-9-]`, non-reserved, bounded. */
 export function isValidActorId(v: unknown): v is string {

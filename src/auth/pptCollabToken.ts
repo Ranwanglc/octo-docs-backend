@@ -23,10 +23,11 @@
  * collab token carries.)
  */
 import jwt from 'jsonwebtoken'
-import { randomUUID } from 'node:crypto'
+import { createHmac, randomUUID } from 'node:crypto'
 import { config } from '../config/env.js'
 import { getRedis, rkey } from '../db/redis.js'
 import type { Role } from '../permission/role.js'
+import { isValidActorId } from '../ppt/relay/frames.js'
 
 /** JWT audience for the primary relay token. */
 export const PPT_RELAY_AUD = 'ppt-relay'
@@ -47,6 +48,17 @@ export interface PptCollabClaims {
   permission_epoch: number
   /** Server-trusted display name resolved at issuance; absent when unknown. */
   name?: string
+  /**
+   * The Bento actor id this credential authors under, MINTED SERVER-SIDE from the
+   * authenticated `uid` at issuance (XIN-1789 D1 — see {@link mintCollabActor}). The
+   * relay pins the connection's actor from THIS claim, not the first frame's
+   * self-declared `op.a`, and refuses any op whose `a` differs — so the client can
+   * neither choose nor forge its actor (structurally closing the impersonation /
+   * co-editor-censorship path P0-2). A signed claim: the client cannot alter it
+   * without breaking the token signature. Absent on legacy tokens minted before D1,
+   * for which the relay falls back to the first-frame pin (XIN-1772).
+   */
+  actor?: string
   /**
    * The caller's space-membership at issuance (§4.4). Carried so the relay can
    * re-resolve the SAME effective role issuance did — folding in an
@@ -99,6 +111,31 @@ export interface IssuePptCollabInput {
   name?: string
   /** Caller's space-membership at issuance (fold-in for share-derived re-resolve). */
   spaceMember?: boolean
+  /**
+   * The server-minted Bento actor id to bind this credential to (XIN-1789 D1).
+   * Normally omitted by callers — {@link issuePptCollabToken} mints one via
+   * {@link mintCollabActor} from `uid`/`docId`. Passed explicitly only by tests that
+   * pin a deterministic actor to assert the binding.
+   */
+  actor?: string
+}
+
+/**
+ * Mint the server-side Bento actor id for a collab session (XIN-1789 D1). The actor
+ * is derived from the authenticated `uid` (+ `docId` + a fresh per-session nonce) so
+ * the CLIENT can never choose or forge it: it is an HMAC over the shared collab
+ * secret, truncated into the wire-accepted actor charset (`[a-z0-9-]`, see
+ * {@link isValidActorId}). A fresh nonce per issuance means each collab-token grant
+ * is its own session with its own actor — so a page reload mints a new actor, which
+ * the relay's idempotent-resend path tolerates (a re-ack keys off `frameId`, not the
+ * actor). Hex output is a subset of the accepted charset; 32 hex chars (128 bits) is
+ * collision-safe and well under the 64-char cap.
+ */
+export function mintCollabActor(uid: string, docId: string, session: string = randomUUID()): string {
+  return createHmac('sha256', config.collabToken.secret)
+    .update(`${uid}\u0000${docId}\u0000${session}`)
+    .digest('hex')
+    .slice(0, 32)
 }
 
 /**
@@ -109,6 +146,13 @@ export interface IssuePptCollabInput {
  */
 export function issuePptCollabToken(input: IssuePptCollabInput): PptCollabTokenResult {
   const name = typeof input.name === 'string' && input.name !== '' ? input.name : undefined
+  // The actor is a signed identity claim (XIN-1789 D1): reject a caller-supplied
+  // value that is not a wire-legal actor id rather than sign an unusable token the
+  // relay would refuse on the first frame.
+  const actor = input.actor
+  if (actor !== undefined && !isValidActorId(actor)) {
+    throw new Error('invalid ppt collab actor id')
+  }
   const claims = {
     uid: input.uid,
     docId: input.docId,
@@ -117,6 +161,7 @@ export function issuePptCollabToken(input: IssuePptCollabInput): PptCollabTokenR
     permission_epoch: input.permission_epoch,
     ...(name !== undefined ? { name } : {}),
     ...(input.spaceMember !== undefined ? { space_member: input.spaceMember } : {}),
+    ...(actor !== undefined ? { actor } : {}),
   }
 
   const tokenTtl = config.collabToken.ttlSeconds
@@ -155,7 +200,7 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
     throw new Error('invalid ppt collab token payload')
   }
   const d = decoded as Record<string, unknown>
-  const { uid, docId, documentName, role, permission_epoch: epoch, name, jti, space_member: spaceMember, exp } = d
+  const { uid, docId, documentName, role, permission_epoch: epoch, name, jti, space_member: spaceMember, actor, exp } = d
   if (
     typeof uid !== 'string' ||
     typeof docId !== 'string' ||
@@ -173,6 +218,10 @@ function parseClaims(decoded: unknown): PptCollabClaims & { jti?: string } {
     permission_epoch: epoch,
     ...(typeof name === 'string' && name !== '' ? { name } : {}),
     ...(typeof spaceMember === 'boolean' ? { space_member: spaceMember } : {}),
+    // Only trust an actor claim that is still a wire-legal id; a malformed one is
+    // dropped so the relay treats the token as legacy (first-frame pin) rather than
+    // pinning an unusable actor (XIN-1789 D1).
+    ...(isValidActorId(actor) ? { actor } : {}),
     ...(typeof jti === 'string' ? { jti } : {}),
     ...(typeof exp === 'number' ? { exp } : {}),
   }

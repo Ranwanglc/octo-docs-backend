@@ -107,7 +107,8 @@ export function canonicalStringify(value: unknown, depth = 0): string {
 
 /**
  * Canonical hash of a frame's SEMANTIC payload — its `ops` array ONLY, with
- * stable key order — NOT the whole wire envelope.
+ * stable key order and with each op's `a` (actor) field EXCLUDED — NOT the whole
+ * wire envelope.
  *
  * The envelope carries transport metadata (`t`, `pv`, `k`, `frameId`, `epoch`)
  * that legitimately varies between an original frame and an idempotent resend of
@@ -120,12 +121,31 @@ export function canonicalStringify(value: unknown, depth = 0): string {
  * canonical `ops` alone makes the dedup identity depend only on the edit, so a
  * genuine resend re-acks and only a reused frameId carrying DIFFERENT ops is
  * refused.
+ *
+ * The actor `a` is likewise NOT part of the edit identity (XIN-1789 D1): with the
+ * actor now server-minted per session, a page reload → offline-queue flush resends
+ * the SAME edit under the session's freshly-minted actor. Folding `a` into the hash
+ * would make that legitimate idempotent resend compute a different hash and be
+ * refused `protocol-version` for an already-durable write — so `a` is normalized out
+ * here, exactly as the envelope metadata is. A NEW (non-duplicate) write still has
+ * its actor authenticated against the connection's minted actor at the trust
+ * boundary in the relay, so actor-independent dedup grants no ability to forge or
+ * mis-attribute a genuinely new op.
  */
 export function canonicalPayloadHash(frame: unknown): string {
-  const payload =
+  const ops =
     frame !== null && typeof frame === 'object' && 'ops' in (frame as Record<string, unknown>)
       ? (frame as { ops: unknown }).ops
       : frame
+  // Strip the per-op actor `a` so the dedup identity is actor-independent; every
+  // other op field (including `s`/`l` and the edit payload) is preserved.
+  const payload = Array.isArray(ops)
+    ? ops.map((op) =>
+        op !== null && typeof op === 'object' && !Array.isArray(op)
+          ? Object.fromEntries(Object.entries(op as Record<string, unknown>).filter(([key]) => key !== 'a'))
+          : op,
+      )
+    : ops
   return createHash('sha256').update(canonicalStringify(payload), 'utf8').digest('hex')
 }
 
