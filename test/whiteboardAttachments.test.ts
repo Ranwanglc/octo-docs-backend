@@ -99,8 +99,7 @@ describe('board image upload (presign) is board-member scoped', () => {
     // Real, verifiable signature (not a stub).
     expect(verifySignedUrl(body.uploadUrl).valid).toBe(true)
     // Presign asked the guard for the WRITER tier on the board, scoped to the space.
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('writer')
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s_board')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('writer')
     // A doc_attachment row was registered against the board doc id.
     const insert = vi.mocked(query).mock.calls.find((c) => String(c[0]).includes('INSERT INTO doc_attachment'))
     expect(insert).toBeTruthy()
@@ -166,7 +165,7 @@ describe('board image fetch (read) is board-member scoped', () => {
     expect(body.mime).toBe('image/png')
     expect(verifySignedUrl(body.url).valid).toBe(true)
     // Read asked the guard for the READER tier.
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
   })
 
   it('404s an attachId owned by a different doc (no cross-board binary leak)', async () => {

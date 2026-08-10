@@ -136,17 +136,16 @@ describe('a cross-space doc_member keeps their grant (only-adds contract)', () =
     expect(body).toMatchObject({ docId: 'd_1', spaceId: 's_home', role: 'reader' })
   })
 
-  it('the forged-header attack buys nothing on that route: a wrong space still 404s', async () => {
-    // requireDocRole pins req.spaceId === meta.space_id (requireSameSpace), so the
-    // only header value that reaches the role check is the doc's own space — which
-    // is exactly the value the legitimate grantee sends. That is why gating this
-    // route on membership adds no security while breaking the grant.
+  it('ignores a forged Space header: docId and the direct grant remain authoritative', async () => {
+    // remove-sp makes X-Space-Id optional viewer context on single-document
+    // routes, never a selector or authorization input. A forged value therefore
+    // cannot widen or narrow the real doc_member grant resolved from uid + docId.
     const res = await fetch(`${base}/api/v1/docs/d_1`, {
       headers: { authorization: 'Bearer tok_u_ext', 'X-Space-Id': 's_not_the_docs_space' },
     })
 
-    expect(res.status).toBe(404)
-    expect(await res.json()).toEqual({ error: 'not_found' })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toMatchObject({ docId: 'd_1', spaceId: 's_home', role: 'reader' })
   })
 
   it('403 (not 404) when the same caller holds no grant at all — doc-level denial survives', async () => {
@@ -244,7 +243,7 @@ describe('access-request submit stays open to outsiders (#511 screen 4c)', () =>
     expect(await submit.json()).toEqual({ requestId: 'r_1', status: 'pending' })
   })
 
-  it('but the row is still pinned to the doc own space (requireSameSpace)', async () => {
+  it('ignores a forged Space header and pins the request to the path docId', async () => {
     getRole.mockResolvedValue(null as never)
 
     const res = await fetch(`${base}/api/v1/docs/d_1/access-requests`, {
@@ -257,9 +256,11 @@ describe('access-request submit stays open to outsiders (#511 screen 4c)', () =>
       body: JSON.stringify({ requestedRole: 'reader' }),
     })
 
-    // Dropping the membership gate does NOT mean a cross-space write: the header
-    // still has to name the doc's own space, so no row can land elsewhere.
-    expect(res.status).toBe(404)
-    expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+    // The client header cannot redirect the write: submit receives only d_1 from
+    // the path, while the backend independently resolves d_1's home Space.
+    expect(res.status).toBe(201)
+    expect(vi.mocked(docAccessRequestRepo.submit)).toHaveBeenCalledWith(
+      expect.objectContaining({ docId: 'd_1', uid: 'u_ext' }),
+    )
   })
 })

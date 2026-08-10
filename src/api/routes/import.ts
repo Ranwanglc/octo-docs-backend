@@ -87,14 +87,12 @@ export async function importExcalidrawHandler(req: Request, res: Response): Prom
     res.status(400).json({ error: 'invalid_request' })
     return
   }
-  if (typeof docIdParam !== 'string' || !docIdParam || typeof req.uid !== 'string' || typeof req.spaceId !== 'string') {
+  if (typeof docIdParam !== 'string' || !docIdParam || typeof req.uid !== 'string') {
     res.status(400).json({ error: 'invalid_request' })
     return
   }
   const docIdSafe: string = docIdParam
-  const guard = await requireDocRole(res, req.uid, docIdSafe, req.spaceId, 'writer', {
-    isBot: req.botToken !== undefined, token: req.octoToken,
-  })
+  const guard = await requireDocRole(req, res, docIdSafe, 'writer')
   if (!guard) return
   if (guard.meta.doc_type !== WHITEBOARD_DOC_TYPE) {
     res.status(409).json({ error: 'unsupported_doc_type' })
@@ -222,7 +220,7 @@ async function applyImportedDoc(
     doc.content,
     guard.meta.doc_id,
     req.uid!,
-    req.spaceId!,
+    guard.meta.space_id,
   )
   if (migration.count > 0) {
     warnings.push(`docs.import.imageAttachmentsMigrated:${migration.count}`)
@@ -440,16 +438,13 @@ export async function importDocxHandler(req: Request, res: Response): Promise<vo
     res.status(400).json({ error: 'invalid_doc_id' })
     return
   }
-  if (typeof req.uid !== 'string' || typeof req.spaceId !== 'string') {
+  if (typeof req.uid !== 'string') {
     res.status(400).json({ error: 'invalid_request' })
     return
   }
 
   // Import WRITES content into the doc → writer role, never reader. Default-deny.
-  const guard = await requireDocRole(res, req.uid, req.params.docId, req.spaceId, 'writer', {
-    isBot: req.botToken !== undefined,
-    token: req.octoToken,
-  })
+  const guard = await requireDocRole(req, res, req.params.docId, 'writer')
   if (!guard) return
   // Reject the target type before parsing: DOCX parsing can persist embedded
   // media, so a non-document target must never reach the upload context.
@@ -609,16 +604,13 @@ export async function importMarkdownHandler(req: Request, res: Response): Promis
     res.status(400).json({ error: 'invalid_doc_id' })
     return
   }
-  if (typeof req.uid !== 'string' || typeof req.spaceId !== 'string') {
+  if (typeof req.uid !== 'string') {
     res.status(400).json({ error: 'invalid_request' })
     return
   }
 
   // Import WRITES content into the doc → writer role, never reader. Default-deny.
-  const guard = await requireDocRole(res, req.uid, req.params.docId, req.spaceId, 'writer', {
-    isBot: req.botToken !== undefined,
-    token: req.octoToken,
-  })
+  const guard = await requireDocRole(req, res, req.params.docId, 'writer')
   if (!guard) return
 
   const rawBody: unknown = req.body
@@ -700,17 +692,14 @@ export async function importXlsxHandler(req: Request, res: Response): Promise<vo
     res.status(400).json({ error: 'invalid_doc_id' })
     return
   }
-  if (typeof req.uid !== 'string' || typeof req.spaceId !== 'string') {
+  if (typeof req.uid !== 'string') {
     res.status(400).json({ error: 'invalid_request' })
     return
   }
 
   // Import WRITES content into the doc -> writer role, never reader. Default-deny. The bot /
   // human membership context is threaded through exactly as the docSheet write route does.
-  const guard = await requireDocRole(res, req.uid, req.params.docId, req.spaceId, 'writer', {
-    isBot: req.botToken !== undefined,
-    token: req.octoToken,
-  })
+  const guard = await requireDocRole(req, res, req.params.docId, 'writer')
   if (!guard) return
 
   // Only a sheet doc can receive a workbook import; a doc/board target is a 409.

@@ -48,7 +48,7 @@ function cacheKey(url: string): string {
 linkCardRouter.post('/:docId/link-card', linkCardHandler)
 
 export async function linkCardHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
 
   const { url } = (req.body ?? {}) as { url?: unknown }

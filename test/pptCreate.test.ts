@@ -211,8 +211,14 @@ describe('PPT-HUMAN-001 — human creates a PPT from a template', () => {
       draftRevision: 0,
       snapshotVersion: 0,
     })
-    expect(String(body.data.editorUrl)).toContain('d_ppt1')
-    expect(String(body.data.shareUrl)).toContain('d_ppt1')
+    // shareUrl is the canonical type-agnostic bare link. The client obtains the
+    // deck's canonical home Space from /:docId/open-context when opening it.
+    expect(body.data.shareUrl).toBe('/d/d_ppt1')
+    expect(String(body.data.shareUrl)).not.toContain('sp=')
+    expect(String(body.data.shareUrl)).not.toContain('sid=')
+    // The old PPT editor transport remains compatible during migration; unlike
+    // shareUrl it may still carry the create mount's Space.
+    expect(body.data.editorUrl).toBe('/d/d_ppt1/edit?sp=s_1')
 
     // Persisted inside ONE transaction (atomic create).
     expect(transactionMock).toHaveBeenCalledTimes(1)

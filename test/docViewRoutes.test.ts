@@ -42,7 +42,19 @@ function mockRes(): MockRes {
   }
 }
 function req(extra: Record<string, unknown>) {
-  return { uid: 'u_1', spaceId: 's1', octoToken: 'tok', params: {}, query: {}, ...extra } as never
+  // Human open-context mount policy (remove-sp §6) + a viewer Space the caller is
+  // an active member of (isSpaceMemberMock defaults to true), so the §7.1
+  // verified-or-skip recent-view write lands under 's1'.
+  return {
+    uid: 'u_1',
+    spaceId: 's1',
+    octoToken: 'tok',
+    docSpaceScope: { mode: 'human' as const },
+    viewerSpaceId: 's1',
+    params: {},
+    query: {},
+    ...extra,
+  } as never
 }
 
 beforeEach(() => {

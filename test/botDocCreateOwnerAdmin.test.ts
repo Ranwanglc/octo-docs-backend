@@ -481,9 +481,10 @@ describe('bot html doc registration', () => {
     expect(body.ownerId).toBe('s_bot_b')
     expect(body.docId).not.toBe('d_html')
     expect(body.spaceId).not.toBe('s_1')
-    // shareUrl uses the canonical response space/doc (not the throwaway create id).
+    // Ordinary shareUrl uses the canonical response doc and never serializes Space.
     expect(body.shareUrl).toContain('d_html_B')
-    expect(body.shareUrl).toContain('s_B')
+    expect(body.shareUrl).not.toContain('sp=')
+    expect(body.shareUrl).not.toContain('sid=')
   })
 
   it('renames and soft-deletes html docs by octo-doc slug', async () => {

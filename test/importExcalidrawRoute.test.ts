@@ -66,7 +66,7 @@ describe('POST /:docId/import/excalidraw', () => {
     const duplicateMode = request(); duplicateMode.originalUrl += '?mode=merge&mode=replace'; const badDuplicate = response(); await importExcalidrawHandler(duplicateMode, badDuplicate as unknown as Response); expect(badDuplicate.statusCode).toBe(400)
     const objectMode = request(); objectMode.originalUrl += '?mode[value]=replace'; const badObject = response(); await importExcalidrawHandler(objectMode, badObject as unknown as Response); expect(badObject.statusCode).toBe(400)
     const badJson = request(); badJson.body = Buffer.from('{'); const bad = response(); await importExcalidrawHandler(badJson, bad as unknown as Response); expect(bad.statusCode).toBe(400)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('writer')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('writer')
   })
 
   it('cleans up staged attachments when the optimistic scene edit is rejected', async () => {
