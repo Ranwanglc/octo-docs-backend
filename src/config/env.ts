@@ -316,7 +316,7 @@ export const config = {
   webOrigin: str('OCTO_WEB_ORIGIN', ''),
 
   htmlRegistration: {
-    // Dedicated service credential; browser session tokens never authorize this entry.
+    // Shared with trusted docs-html; empty disables the internal boundary.
     token: str('OCTO_DOCS_HTML_REGISTRATION_TOKEN', ''),
   },
 

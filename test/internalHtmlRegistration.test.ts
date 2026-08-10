@@ -4,6 +4,7 @@ const { mockConfig, newDocId } = vi.hoisted(() => ({
   mockConfig: {
     htmlRegistration: { token: 'trusted-html-token' },
     webOrigin: 'https://docs.example.test',
+    search: { indexEnabled: true },
   },
   newDocId: vi.fn(() => 'd_new'),
 }))
@@ -13,6 +14,10 @@ vi.mock('../src/util/ids.js', () => ({ newDocId }))
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   DocOwnershipError: class DocOwnershipError extends Error {},
   docMetaRepo: { upsertHtmlByOctoDocSlug: vi.fn() },
+}))
+vi.mock('../src/search/docIndexQueue.js', () => ({
+  enqueueDocIndex: vi.fn(),
+  isSearchIndexedDoc: vi.fn(() => true),
 }))
 
 import { internalHtmlRegistrationHandler } from '../src/api/routes/internalHtmlRegistration.js'
@@ -98,7 +103,7 @@ describe('trusted user HTML registration', () => {
     expect(res.body).toMatchObject({ docId: 'd_existing', created: false })
   })
 
-  it('returns 403 when the slug belongs to a different owner', async () => {
+  it('rejects a conflicting delegated owner without treating the route as user authentication', async () => {
     vi.mocked(docMetaRepo.upsertHtmlByOctoDocSlug).mockRejectedValue(new DocOwnershipError())
     const res = response()
     await internalHtmlRegistrationHandler(request(input) as never, res as never)

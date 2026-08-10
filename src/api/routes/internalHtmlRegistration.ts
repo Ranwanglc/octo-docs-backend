@@ -1,10 +1,19 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
-import { Router, type Request, type Response, type Router as ExpressRouter } from 'express'
+import {
+  Router,
+  type NextFunction,
+  type Request,
+  type Response,
+  type Router as ExpressRouter,
+} from 'express'
 import { config } from '../../config/env.js'
+import { HTML_DOC_TYPE } from '../../db/docType.js'
 import { DocOwnershipError, docMetaRepo } from '../../db/repos/docMetaRepo.js'
+import { refreshAndPublish } from '../../permission/epoch.js'
 import { buildHtmlDocumentName, DocumentNameError } from '../../permission/documentName.js'
-import { newDocId } from '../../util/ids.js'
+import { enqueueDocIndex, isSearchIndexedDoc } from '../../search/docIndexQueue.js'
 import { buildDocShareUrl } from '../../util/docShareLink.js'
+import { newDocId } from '../../util/ids.js'
 
 const FOLDER_ID = 'f_default'
 const ID_MAX_LENGTH = 64
@@ -21,32 +30,45 @@ function credentialMatches(actual: string): boolean {
   return timingSafeEqual(digest(actual), digest(expected))
 }
 
-export async function internalHtmlRegistrationHandler(req: Request, res: Response): Promise<void> {
-  if (!credentialMatches(req.header('x-internal-token') ?? '')) {
-    res.status(401).json({ error: 'unauthorized' })
-    return
-  }
+function authorize(req: Request, res: Response): boolean {
+  if (credentialMatches(req.header('x-internal-token') ?? '')) return true
+  res.status(401).json({ error: 'unauthorized' })
+  return false
+}
 
-  const { octoDocSlug: rawSlug, spaceId: rawSpaceId, owner: rawOwner, title } = req.body ?? {}
-  if (
-    typeof rawSlug !== 'string' ||
-    typeof rawSpaceId !== 'string' ||
-    typeof rawOwner !== 'string' ||
-    typeof title !== 'string'
-  ) {
+interface DelegatedIdentity {
+  octoDocSlug: string
+  spaceId: string
+  owner: string
+}
+
+function delegatedIdentity(req: Request, res: Response): DelegatedIdentity | null {
+  const { octoDocSlug: rawSlug, spaceId: rawSpaceId, owner: rawOwner } = req.body ?? {}
+  if (typeof rawSlug !== 'string' || typeof rawSpaceId !== 'string' || typeof rawOwner !== 'string') {
     res.status(400).json({ error: 'invalid_body' })
-    return
+    return null
   }
-
   const octoDocSlug = rawSlug.trim()
   const spaceId = rawSpaceId.trim()
   const owner = rawOwner.trim()
   if (
     !SAFE_SEGMENT.test(octoDocSlug) || octoDocSlug.length > SLUG_MAX_LENGTH ||
     !SAFE_SEGMENT.test(spaceId) || spaceId.length > ID_MAX_LENGTH ||
-    !SAFE_SEGMENT.test(owner) || owner.length > ID_MAX_LENGTH ||
-    title.length > TITLE_MAX_LENGTH
+    !SAFE_SEGMENT.test(owner) || owner.length > ID_MAX_LENGTH
   ) {
+    res.status(400).json({ error: 'invalid_body' })
+    return null
+  }
+  return { octoDocSlug, spaceId, owner }
+}
+
+export async function internalHtmlRegistrationHandler(req: Request, res: Response): Promise<void> {
+  if (!authorize(req, res)) return
+  const identity = delegatedIdentity(req, res)
+  if (!identity) return
+  const { octoDocSlug, spaceId, owner } = identity
+  const { title } = req.body ?? {}
+  if (typeof title !== 'string' || title.length > TITLE_MAX_LENGTH) {
     res.status(400).json({ error: 'invalid_body' })
     return
   }
@@ -65,6 +87,8 @@ export async function internalHtmlRegistrationHandler(req: Request, res: Respons
 
   let result
   try {
+    // The internal token authenticates docs-html; that trusted service delegates
+    // the already-authenticated user's owner id in the request body.
     result = await docMetaRepo.upsertHtmlByOctoDocSlug({
       docId,
       documentName,
@@ -72,7 +96,7 @@ export async function internalHtmlRegistrationHandler(req: Request, res: Respons
       ownerId: owner,
       spaceId,
       folderId: FOLDER_ID,
-      docType: 'html',
+      docType: HTML_DOC_TYPE,
       octoDocSlug,
       createdBy: owner,
     })
@@ -84,6 +108,9 @@ export async function internalHtmlRegistrationHandler(req: Request, res: Respons
     throw err
   }
 
+  if (config.search.indexEnabled && isSearchIndexedDoc(result.meta.document_name)) {
+    void enqueueDocIndex(result.meta.document_name)
+  }
   res.status(result.created ? 201 : 200).json({
     docId: result.meta.doc_id,
     documentName: result.meta.document_name,
@@ -91,11 +118,35 @@ export async function internalHtmlRegistrationHandler(req: Request, res: Respons
     spaceId: result.meta.space_id,
     owner: result.meta.owner_id,
     title: result.meta.title,
-    docType: 'html',
+    docType: HTML_DOC_TYPE,
     mountType: 'space',
     created: result.created,
     shareUrl: buildDocShareUrl(config.webOrigin ?? '', result.meta.doc_id, result.meta.space_id),
   })
 }
 
-internalHtmlRegistrationRouter.post('/register', internalHtmlRegistrationHandler)
+export async function internalHtmlDeleteHandler(req: Request, res: Response): Promise<void> {
+  if (!authorize(req, res)) return
+  const identity = delegatedIdentity(req, res)
+  if (!identity) return
+  const { octoDocSlug, spaceId, owner } = identity
+
+  const result = await docMetaRepo.deleteHtmlRegistration(spaceId, octoDocSlug, owner)
+  if (result.outcome === 'owner_conflict') {
+    res.status(403).json({ error: 'forbidden' })
+    return
+  }
+  if (result.outcome === 'deleted') {
+    await refreshAndPublish(result.documentName, result.permissionEpoch)
+  }
+  res.status(200).json({ octoDocSlug, spaceId, deleted: result.outcome === 'deleted' })
+}
+
+function asyncHandler(handler: (req: Request, res: Response) => Promise<void>) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    handler(req, res).catch(next)
+  }
+}
+
+internalHtmlRegistrationRouter.post('/register', asyncHandler(internalHtmlRegistrationHandler))
+internalHtmlRegistrationRouter.delete('/', asyncHandler(internalHtmlDeleteHandler))
