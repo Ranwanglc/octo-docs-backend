@@ -62,6 +62,26 @@ function callerSessionToken(req: Request): string | undefined {
  * POST submit — any authenticated octo user (no doc role required). Idempotent
  * by (doc_id, uid). If the caller already holds >= the requested role and no
  * bots are requested, returns 200 already_granted without writing a row.
+ *
+ * ★ Deliberately NOT behind `requireSpaceMembership`, unlike the space-selector
+ * routes. The whole persona this route serves is an OUTSIDER: octo-web's
+ * forbidden landing (`packages/docs/src/pages/StandaloneDocPage.tsx`, feature
+ * #511 screen 4c) renders `RequestAccessButton` for "a receiver who lands on a
+ * doc they cannot open", passing `preflightSpace` — which is
+ * `standaloneLinkSpace()`, i.e. the `?sp=` value from the doc's OWN space that
+ * `util/docShareLink.ts` minted. Such a receiver is by definition not a member of
+ * that space; that is the design premise, not an anomaly. A membership gate here
+ * makes the preflight 403 render the button and the button itself 404 — the same
+ * defect as gating the `/:docId` read path, one route over. Nor does
+ * forward-grant substitute for it: `forwardGrant.ts:36` requires `admin`, so it
+ * is the doc admin GRANTING, never the outsider ASKING.
+ *
+ * `requireSameSpace` below therefore stays the only space check, and is honest
+ * about what it buys: it compares `meta.space_id` against the same unverified
+ * header, so it does not prove membership — it only pins the write to the doc's
+ * own space, keeping a cross-space row from ever landing. The residual is a
+ * (doc_id, space_id) existence probe, which needs a `newDocId()` guess first:
+ * `util/ids.ts:14` is `d_` + `randomBytes(12)`, i.e. 96 bits.
  */
 accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: Response) => {
   const docId = req.params.docId!

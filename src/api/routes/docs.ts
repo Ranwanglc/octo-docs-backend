@@ -26,6 +26,7 @@ import { buildDocShareUrl } from '../../util/docShareLink.js'
 import { config } from '../../config/env.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { requireDocRole } from '../guard.js'
+import { requireSpaceMembership } from '../middleware/spaceContext.js'
 import { searchDocs, VisibleTermsTooLargeError, encodeSearchCursor, decodeSearchCursor } from '../../search/osClient.js'
 
 export const docsRouter: ExpressRouter = Router()
@@ -282,7 +283,33 @@ export async function createDocHandler(req: Request, res: Response) {
   })
 }
 
-docsRouter.post('/', createDocHandler)
+// WRITE routes whose target is chosen by the space alone carry
+// requireSpaceMembership: `POST /` mints a NEW row into the named space, so no
+// document exists yet to resolve a role from and the header IS the whole
+// authorization. Confirming it here is what stops a session holder from planting
+// a doc into a space they do not belong to.
+//
+// The COLLECTION READS below (`GET /`, `POST /search`, `GET /recent`,
+// `GET /recent/creators`) deliberately do NOT carry it, even though the space is
+// their selector too. They are not authorized by space membership in the first
+// place: each pushes a row-level predicate down to the repo that admits only
+// `owner OR doc_member`, and ADDS the `share_scope = anyone_in_space` branch only
+// when `isSpaceMember` is confirmed (docMetaRepo.listForUser's `includeSpaceShare`,
+// listVisibleDocIdSet's `spaceShare`, docViewHistoryRepo.visibilityPredicate). A
+// non-member naming someone else's space therefore already sees nothing of that
+// space — the predicate collapses to their own direct grants. Gating the route
+// instead would SUBTRACT: a legitimate cross-space owner / doc_member, whose grant
+// is independent of space membership by design (members.ts / forwardGrant.ts
+// verify only that the grantee is a real octo user), would be 404'd out of listing
+// or searching documents they own. That violates the contract's supplemental-only
+// rule (docs/contract/backend-design.md:1514, only-adds) — the same subtraction
+// that split this middleware off the global mount in the first place.
+//
+// The `/:docId` routes below also do NOT carry it: requireDocRole is strictly
+// stronger there (real-uid role resolution + requireSameSpace pinning req.spaceId
+// to meta.space_id).
+// See api/middleware/spaceContext.ts for why this is per-route, not global.
+docsRouter.post('/', requireSpaceMembership, createDocHandler)
 
 /** GET /api/v1/docs/{docId} — fetch one doc's metadata (needs reader). */
 export async function getDocHandler(req: Request, res: Response) {
