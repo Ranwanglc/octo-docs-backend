@@ -139,6 +139,9 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `PPT_RELAY_AUTH_REFRESH_MS` | no (`5000`) | jittered per-connection read-auth refresh interval for live relay sockets. |
 | `PPT_RELAY_DOC_STATUS_CACHE_TTL_MS` | no (`2000`) | short doc-status cache TTL used to bound repeated status provider calls; local status-changing REST paths must invalidate by publishing the existing epoch/status bump. |
 | `PPT_RELAY_REAUTH_GRACE_MS` | no (`10000`) | grace window for a share-derived socket whose ticket membership claim just expired to present a fresh ticket via an in-place `reauth` frame before the relay fails closed. Keep it above `PPT_RELAY_AUTH_REFRESH_MS` so a read-auth refresh fires inside the window without clearing the sticky pending-reauth state. |
+| `PPT_RELAY_MAX_INBOUND_QUEUE` | no (`256`) | depth cap for a connection's inbound ordering chain; beyond it further frames are shed `rate-limited`. |
+| `PPT_RELAY_MAX_INBOUND_QUEUE_BYTES` | no (`67108864`) | BYTE cap for a connection's inbound ordering chain (XIN-1840 P1-3). The depth cap above bounds only frame COUNT, so a burst of near-`PPT_RELAY_MAX_FRAME_BYTES` frames could retain ~`MAX_INBOUND_QUEUE × MAX_FRAME_BYTES` in-process before the socket drains; beyond EITHER cap the frame is shed `rate-limited`. |
+| `PPT_RELAY_MAX_OPS_ADMISSION_PER_WINDOW` | no (`5000`) | coarse per-connection ceiling for ALL `ops` frames per `PPT_RELAY_RATE_WINDOW_MS`, checked BEFORE the identity gate / payload hash / dedup-ledger read (XIN-1840 P1-2), so a reader looping one harvested-valid frameId is O(1)-shed (silently dropped, never `refused`) before paying that work. Sized far above the `PPT_RELAY_MAX_FRAMES_PER_WINDOW` mutation budget and any idempotent resend, so a genuine frame is never shed. |
 | `PPT_RELAY_MAX_BUFFERED_OP_LAG` | no (`4096`) | seq-lag cap after which the snapshotter ages out a permanently-buffered op to unfreeze GC. Now operator-tunable: lower it so a room whose average frame is above `PPT_RELAY_MAX_ROOM_FRAME_BYTES / lagCap` bytes forces the reclaim on seq lag before the byte-budget (`room-full`) trigger fires. Each aged-op drop emits the `ppt_relay_aged_op_drop` alert (§6.1). |
 | `PPT_RELAY_LEDGER_RETENTION_FRAMES` | no (`262144`) | retention window (room seqs) for the `ppt_collab_frame` dedup ledger. The ledger outlives the pruned op log so a resend after a lost ack re-acks its original seq; without retention it grew forever. Ledger rows are reclaimed only once they fall this many seqs behind the covered watermark, bounding the table to ~this many rows per doc. An idempotent resend happens within seconds — far inside the window — so recent frames are always preserved; a resend older than the window is re-minted and rebroadcast but the reducer drops it as a duplicate (inert). |
 | `OCTO_IDENTITY_MODE` | no (`http`) | `http` (cross-service introspection) or `middleware` |
@@ -466,9 +469,12 @@ default (`PPT_RELAY_ENABLED=false`) and must stay off in production until Half B
 What Half A **does** enforce on op metadata (no client half required):
 
 - **Wire shape / charset.** Each op's actor `a` is charset-restricted (`[a-z0-9-]{1,64}`)
-  and the reserved reducer namespace (`@…`) is refused, and node ids / `set` keys naming a
-  reserved prototype member (`__proto__`/`constructor`/`prototype`) are rejected so a wire
-  op can neither mint the reducer actor nor crash/pollute the reduction.
+  and the reserved reducer namespace (`@…`) is refused, and node ids / `set` keys naming ANY
+  `Object.prototype` member (`__proto__`/`constructor`/`prototype` **and** `valueOf`/
+  `toString`/`hasOwnProperty`/… — XIN-1840 P0-1) or a DocShape container (`slides`/`elements`)
+  are rejected, `del`/`ord` ids are shape-checked per `kind` (bare slide id vs composite
+  element key), and a `txt` op is limited to one insert group — so a wire op can neither mint
+  the reducer actor nor crash/pollute/silently-drop-through the reduction.
 - **Room-relative clock bound.** An op's `l` (and a `txt` op's seed generation `sd[0]`) is
   refused when it exceeds the room's live Lamport clock by more than a generous slack, so a
   single wire-legal value cannot pin the clock at a ceiling and permanently refuse every
@@ -492,6 +498,25 @@ Because those two gates are absent, **the relay must not be exposed in productio
 `PPT_RELAY_ENABLED=false` keeps `/api/v1/ppt/collab` unmounted and the collab-token route
 absent, so no ticket is issued and the endpoint cannot be reached. Turn it on only once
 Half B binds the actor to the authenticated identity.
+
+### 6.3 PPT relay — quarantined frame is a manual-intervention event (XIN-1835 P0-1 / XIN-1840)
+
+The wire validator is the primary guard against a frame the reducer cannot apply, but the
+snapshotter has a defense-in-depth backstop: if a frame still **throws** inside
+`engine.apply`, it is **quarantined** — the snapshotter freezes the proven watermark at the
+last clean boundary strictly below it and NEVER prunes the poison frame or anything after
+it, so the room degrades to **read-only from that seq** rather than bricking. Production
+logs it as `[ppt-relay] doc <id>: quarantined a throwing frame at seq <n>` (watermark frozen,
+frame not pruned).
+
+**A quarantined frame is a manual-intervention event, not self-healing.** The room stops
+advancing its snapshot and its op log grows unpruned until an operator acts; a validator that
+accepts a frame the reducer rejects is a bug to fix at the wire, not a runtime condition the
+relay recovers from on its own. On seeing this log line: capture the offending `(docId, seq)`
+and the frame, treat it as a validator/reducer accept-set escape (the class the wire-grammar
+fuzz gate in `test/pptOpValidationFuzz.test.ts` is meant to prevent), and file it for a wire
+fix. An automated operator escape hatch (e.g. surgically dropping the quarantined frame) is
+out of scope this round.
 
 ---
 

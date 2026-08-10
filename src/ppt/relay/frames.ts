@@ -424,9 +424,53 @@ function isReg(v: unknown): boolean {
  */
 const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype'])
 
-/** True for a non-empty string that is safe to use as a map / object key. */
+/**
+ * The FULL set of object-key names that are UNSAFE as a wire-supplied map / object
+ * key (XIN-1840 P0-1). The round-3 guard rejected only `__proto__`/`constructor`/
+ * `prototype` ({@link RESERVED_KEYS}), but EVERY other `Object.prototype` member —
+ * `valueOf`, `toString`, `hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable`,
+ * `toLocaleString`, the legacy `__define`/`__lookup` accessors — is equally
+ * dangerous: the reducer reads a stashed/assigned key back THROUGH the prototype
+ * chain (`stashNode`/`assignNode` in `crdt.ts` read `node[k]` where `k` is a
+ * register/payload key), so `set k:'valueOf'` then `del` makes `node['valueOf']`
+ * resolve to `Object.prototype.valueOf` (a function), and `clone` =
+ * `JSON.parse(JSON.stringify(fn))` = `JSON.parse(undefined)` THROWS out of
+ * `engine.apply` — a permanent room brick. Deriving the set from
+ * `Object.getOwnPropertyNames(Object.prototype)` SUBSUMES the three reserved names
+ * plus every method and cannot drift as the runtime evolves. This is the wire
+ * (fail-closed) half; the engine's own-property reads are the belt-and-braces twin.
+ */
+const PROTO_UNSAFE_KEYS: ReadonlySet<string> = new Set<string>([
+  ...Object.getOwnPropertyNames(Object.prototype), // valueOf/toString/hasOwnProperty/… + __proto__ + constructor
+  ...RESERVED_KEYS, // adds `prototype`, which is not an Object.prototype own-name
+])
+
+/** True for a non-empty string that is safe to use as a map / object key: it must
+ *  not name any `Object.prototype` member (or a reserved chain-walker). */
 function isSafeKeyString(v: unknown): v is string {
-  return typeof v === 'string' && v.length > 0 && !RESERVED_KEYS.has(v)
+  return typeof v === 'string' && v.length > 0 && !PROTO_UNSAFE_KEYS.has(v)
+}
+
+/** The composite-element-key separator (U+001F), DERIVED from {@link elKey} so it
+ *  cannot drift from the reducer's key format (`crdt.ts` `SEP`). `elKey('','')` is
+ *  exactly the separator. */
+const EL_KEY_SEP = elKey('', '')
+
+/** True for a bare SLIDE id: a safe key carrying NO composite separator (a slide id
+ *  is never an `elKey`, XIN-1840 P2). Used to shape `del`/`ord` ids against `kind`. */
+function isSlideId(v: unknown): v is string {
+  return isSafeKeyString(v) && !v.includes(EL_KEY_SEP)
+}
+
+/** True for a composite ELEMENT node key `slide<SEP>element` ({@link elKey}, XIN-1840
+ *  P2): exactly ONE separator, with a safe-key slide part and a safe-key element part.
+ *  The reducer derives `keySlide`/`keyEl` by slicing on this separator, so a `del`/`ord`
+ *  element id (and a `del` `cas` entry) that is not composite keys the WRONG node. */
+function isElementKey(v: unknown): v is string {
+  if (typeof v !== 'string') return false
+  const i = v.indexOf(EL_KEY_SEP)
+  if (i <= 0 || i !== v.lastIndexOf(EL_KEY_SEP) || i === v.length - 1) return false
+  return isSafeKeyString(v.slice(0, i)) && isSafeKeyString(v.slice(i + 1))
 }
 
 /**
@@ -460,7 +504,13 @@ const CONTAINER_KEYS: ReadonlySet<string> = new Set([SLIDES_SHAPE.parents, SLIDE
 function isSafeSetKey(v: unknown): v is string {
   if (typeof v !== 'string' || v.length === 0) return false
   if (CONTAINER_KEYS.has(v)) return false
-  return !v.split('.').some((seg) => RESERVED_KEYS.has(seg))
+  // `set k:'id'` rewrites a node's identity while `pos`/`births`/`regs`/`pending`
+  // stay keyed by the OLD id — births/positions dangle and the deck silently diverges
+  // from every peer's next diff. `id` is structural (synced with the node, never a
+  // legitimate `set` target — the differ SKIPS it, `crdt.ts:593,631`), so reject the
+  // exact key (XIN-1840 P2). A dotted `style.id` writes a harmless own key and passes.
+  if (v === 'id') return false
+  return !v.split('.').some((seg) => PROTO_UNSAFE_KEYS.has(seg))
 }
 
 /**
@@ -473,16 +523,20 @@ function isSafeSetKey(v: unknown): v is string {
 const MAX_NODE_SCAN_DEPTH = 64
 
 /**
- * True if `v` (an `ins.node` payload) contains a reserved prototype key
- * (`__proto__`/`constructor`/`prototype`) as an OWN key anywhere in its object
- * graph (XIN-1835 P1-2). `assignNode` (`crdt.ts:1005-1035`) copies every payload
- * key onto the REAL doc node via `node[k] = clone(payload[k])`; a `__proto__`
- * key there writes through the prototype accessor, so the op "applies" (leaves
- * both engine buffers) yet its effect is ABSENT from `toJSON()` — proven, pruned,
- * lost, exactly the P1-1 buffer-probe break the snapshotter declares closed. Note
- * `JSON.parse` materializes `"__proto__"` as an enumerable OWN key, so
- * `Object.keys` surfaces it; we reject on sight and never index into it. Rejecting
- * at the wire (fail-closed) keeps the reducer contract clean end to end.
+ * True if `v` (an `ins.node` payload) contains an UNSAFE object key — a reserved
+ * prototype key (`__proto__`/`constructor`/`prototype`) OR any other
+ * `Object.prototype` member ({@link PROTO_UNSAFE_KEYS}) — as an OWN key anywhere in
+ * its object graph (XIN-1835 P1-2, widened XIN-1840 P0-1). `assignNode`
+ * (`crdt.ts:1005-1035`) copies every payload key onto the REAL doc node via
+ * `node[k] = clone(payload[k])`; a `__proto__` key writes through the prototype
+ * accessor, so the op "applies" (leaves both engine buffers) yet its effect is
+ * ABSENT from `toJSON()` — proven, pruned, lost, exactly the P1-1 buffer-probe
+ * break the snapshotter declares closed — and a `valueOf`/`toString`/… own key
+ * later collides with `Object.prototype[k]` on a resurrecting assignment's
+ * own-vs-inherited read. Note `JSON.parse` materializes `"__proto__"` as an
+ * enumerable OWN key, so `Object.keys` surfaces it; we reject on sight and never
+ * index into it. Rejecting at the wire (fail-closed) keeps the reducer contract
+ * clean end to end.
  */
 function nodePayloadHasReservedKey(v: unknown, depth = 0): boolean {
   if (depth > MAX_NODE_SCAN_DEPTH) return true // over-deep → refuse (fail closed)
@@ -492,7 +546,7 @@ function nodePayloadHasReservedKey(v: unknown, depth = 0): boolean {
   }
   if (typeof v === 'object' && v !== null) {
     for (const key of Object.keys(v)) {
-      if (RESERVED_KEYS.has(key)) return true
+      if (PROTO_UNSAFE_KEYS.has(key)) return true
       if (nodePayloadHasReservedKey((v as Record<string, unknown>)[key], depth + 1)) return true
     }
   }
@@ -573,12 +627,20 @@ export function isBentoOp(op: unknown): boolean {
     }
     case 'del':
       if (o.kind !== 'slide' && o.kind !== 'element') return false
-      if (!isSafeKeyString(o.id)) return false
-      if (o.cas !== undefined && !(Array.isArray(o.cas) && o.cas.every((c) => typeof c === 'string'))) return false
+      // Per-kind id shape (XIN-1840 P2): a slide id is bare (carries no composite
+      // separator); an element id MUST be the composite `elKey` the reducer's
+      // `keySlide`/`keyEl` slice on — a non-composite element id keys the wrong node.
+      if (o.kind === 'slide' ? !isSlideId(o.id) : !isElementKey(o.id)) return false
+      // `cas` cascades element tombstones (`applyDel` bumps + removes each). Each entry
+      // keys the reducer's tomb/limbo maps and is fed to `keySlide`/`keyEl`, so every
+      // entry must be a composite element key, not merely a string (XIN-1840 P2).
+      if (o.cas !== undefined && !(Array.isArray(o.cas) && o.cas.every((c) => isElementKey(c)))) return false
       return true
     case 'ord':
       if (o.kind !== 'slide' && o.kind !== 'element') return false
-      if (!isSafeKeyString(o.id) || !isNonEmptyString(o.ord)) return false
+      // Per-kind id shape (XIN-1840 P2): same slide-bare / element-composite split as `del`.
+      if (o.kind === 'slide' ? !isSlideId(o.id) : !isElementKey(o.id)) return false
+      if (!isNonEmptyString(o.ord)) return false
       if (o.sl !== undefined && !isSafeKeyString(o.sl)) return false
       return true
     case 'txt':
@@ -587,6 +649,12 @@ export function isBentoOp(op: unknown): boolean {
       if (o.del !== undefined && !(Array.isArray(o.del) && o.del.every((d) => typeof d === 'string'))) return false
       if (o.ins !== undefined) {
         if (!Array.isArray(o.ins)) return false
+        // A `txt` op carries AT MOST ONE insert group: the differ (`crdt.ts diffText`)
+        // only ever mints one, and `applyTxtToState` (`crdt.ts:1552-1585`) ids every
+        // group's tokens by the SINGLE op stamp `${l}.${a}.i` — so a 2nd group is seen
+        // as a replay of the 1st (`crdt.ts:1558`) and SILENTLY dropped (partial apply).
+        // Refuse >1 group on the wire so the accept-set stays closed under apply (XIN-1840 P2).
+        if (o.ins.length > 1) return false
         for (const seg of o.ins) {
           if (typeof seg !== 'object' || seg === null) return false
           const s = seg as Record<string, unknown>

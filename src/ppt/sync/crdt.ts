@@ -1005,13 +1005,22 @@ export class SyncEngine {
   private assignNode(node: Record<string, unknown>, payload: Record<string, unknown>, id: string, birth: Reg, skip: string[]) {
     for (const k of new Set([...Object.keys(node), ...Object.keys(payload)])) {
       if (skip.includes(k)) continue
+      // UPSTREAM NOTE (XIN-1840 P0-1): read `payload[k]` as an OWN property only.
+      // `k` is drawn from the UNION of the node's and payload's keys, so for a
+      // node-only key `payload[k]` walks the prototype chain — if that key names an
+      // Object.prototype member (e.g. a `valueOf` own key a prior op left on the node),
+      // `payload['valueOf']` resolves to the inherited function, the `=== undefined`
+      // removal test is skipped, and `clone(fn)` = JSON.parse(undefined) THROWS out of
+      // `engine.apply`. Same inherited-property hazard family as `stashNode`; every
+      // key-list-driven read in the reducer must dereference own-properties only.
+      const pv = Object.hasOwn(payload, k) ? payload[k] : undefined
       if (k === 'html' && this.txt[id]) {
         if (this.txt[id].sd[0] < birth[0]) {
           // the RGA's seed predates this rebirth — void it; the assignment
           // wins even over higher-lamport deltas (they drop on every replica)
           delete this.txt[id]
-          if (payload[k] === undefined) delete node[k]
-          else node[k] = clone(payload[k])
+          if (pv === undefined) delete node[k]
+          else node[k] = clone(pv)
         }
         // else: the generation outranks the assignment — keep its text
         continue
@@ -1022,15 +1031,15 @@ export class SyncEngine {
         continue // a newer set beats the assignment
       }
       // String(...) is NOT belt-and-braces: `k` comes from the union of the
-      // local node's keys and the payload's, so `payload[k]` is undefined
+      // local node's keys and the payload's, so `pv` is undefined
       // exactly on the property-REMOVAL path two lines below — and
       // JSON.stringify(undefined) is undefined, not "undefined". dbg() builds
       // its argument eagerly, so this threw whether or not anyone was
       // debugging. Third occurrence of this one bug in this file; the other
       // two already carry the same guard.
-      dbg(id, `assign ${k} := ${String(JSON.stringify(payload[k])).slice(0, 40)}`)
-      if (payload[k] === undefined) delete node[k]
-      else node[k] = clone(payload[k])
+      dbg(id, `assign ${k} := ${String(JSON.stringify(pv)).slice(0, 40)}`)
+      if (pv === undefined) delete node[k]
+      else node[k] = clone(pv)
     }
     this.replayStash(node, id, birth)
   }
@@ -1047,10 +1056,20 @@ export class SyncEngine {
       const k = rk.slice(pref.length)
       const r = clone(this.regs[rk])
       const st = (this.stash[id] ??= nullMap())
+      // UPSTREAM NOTE (XIN-1840 P0-1): dereference `node[k]` as an OWN property only.
+      // `k` is a REGISTER key, not a literal — a `set k:'valueOf'` (any Object.prototype
+      // member) leaves a register `id valueOf` whose live node has NO own `valueOf`
+      // (the key was deleted, or the value parked in the stash on the DEAD path). Reading
+      // `node['valueOf']` then walks the prototype to `Object.prototype.valueOf` (a
+      // function), and `clone` = JSON.parse(JSON.stringify(fn)) = JSON.parse(undefined)
+      // THROWS out of `engine.apply` — a permanent room brick. The wire validator now
+      // rejects such keys (frames.ts), and reading own-properties only is the engine's
+      // belt-and-braces twin: every `regs`-keyed walk must use `Object.hasOwn`.
+      const v = Object.hasOwn(node, k) ? node[k] : undefined
       // overwrite entries whose register is stale — the current register's
       // value (living on this node) is the authoritative parked value
       if (!(k in st) || cmpReg(st[k].r, r) !== 0)
-        st[k] = node[k] === undefined ? { r } : { v: clone(node[k]), r }
+        st[k] = v === undefined ? { r } : { v: clone(v), r }
     }
   }
 

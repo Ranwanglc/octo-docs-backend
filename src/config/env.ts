@@ -864,6 +864,18 @@ export const config = {
       // enqueue an unbounded backlog that keeps persisting after the socket is
       // gone (XIN-1736 P1-F). Sized well above a legitimate in-flight burst.
       maxInboundQueue: numMin('PPT_RELAY_MAX_INBOUND_QUEUE', 256, 1),
+      // Byte cap for a connection's inbound ordering chain (XIN-1840 P1-3). The depth
+      // cap above bounds only frame COUNT, so 256 near-`maxFrameBytes` frames can retain
+      // ~2 GiB in-process before the socket drains; this bounds the byte backlog too.
+      // Default 64 MiB — well above a legitimate in-flight burst, far below runaway.
+      maxInboundQueueBytes: numMin('PPT_RELAY_MAX_INBOUND_QUEUE_BYTES', 64 * 1024 * 1024, 1),
+      // Coarse per-connection ceiling for the `ops`-frame PRE-admission window
+      // (XIN-1840 P1-2), checked at the top of handleOps BEFORE identityGate / the
+      // canonical-payload hash / the dedup-ledger SELECT. A reader looping ONE
+      // harvested-valid frameId is O(1)-shed here instead of paying that work per
+      // iteration. Sized FAR above the `maxFramesPerWindow` (200) mutation budget and
+      // the rare idempotent resend so a genuine frame is never shed. Default 5000.
+      maxOpsAdmissionPerWindow: numMin('PPT_RELAY_MAX_OPS_ADMISSION_PER_WINDOW', 5000, 1),
       // Depth cap for a connection's OUTBOUND ordering chain (XIN-1792 P1-5). A
       // non-reading peer's send buffer is drained per-frame by `gatedSend`
       // (bufferedAmount high-water), but frames still QUEUED on the outbound promise

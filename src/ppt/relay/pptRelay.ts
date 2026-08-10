@@ -113,6 +113,20 @@ export interface RelayLimits {
   /** Max inbound frames queued on a connection's ordering chain before shedding. */
   maxInboundQueue: number
   /**
+   * Max APPROXIMATE bytes queued on a connection's inbound ordering chain before
+   * shedding (XIN-1840 P1-3). The depth cap ({@link maxInboundQueue}) alone bounds
+   * frame COUNT, so 256 near-`maxFrameBytes` frames can retain ~2 GiB in-process; this
+   * bounds the byte backlog alongside the count.
+   */
+  maxInboundQueueBytes: number
+  /**
+   * Coarse ceiling for the per-connection `ops`-frame PRE-admission window
+   * (XIN-1840 P1-2), checked before `identityGate`/hash/ledger. FAR above the
+   * `maxFramesPerWindow` mutation budget and any idempotent resend, so it sheds only
+   * a tight harvested-frameId loop, never a real frame.
+   */
+  maxOpsAdmissionPerWindow: number
+  /**
    * Max frames queued on a connection's OUTBOUND ordering chain before the peer is
    * closed 4410 (XIN-1792 P1-5). Bounds the send backlog a non-reading socket can
    * accumulate in-process, mirroring {@link maxInboundQueue}.
@@ -159,6 +173,8 @@ function defaultLimits(): RelayLimits {
     docStatusCacheTtlMs: r.docStatusCacheTtlMs,
     reauthGraceMs: r.reauthGraceMs,
     maxInboundQueue: r.maxInboundQueue,
+    maxInboundQueueBytes: r.maxInboundQueueBytes,
+    maxOpsAdmissionPerWindow: r.maxOpsAdmissionPerWindow,
     maxOutboundQueue: r.maxOutboundQueue,
     snapshotSoftThresholdBytes: softDefault,
     maxBufferedOpLag: r.maxBufferedOpLag,
@@ -168,6 +184,16 @@ function defaultLimits(): RelayLimits {
 /** Max client frames buffered during the pre-auth handshake window before they
  * are dropped (a flood before auth cannot grow memory unbounded, XIN-1693). */
 const MAX_PREAUTH_FRAMES = 16
+/**
+ * Max APPROXIMATE bytes buffered during the pre-auth handshake window (XIN-1840 P1-3).
+ * The `message` listener is registered SYNCHRONOUSLY before the ticket is verified, so
+ * without a byte bound an UNAUTHENTICATED socket could retain up to
+ * `MAX_PREAUTH_FRAMES × maxFrameBytes` (~16 × ~1.9 MB ≈ 30 MB, or far more if the
+ * frame cap is raised) purely on the pre-auth path before its ticket is rejected. Cap
+ * the retained bytes alongside the frame count; 2 MiB comfortably holds a handshake
+ * `hello` (a tiny resume cursor) with generous slack while closing the byte ingress.
+ */
+const MAX_PREAUTH_BYTES = 2 * 1024 * 1024
 /** Poll interval (ms) while waiting for the socket send buffer to drain. */
 const SEND_DRAIN_POLL_MS = 5
 
@@ -261,6 +287,23 @@ interface Conn {
    * resume and shove the freshly re-authorized socket back into `pendingReauth`.
    */
   reauthGeneration: number
+  /**
+   * Monotonic authority-withdrawal generation (XIN-1840 P1-1). Bumped by
+   * {@link PptRelay.withdrawAuthority} EVERY time this connection's authority is
+   * withdrawn — a `terminalClose`, a load-bearing role-down, an epoch-bump freeze,
+   * a room deletion, or a share-expiry deadline. A gate that rebuilds `conn.auth`
+   * to a LIVE authority after an `await` ({@link PptRelay.identityGate},
+   * {@link PptRelay.guardMutation}, {@link PptRelay.refreshReadAuth},
+   * {@link PptRelay.refreshRoleDownOnly}, {@link PptRelay.handleReauth},
+   * {@link PptRelay.applyEpochBump}) CAPTURES this value before its awaits and
+   * REFUSES to launder a live authority if it moved on resume — closing the
+   * in-flight window where a concurrent withdrawal (e.g. `closeRoomForDeleted`
+   * firing while a `roleProvider` await is parked) would otherwise be overwritten by
+   * the resuming gate. Treats withdrawal EXACTLY as `pendingReauth` was treated
+   * (sticky through every rewrite), but as a positive generation stamp it also
+   * covers a withdrawal that lands mid-gate rather than only one already set.
+   */
+  authGeneration: number
   /** Timestamps of recently persisted frames, for the sliding-window rate limit. */
   frameTimes: number[]
   /**
@@ -280,6 +323,17 @@ interface Conn {
    * dropped — only a tight loop is throttled.
    */
   dedupReackTimes: number[]
+  /**
+   * Timestamps of ALL `ops` frames admitted on this connection, for the coarse
+   * PRE-admission gate (XIN-1840 P1-2). Checked at the TOP of {@link PptRelay.handleOps}
+   * — before `identityGate` (an epochProvider call), `canonicalPayloadHash` (a SHA-256
+   * over up to ~1.9 MB), and the dedup-ledger SELECT — with a ceiling FAR above any
+   * legitimate client ({@link RelayLimits.maxOpsAdmissionPerWindow}). A reader looping
+   * one harvested-valid frameId is therefore O(1)-shed before paying any of that work,
+   * while the ~200/window mutation budget and the rare idempotent resend sit orders of
+   * magnitude under the ceiling, so a genuine frame is never shed here.
+   */
+  opsAdmissionTimes: number[]
   /**
    * True once this connection's first replay reached a stable boundary. Until
    * then — and while any replay is in flight — a peer's live op/presence frame is
@@ -343,6 +397,9 @@ interface Conn {
   inboundChain: Promise<void>
   /** Frames currently queued on {@link inboundChain} (backpressure cap, P1-F). */
   inboundDepth: number
+  /** Approximate bytes currently queued on {@link inboundChain} (byte backpressure
+   *  cap alongside the depth cap, XIN-1840 P1-3). */
+  inboundBytes: number
   /** Frames currently queued on {@link outboundChain} (backpressure cap, P1-5). */
   outboundDepth: number
   /** Per-connection outbound ordering chain. */
@@ -623,14 +680,22 @@ export class PptRelay {
     let conn: Conn | null = null
     let earlyClosed = false
     const preauth: string[] = []
+    let preauthBytes = 0
     const onData = (data: unknown): void => {
       const raw = typeof data === 'string' ? data : String(data)
       if (conn) {
         this.enqueueInbound(conn, raw)
         return
       }
-      if (preauth.length < MAX_PREAUTH_FRAMES) preauth.push(raw)
-      // else: pre-auth flood — drop; the client gets no `ready` and can reconnect.
+      // Pre-auth buffer is bounded by BOTH frame count and bytes (XIN-1693 / XIN-1840
+      // P1-3): the `message` listener is live before the ticket is verified, so an
+      // unauthenticated socket must not be able to retain unbounded memory on either
+      // axis. Over either cap → drop; the client gets no `ready` and can reconnect.
+      const bytes = Buffer.byteLength(raw, 'utf8')
+      if (preauth.length < MAX_PREAUTH_FRAMES && preauthBytes + bytes <= MAX_PREAUTH_BYTES) {
+        preauth.push(raw)
+        preauthBytes += bytes
+      }
     }
     const onGone = (): void => {
       earlyClosed = true
@@ -743,9 +808,11 @@ export class PptRelay {
       name: claims.name,
       spaceMember,
       reauthGeneration: 0,
+      authGeneration: 0,
       frameTimes: [],
       ephemeralFrameTimes: [],
       dedupReackTimes: [],
+      opsAdmissionTimes: [],
       caughtUp: false,
       replayInFlight: false,
       flushDepth: 0,
@@ -756,6 +823,7 @@ export class PptRelay {
       auth: { readAllowed: roleAtLeast(role, 'reader'), invalidated: false },
       inboundChain: Promise.resolve(),
       inboundDepth: 0,
+      inboundBytes: 0,
       outboundDepth: 0,
       outboundChain: Promise.resolve(),
       drainChain: Promise.resolve(),
@@ -781,16 +849,22 @@ export class PptRelay {
    * socket is no longer OPEN, so a queued frame for a gone client never persists.
    */
   private enqueueInbound(conn: Conn, raw: string): void {
-    if (conn.inboundDepth >= this.limits.maxInboundQueue) {
+    const bytes = Buffer.byteLength(raw, 'utf8')
+    // Shed beyond EITHER the depth cap OR the byte cap (XIN-1840 P1-3): the depth cap
+    // alone bounds frame COUNT, so a burst of near-`maxFrameBytes` frames could still
+    // retain ~`maxInboundQueue × maxFrameBytes` in-process before the socket is drained.
+    if (conn.inboundDepth >= this.limits.maxInboundQueue || conn.inboundBytes + bytes > this.limits.maxInboundQueueBytes) {
       this.refuse(conn, 'rate-limited', { retryInMs: this.limits.rateWindowMs })
       return
     }
     conn.inboundDepth++
+    conn.inboundBytes += bytes
     const run = async (): Promise<void> => {
       try {
         await this.onMessage(conn, raw)
       } finally {
         conn.inboundDepth--
+        conn.inboundBytes -= bytes
       }
     }
     conn.inboundChain = conn.inboundChain.then(run, run)
@@ -908,6 +982,16 @@ export class PptRelay {
   }
 
   private closeConn(conn: Conn, code: number, reason: string): Promise<void> {
+    // Stamp an authority-withdrawal generation (XIN-1840 P1-1). EVERY terminal close —
+    // reauth failure, role revocation, epoch-bump condemnation, doc deletion, the
+    // share-expiry grace deadline — funnels through here, so bumping the generation at
+    // this one choke point makes it total: a gate parked in an await (e.g. a
+    // `roleProvider` call) that captured the prior generation will see it moved on
+    // resume and REFUSE to rebuild a live `conn.auth`, instead of laundering the
+    // withdrawn state (the P1-1 laundering at `refreshRoleDownOnly`/`handleReauth`/
+    // `applyEpochBump`). A benign close (`bye`, resync, shutdown) also bumps it — moot,
+    // since the socket is going away and no live-auth rebuild follows those paths.
+    conn.authGeneration++
     return this.enqueueOutbound(conn, () => {
       conn.socket.close(code, reason)
       this.removeFromRoom(conn)
@@ -1397,6 +1481,10 @@ export class PptRelay {
     // window to present a freshly-minted ticket via an in-place `reauth` frame. If
     // none arrives before the deadline, fail closed. A client that reauth'd
     // proactively (before expiry) already re-armed this timer, so it never fires.
+    // Freezing to pendingReauth withdraws the live authority, so bump the withdrawal
+    // generation too (XIN-1840 P1-1): a gate parked mid-await that captured the prior
+    // value refuses on resume rather than writing against the just-frozen socket.
+    conn.authGeneration++
     conn.auth = { readAllowed: conn.auth.readAllowed, invalidated: false, pendingReauth: true }
     this.armReauthGrace(conn)
   }
@@ -1439,6 +1527,11 @@ export class PptRelay {
     // socket merely in the `pendingReauth` grace window is NOT terminal, so the normal
     // reauth recovery still proceeds (terminalRefusal returns null for pendingReauth).
     if (this.terminalRefusal(conn) !== null) return
+    // Capture the withdrawal generation before the reauth awaits (verifyTicket /
+    // ticketStore.consume / readDocStatus / epochProvider / roleProvider). If a
+    // concurrent withdrawal condemns the socket while we await, we must NOT adopt fresh
+    // authority over it below — the queued close stays authoritative (XIN-1840 P1-1).
+    const gen = conn.authGeneration
     let claims: PptCollabClaims & { jti: string }
     try {
       claims = this.verifyTicket(ticket)
@@ -1501,6 +1594,12 @@ export class PptRelay {
     }
     if (!roleAtLeast(role, 'reader')) return this.failReauth(conn, 'access revoked')
     if (conn.socket.readyState !== WebSocket.OPEN || !this.rooms.get(conn.docId)?.has(conn)) return
+    // A concurrent withdrawal (revocation / epoch bump / doc deletion) condemned this
+    // socket while we awaited above; its close is QUEUED but readyState/room-membership
+    // are still true. Do NOT adopt fresh authority over it — that is exactly the P1-1
+    // laundering (`handleReauth` rebuilding conn.auth after 4 awaits). Bail; the queued
+    // close stays authoritative (XIN-1840 P1-1).
+    if (conn.authGeneration !== gen) return
     // Success: adopt the fresh authority in place, re-arm the share-expiry timer
     // from the fresh ticket's expiry, clear pending reauth, and flush via cutover.
     if (conn.reauthGraceTimer) {
@@ -1857,6 +1956,12 @@ export class PptRelay {
    * (possibly downgraded-to-reader) connection is still re-acked (round-7 / D3).
    */
   private async identityGate(conn: Conn): Promise<RefusedCode | null> {
+    // Capture the authority-withdrawal generation BEFORE any await (XIN-1840 P1-1): if a
+    // concurrent withdrawal (role revoke, epoch bump, doc deletion, `closeRoomForDeleted`)
+    // lands while we are parked in `readDocStatus`/`epochProvider`, the generation moves
+    // and we refuse on resume instead of returning `null` (admitting a read/re-ack) for a
+    // socket whose authority was withdrawn mid-gate.
+    const gen = conn.authGeneration
     // A connection already driven into a TERMINAL/invalidated state must not re-ack
     // or drive a store read for a frame that is already queued on the inbound chain
     // (XIN-1792 P1-4). Both reauth-failure paths set a terminal state (readAllowed
@@ -1891,6 +1996,9 @@ export class PptRelay {
       if (await this.refreshRoleDownOnly(conn, live)) return 'forbidden-role'
     }
     if (!roleAtLeast(conn.role, 'reader')) return 'forbidden-role'
+    // Post-await withdrawal recheck (XIN-1840 P1-1): authority withdrawn while we awaited
+    // above (its close is only QUEUED) — refuse rather than admit the read/re-ack.
+    if (conn.authGeneration !== gen) return this.terminalRefusal(conn) ?? 'forbidden-role'
     return null
   }
 
@@ -1902,6 +2010,13 @@ export class PptRelay {
    */
   private async guardMutation(conn: Conn, frameEpoch: number, rawBytes: number, maxBytes: number): Promise<RefusedCode | null> {
     if (rawBytes > maxBytes) return 'too-large'
+    // Capture the authority-withdrawal generation BEFORE any await (XIN-1840 P1-1): a
+    // withdrawal landing during `readDocStatus`/`epochProvider`/`refreshRoleDownOnly`
+    // (e.g. `closeRoomForDeleted` while a `roleProvider` await is parked) moves the
+    // generation, so we refuse on resume instead of persisting a durable write against
+    // a socket whose authority was withdrawn mid-gate — the residual in-flight window a
+    // sticky `terminalClose` flag alone did not close.
+    const gen = conn.authGeneration
     // Refuse a mutation from a connection already in a TERMINAL/invalidated state
     // BEFORE the durable append (XIN-1792 P1-4). A reauth failure / revocation sets
     // `terminalClose` and clears `pendingReauth` while the socket close is only
@@ -1944,6 +2059,9 @@ export class PptRelay {
     // Only writer/admin may persist; a reader/commenter (or a downgraded socket
     // at the current epoch) is refused `forbidden-role`.
     if (!roleAtLeast(conn.role, 'writer')) return 'forbidden-role'
+    // Post-await withdrawal recheck (XIN-1840 P1-1): authority withdrawn while we awaited
+    // above (its close is only QUEUED) — refuse rather than let the write persist.
+    if (conn.authGeneration !== gen) return this.terminalRefusal(conn) ?? 'forbidden-role'
     return null
   }
 
@@ -1994,6 +2112,8 @@ export class PptRelay {
    * space-membership claim became load-bearing and unverifiable (P1-6).
    */
   private async refreshRoleDownOnly(conn: Conn, live: number): Promise<boolean> {
+    // Capture the withdrawal generation BEFORE the roleProvider await (XIN-1840 P1-1).
+    const gen = conn.authGeneration
     const outcome = await this.recheckRole({
       uid: conn.uid,
       docId: conn.docId,
@@ -2006,6 +2126,12 @@ export class PptRelay {
       void this.closeConn(conn, CLOSE_FORBIDDEN, 'membership recheck required')
       return true
     }
+    // A DIFFERENT withdrawal condemned this socket, EITHER during our own `recheckRole`
+    // await (generation moved) OR during the CALLER's earlier awaits before it invoked us
+    // (a `terminalClose` is already set — our generation capture is too late to see that
+    // one). In both cases its close is QUEUED; do NOT rebuild a live `conn.auth` over it
+    // (the P1-1 laundering). Report CLOSED so the caller refuses (XIN-1840 P1-1).
+    if (conn.authGeneration !== gen || conn.auth.terminalClose) return true
     if (roleRank(outcome.role) < roleRank(conn.role)) conn.role = outcome.role
     conn.roleEpoch = live
     // Preserve a sticky pendingReauth here too (XIN-1739 P0-1): a downgrade-only
@@ -2017,15 +2143,17 @@ export class PptRelay {
     return false
   }
 
-  /** Sliding-window rate limit over `times`; returns retry delay ms when over. */
-  private rateLimited(times: number[]): number | null {
+  /** Sliding-window rate limit over `times`; returns retry delay ms when over.
+   *  `ceiling` defaults to the per-window mutation budget; pass a higher one for a
+   *  coarse pre-admission gate (XIN-1840 P1-2). */
+  private rateLimited(times: number[], ceiling: number = this.limits.maxFramesPerWindow): number | null {
     const now = Date.now()
     const windowStart = now - this.limits.rateWindowMs
     // Compact in place so the caller's array stays the live window.
     let write = 0
     for (const t of times) if (t > windowStart) times[write++] = t
     times.length = write
-    if (times.length >= this.limits.maxFramesPerWindow) {
+    if (times.length >= ceiling) {
       const oldest = times[0] ?? now
       return Math.max(1, oldest + this.limits.rateWindowMs - now)
     }
@@ -2205,6 +2333,19 @@ export class PptRelay {
     // abuse without ever refusing a real re-ack, preserving the resend contract exactly.
     if (rawBytes > this.limits.maxFrameBytes) {
       this.refuse(conn, 'too-large', { k, frameId, message: 'frame exceeds size limit' })
+      return
+    }
+    // Coarse PRE-admission gate (XIN-1840 P1-2). The duplicate-re-ack throttle
+    // (`dedupReackTimes`) sits AFTER `identityGate` (an epochProvider call),
+    // `canonicalPayloadHash` (SHA-256 over up to ~1.9 MB), and the ledger SELECT, so a
+    // reader looping ONE harvested-valid frameId used to pay all of that per iteration
+    // before being shed. Count EVERY `ops` frame on the connection here, before any of
+    // that work, and SHED (drop silently — never `refused`, so a real client is never
+    // told a durable write is unsynced, and no per-frame send amplifies the flood) once
+    // the window saturates. The ceiling is FAR above the ~`maxFramesPerWindow` mutation
+    // budget and the rare idempotent resend, so a genuine frame is O(1)-admitted and only
+    // a tight loop trips it — the idempotent-resend contract is preserved exactly.
+    if (this.rateLimited(conn.opsAdmissionTimes, this.limits.maxOpsAdmissionPerWindow) !== null) {
       return
     }
     if (!opsAreValid(frame.ops)) {
@@ -2645,10 +2786,19 @@ export class PptRelay {
     // cleared and every live socket would stall until reconnect (XIN-1739 P2). The
     // deletion sweep above needs no freeze — a deleted doc's sockets are closed
     // outright regardless of auth state.
+    const frozenGen = new Map<Conn, number>()
     for (const room of this.rooms.values()) {
       for (const conn of room) {
         if (conn.documentName === documentName) {
+          // Freezing to pendingReauth withdraws live authority — bump the withdrawal
+          // generation so a gate parked mid-await refuses on resume (XIN-1840 P1-1).
+          conn.authGeneration++
           conn.auth = { readAllowed: false, invalidated: false, pendingReauth: true }
+          // Remember the generation as of OUR freeze. Any later bump (a concurrent
+          // `closeRoomForDeleted` / another epoch bump firing during the `epochProvider`
+          // or `recheckRole` awaits below) makes it differ, so we skip the live-authority
+          // rebuild for that socket rather than laundering the withdrawal (XIN-1840 P1-1).
+          frozenGen.set(conn, conn.authGeneration)
         }
       }
     }
@@ -2663,6 +2813,7 @@ export class PptRelay {
     for (const room of this.rooms.values()) {
       for (const conn of [...room]) {
         if (conn.documentName !== documentName) continue
+        const gen = frozenGen.get(conn)
         const outcome = await this.recheckRole({
           uid: conn.uid,
           docId: conn.docId,
@@ -2707,6 +2858,14 @@ export class PptRelay {
         // armReauthGrace was never called here, and no client sends `reauth`
         // unprompted), so a single transient epoch-read blip left the socket neither
         // usable (reads suppressed, writes `forbidden-role`) nor closed — forever.
+        //
+        // A DIFFERENT withdrawal (e.g. `closeRoomForDeleted`) condemned this socket while
+        // we awaited `epochProvider`/`recheckRole`; its `terminalClose`/freeze is already
+        // set and its close is QUEUED. Do NOT rebuild a live authority over it (the P1-1
+        // laundering) — skip and leave the withdrawal authoritative (XIN-1840 P1-1). A
+        // socket that joined AFTER our freeze (not in `frozenGen`) is likewise skipped:
+        // its own connect-time authority stands, this bump does not own it.
+        if (gen === undefined || conn.authGeneration !== gen) continue
         conn.auth = { readAllowed: roleAtLeast(conn.role, 'reader'), invalidated: false }
         if (downgraded) void this.gatedSend(conn, { ctl: 'role-changed', role: conn.role, epoch: newEpoch })
         if (roleAtLeast(conn.role, 'reader') && conn.caughtUp) void this.drainLiveBuffer(conn)
