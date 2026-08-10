@@ -198,14 +198,29 @@ function reduceInto(
 }
 
 /**
+ * A frame `reduceProving` refused to apply because `engine.apply` THREW on it
+ * (XIN-1835 P0-1). Recorded — not swallowed silently — so `advance()` can escalate
+ * it on the operational channel; the watermark freezes below it so it is never
+ * pruned.
+ */
+export interface QuarantinedFrame {
+  seq: number
+  error: string
+}
+
+/**
  * The result of a materialization-proving reduction: the doc + engine after the
- * WHOLE tail, plus `provenSeq` — the highest frame seq at which the running
- * reduction held ZERO buffered ops ({@link SyncEngine.bufferedOps} empty).
+ * WHOLE tail (or up to the first quarantined frame), plus `provenSeq` — the
+ * highest frame seq at which the running reduction held ZERO buffered ops
+ * ({@link SyncEngine.bufferedOps} empty). `quarantined` is set when a frame threw
+ * inside `engine.apply`: reduction stopped there, `provenSeq` froze below it, and
+ * the doc/engine reflect only a partial (unusable-for-persist) mutation.
  */
 export interface ProvingReduction {
   doc: BentoDoc
   engine: SyncState
   provenSeq: number
+  quarantined?: QuarantinedFrame
 }
 
 /**
@@ -233,23 +248,47 @@ export function reduceProving(
   const { doc, engine } = seedReduction(baseDoc, baseState)
   const ordered = [...frames].sort((a, b) => a.seq - b.seq)
   let provenSeq = coveredSeq
+  let quarantined: QuarantinedFrame | undefined
   for (const f of ordered) {
-    engine.apply(doc, f.ops)
+    // DEFENSE IN DEPTH (XIN-1835 P0-1): the wire validator is the primary guard,
+    // but a frame that still throws inside `engine.apply` must NOT propagate out of
+    // `advance()` and BRICK the room forever. Quarantine the FIRST throwing frame:
+    // stop advancing the proven watermark and break. `provenSeq` therefore freezes
+    // at the last boundary strictly BELOW the poison frame, so the poison frame —
+    // and everything after it — stays durable (NEVER pruned): the durability
+    // contract "provenSeq never exceeds materialization" is preserved, since a
+    // frame that threw materialized nothing. `advance()` then either only
+    // re-attempts the already-covered prune (safeSeq <= coveredSeq) or persists a
+    // CLEAN re-reduction of the proven prefix (`reduceInto` on `seq <= safeSeq`,
+    // which excludes the poison frame and discards this partially-mutated engine),
+    // so a single bad frame degrades to a bounded, non-lossy freeze instead of a
+    // permanent brick. We break rather than skip-and-continue precisely so
+    // `provenSeq` can never leapfrog the quarantined frame and authorize its prune.
+    try {
+      engine.apply(doc, f.ops)
+    } catch (err) {
+      quarantined = { seq: f.seq, error: err instanceof Error ? err.message : String(err) }
+      break
+    }
     // An empty buffer set proves every op applied so far materialized into
     // (doc, state); nothing sits in the non-serialized gap/pending buffers, so
     // this prefix survives a snapshot round-trip losslessly.
     //
     // This equivalence (buffer-empty ⟺ effect-in-`toJSON()`) held for gap/pending but
-    // was BROKEN by a prototype-named node id: on a plain-object engine map,
-    // `pos['__proto__'] = …` wrote through the prototype accessor, so an op that left
-    // both buffers ("applied") had its effect ABSENT from `toJSON()` — proven, then
-    // pruned, then lost (XIN-1821 P1-1). That vector is now closed at BOTH ends: the
-    // wire validator rejects reserved-key ids/keys, and the engine keys its maps on
-    // null-prototype objects so a reserved key is always a serialized OWN slot. The
-    // buffer probe is therefore sound again for every op the reducer can apply.
+    // was BROKEN by a prototype-named node id or a reserved key inside an `ins.node`
+    // payload: on a plain-object engine map, `pos['__proto__'] = …` (or `assignNode`
+    // copying a `__proto__` payload key onto the doc node) wrote through the prototype
+    // accessor, so an op that left both buffers ("applied") had its effect ABSENT from
+    // `toJSON()` — proven, then pruned, then lost (XIN-1821 P1-1 / XIN-1835 P1-2). That
+    // vector is now closed at BOTH ends: the wire validator rejects reserved-key
+    // ids/keys AND scans the `ins.node` payload recursively for reserved keys, and the
+    // engine keys its maps on null-prototype objects so a reserved key is always a
+    // serialized OWN slot. The buffer probe is therefore sound again for every op the
+    // reducer can apply; the try/catch above is the residual backstop for any shape
+    // that nonetheless throws.
     if (engine.bufferedOps.length === 0) provenSeq = f.seq
   }
-  return { doc, engine, provenSeq }
+  return { doc, engine, provenSeq, quarantined }
 }
 
 /**
@@ -441,6 +480,22 @@ export class PptSnapshotter {
     // exact prefix that is persisted. `reduceProving` never advances past a frame
     // with any buffered op, so it is STRUCTURALLY unable to exceed materialization.
     const probe = reduceProving(baseDoc, existing?.state ?? null, frames, coveredSeq)
+    if (probe.quarantined) {
+      // A frame threw inside the reducer despite the wire validator (XIN-1835 P0-1).
+      // reduceProving froze `provenSeq` below it, so it is never pruned; escalate on
+      // the operational channel so the poison `(seq)` can be inspected. The room does
+      // NOT brick: we fall through to persist only the clean proven prefix (or, if
+      // none advanced, to `reattemptPrune`). A throw from the sink must not re-brick GC.
+      try {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[ppt-relay] doc ${docId}: quarantined a throwing frame at seq ${probe.quarantined.seq} ` +
+            `(watermark frozen at ${probe.provenSeq}, frame NOT pruned; XIN-1835 P0-1): ${probe.quarantined.error}`,
+        )
+      } catch {
+        /* an operational-escalation failure must not abort GC */
+      }
+    }
     const safeSeq = probe.provenSeq
     if (safeSeq <= coveredSeq) {
       // The boundary op itself is still buffered — nothing new can normally be safely
@@ -477,7 +532,13 @@ export class PptSnapshotter {
       const bufferedLag = highWater - coveredSeq
       const lagAged = bufferedLag >= this.maxBufferedOpLag
       const byteAged = opts?.forceUnfreeze === true
-      if (probe.engine.bufferedOps.length > 0 && (lagAged || byteAged)) {
+      // A quarantined reduction (a frame threw, XIN-1835 P0-1) must NOT take the
+      // forced whole-tail persist path: `probe.(doc,engine)` reflect a PARTIAL,
+      // aborted mutation, not the materialized tail, so persisting them at
+      // `targetSeq` and pruning through it would destroy the un-applied frames. Fall
+      // back to the idempotent already-covered prune instead — non-lossy, and the
+      // poison frame stays durable for inspection/repair.
+      if (!probe.quarantined && probe.engine.bufferedOps.length > 0 && (lagAged || byteAged)) {
         const dropped: AgedOpDrop[] = probe.engine.bufferedOps.map((o) => ({ a: o.a, s: o.s }))
         const trigger: 'seq-lag' | 'byte-budget' = lagAged ? 'seq-lag' : 'byte-budget'
         const doc = probe.doc

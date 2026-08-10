@@ -13,7 +13,7 @@ describe('opsAreValid / isBentoOp: Bento Op shape', () => {
     const ops = [
       { op: 'set', a: 'u1', s: 1, l: 1, k: 'title', v: 'x' },
       { op: 'set', a: 'u1', s: 2, l: 2, sl: 's1', el: 's1e1', k: 'color', v: 'red' },
-      { op: 'ins', a: 'u1', s: 3, l: 3, kind: 'slide', id: 's2', ord: 'V', node: { id: 's2' } },
+      { op: 'ins', a: 'u1', s: 3, l: 3, kind: 'slide', id: 's2', ord: 'V', node: { id: 's2', elements: [{ id: 'e1' }] } },
       { op: 'ins', a: 'u1', s: 4, l: 4, kind: 'element', id: 's2e2', sl: 's2', ord: 'V', node: { id: 'e2' } },
       { op: 'del', a: 'u1', s: 5, l: 5, kind: 'slide', id: 's2', cas: ['s2e2'] },
       { op: 'del', a: 'u1', s: 6, l: 6, kind: 'element', id: 's1e1' },
@@ -135,6 +135,91 @@ describe('isBentoOp: reserved prototype keys rejected at the wire (XIN-1821 P0-4
     // Only the exact reserved segments are rejected — real keys are unaffected.
     expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: 1, k: 'style.fontFamily', v: 'x' })).toBe(true)
     expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: 1, k: 'assets.logo', v: 'x' })).toBe(true)
-    expect(isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'slide', id: 's1e1', ord: 'V', node: {} })).toBe(true)
+    // A slide ins now requires a well-formed `node` with a matching id + child array
+    // (XIN-1835 P0-1) — a full-shape node is accepted (see the tightened-ins block).
+    expect(
+      isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'slide', id: 's1', ord: 'V', node: { id: 's1', elements: [] } }),
+    ).toBe(true)
+  })
+})
+
+// XIN-1835 P0-1 / P1-2: `isBentoOp`'s `ins` case is tightened so the validator accept-set
+// is CLOSED under `SyncEngine.apply`. On the buggy head an `ins.node` was checked only as
+// a non-null object, so a slide node with no child (`elements`) array crashed the reducer's
+// per-member iteration (`C(S, node).forEach`) — a permanent room brick — and a `__proto__`
+// key inside the node payload was copied onto the real doc node by `assignNode` (applied
+// but absent from `toJSON()`). A `set` naming a container key (`slides`/`elements`) could
+// overwrite the very array `P()`/`C()` call array methods on.
+describe('isBentoOp: tightened ins.node + container-key guard (XIN-1835 P0-1/P1-2)', () => {
+  const SEP = ''
+  const elKey = (sl: string, el: string): string => sl + SEP + el
+
+  it('rejects a slide ins whose node lacks the elements child array (the brick shape)', () => {
+    // The exact shapes the old fixtures pinned as valid — now refused on the wire.
+    expect(isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'slide', id: 's2', ord: 'V', node: { id: 's2' } })).toBe(false)
+    expect(isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'slide', id: 's1', ord: 'V', node: {} })).toBe(false)
+    // A non-array `elements` is refused too (it would still crash `C(S, node)`).
+    expect(
+      isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'slide', id: 's1', ord: 'V', node: { id: 's1', elements: {} } }),
+    ).toBe(false)
+  })
+
+  it('requires a slide node id equal to the op id', () => {
+    expect(
+      isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'slide', id: 's1', ord: 'V', node: { id: 'other', elements: [] } }),
+    ).toBe(false)
+    expect(
+      isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'slide', id: 's1', ord: 'V', node: { id: 's1', elements: [] } }),
+    ).toBe(true)
+  })
+
+  it('requires every slide-node member to be an object with a string id', () => {
+    expect(
+      isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'slide', id: 's1', ord: 'V', node: { id: 's1', elements: [{}] } }),
+    ).toBe(false)
+    expect(
+      isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'slide', id: 's1', ord: 'V', node: { id: 's1', elements: ['nope'] } }),
+    ).toBe(false)
+    expect(
+      isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'slide', id: 's1', ord: 'V', node: { id: 's1', elements: [{ id: 'e1' }, { id: 'e2' }] } }),
+    ).toBe(true)
+  })
+
+  it('requires an element ins to carry sl and a composite op id = elKey(sl, node.id)', () => {
+    // Missing parent slide id.
+    expect(isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'element', id: elKey('s1', 'e1'), ord: 'V', node: { id: 'e1' } })).toBe(false)
+    // op id is NOT the composite elKey(sl, node.id) — diverges from every peer's diff.
+    expect(isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'element', id: 's1e1', sl: 's1', ord: 'V', node: { id: 'e1' } })).toBe(false)
+    // node without a string id.
+    expect(isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'element', id: elKey('s1', 'e1'), sl: 's1', ord: 'V', node: {} })).toBe(false)
+    // Well-formed composite element ins.
+    expect(isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'element', id: elKey('s1', 'e1'), sl: 's1', ord: 'V', node: { id: 'e1' } })).toBe(true)
+  })
+
+  it('rejects a reserved prototype key ANYWHERE inside an ins.node payload (P1-2)', () => {
+    for (const key of ['__proto__', 'constructor', 'prototype']) {
+      // top-level payload key
+      expect(
+        isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'element', id: elKey('s1', 'e1'), sl: 's1', ord: 'V', node: { id: 'e1', [key]: 1 } }),
+      ).toBe(false)
+      // nested inside a member of a slide node
+      expect(
+        isBentoOp({
+          op: 'ins', a: 'u1', s: 1, l: 1, kind: 'slide', id: 's1', ord: 'V',
+          node: { id: 's1', elements: [{ id: 'e1', style: { [key]: 'x' } }] },
+        }),
+      ).toBe(false)
+    }
+    // JSON.parse materializes "__proto__" as an OWN key — the scan must catch it.
+    const parsed = JSON.parse('{"id":"e1","__proto__":{"x":1}}')
+    expect(isBentoOp({ op: 'ins', a: 'u1', s: 1, l: 1, kind: 'element', id: elKey('s1', 'e1'), sl: 's1', ord: 'V', node: parsed })).toBe(false)
+  })
+
+  it('rejects a set whose key overwrites a DocShape container (slides/elements)', () => {
+    // `d['slides'] = v` / `slide['elements'] = v` would replace the array P()/C() operate on.
+    expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: 1, k: 'slides', v: [] })).toBe(false)
+    expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: 1, sl: 's1', k: 'elements', v: [] })).toBe(false)
+    // A dotted key that merely STARTS with a container name writes a plain own key.
+    expect(isBentoOp({ op: 'set', a: 'u1', s: 1, l: 1, k: 'slides.count', v: 1 })).toBe(true)
   })
 })

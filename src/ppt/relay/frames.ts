@@ -13,6 +13,7 @@
  * `bye`) are allowed for every role.
  */
 import type { SyncStateJSON } from '../sync/slidesSync.js'
+import { SLIDES_SHAPE, elKey } from '../sync/slidesSync.js'
 
 /** The five Bento op kinds the relay accepts (§7.2). */
 export const OP_KINDS = ['set', 'ins', 'del', 'ord', 'txt'] as const
@@ -429,16 +430,73 @@ function isSafeKeyString(v: unknown): v is string {
 }
 
 /**
+ * The DocShape CONTAINER keys — the doc-level parent array (`slides`) and the
+ * parent-level child array (`elements`) — DERIVED from the live descriptor
+ * ({@link SLIDES_SHAPE}) rather than hardcoded, so the wire guard cannot drift
+ * from the reducer's structural vocabulary (XIN-1835 P0-1). `P()`/`C()`
+ * (`crdt.ts:117-118`) call array methods (`push`/`forEach`/`sort`) on exactly
+ * these two keys, so a wire-legal `set` that overwrites one with a non-array
+ * value (`set k:'slides'` at `@doc`, `crdt.ts applySet :882-884`; `set sl:<id>
+ * k:'elements'`, `:913-914`) turns the next structural op into a reducer
+ * TypeError and PERMANENTLY bricks the room (the snapshotter re-throws out of
+ * `advance()`). They are structural containers, synced per-node with their own
+ * position key — never a legitimate `set` target — so rejecting them on the wire
+ * costs nothing real.
+ */
+const CONTAINER_KEYS: ReadonlySet<string> = new Set([SLIDES_SHAPE.parents, SLIDES_SHAPE.children])
+
+/**
  * True for a safe `set` op key. A `set` `k` is written onto the real doc node via
  * `d[op.k]`, and a `blobs.`/`assets.` key is split on the FIRST `.` and its remainder
  * used as a sub-map key (`doc.assets[k.slice(...)]`, `crdt.ts` `applySet`). So no
  * `.`-delimited segment may be a reserved prototype key: `assets.__proto__` would
  * otherwise mutate the assets map's prototype. `style.fontFamily` and the like are
- * unaffected — only the exact reserved names are rejected (XIN-1821 P0-4).
+ * unaffected — only the exact reserved names are rejected (XIN-1821 P0-4). A key
+ * whose WHOLE value is a DocShape container name (`slides`/`elements`) is ALSO
+ * rejected: `d[op.k] = v` would replace the array `P()`/`C()` operate on with an
+ * arbitrary value and brick the room (XIN-1835 P0-1). Only the exact container
+ * name is rejected — a dotted `slides.foo` writes a plain own key and is harmless.
  */
 function isSafeSetKey(v: unknown): v is string {
   if (typeof v !== 'string' || v.length === 0) return false
+  if (CONTAINER_KEYS.has(v)) return false
   return !v.split('.').some((seg) => RESERVED_KEYS.has(seg))
+}
+
+/**
+ * Maximum object/array nesting the wire validator will descend when scanning an
+ * `ins.node` payload for reserved keys (XIN-1835 P1-2). A real slide/element node
+ * is shallow (node → `elements[]` → element → style object); a pathologically
+ * deep adversarial payload is refused (fail-closed) rather than risking a native
+ * stack overflow escaping the validator. Kept well above any real deck depth.
+ */
+const MAX_NODE_SCAN_DEPTH = 64
+
+/**
+ * True if `v` (an `ins.node` payload) contains a reserved prototype key
+ * (`__proto__`/`constructor`/`prototype`) as an OWN key anywhere in its object
+ * graph (XIN-1835 P1-2). `assignNode` (`crdt.ts:1005-1035`) copies every payload
+ * key onto the REAL doc node via `node[k] = clone(payload[k])`; a `__proto__`
+ * key there writes through the prototype accessor, so the op "applies" (leaves
+ * both engine buffers) yet its effect is ABSENT from `toJSON()` — proven, pruned,
+ * lost, exactly the P1-1 buffer-probe break the snapshotter declares closed. Note
+ * `JSON.parse` materializes `"__proto__"` as an enumerable OWN key, so
+ * `Object.keys` surfaces it; we reject on sight and never index into it. Rejecting
+ * at the wire (fail-closed) keeps the reducer contract clean end to end.
+ */
+function nodePayloadHasReservedKey(v: unknown, depth = 0): boolean {
+  if (depth > MAX_NODE_SCAN_DEPTH) return true // over-deep → refuse (fail closed)
+  if (Array.isArray(v)) {
+    for (const item of v) if (nodePayloadHasReservedKey(item, depth + 1)) return true
+    return false
+  }
+  if (typeof v === 'object' && v !== null) {
+    for (const key of Object.keys(v)) {
+      if (RESERVED_KEYS.has(key)) return true
+      if (nodePayloadHasReservedKey((v as Record<string, unknown>)[key], depth + 1)) return true
+    }
+  }
+  return false
 }
 
 /**
@@ -475,13 +533,44 @@ export function isBentoOp(op: unknown): boolean {
       if (o.el !== undefined && !isSafeKeyString(o.el)) return false
       if (o.sl !== undefined && !isSafeKeyString(o.sl)) return false
       return true // `v` is any (undefined = key delete)
-    case 'ins':
+    case 'ins': {
       if (o.kind !== 'slide' && o.kind !== 'element') return false
       // `id` keys the engine's pos/births/pending maps, so it must be a safe key.
       if (!isSafeKeyString(o.id) || !isNonEmptyString(o.ord)) return false
       if (typeof o.node !== 'object' || o.node === null) return false
+      const node = o.node as Record<string, unknown>
+      // Reserved prototype keys must not appear ANYWHERE in the payload the reducer
+      // copies onto the real doc node via `assignNode` — reject them recursively at
+      // the wire (fail-closed), so an applied op can never be absent from `toJSON()`
+      // (XIN-1835 P1-2). `o.sl`, when present, is a map key too.
+      if (nodePayloadHasReservedKey(node)) return false
       if (o.sl !== undefined && !isSafeKeyString(o.sl)) return false
+      if (o.kind === 'slide') {
+        // A slide ins clones `node` into the parent array and then iterates its
+        // CHILD container per-member (`C(S, node).length` / `.forEach`, applyIns
+        // `crdt.ts:926-931`). A missing / non-array container, or a member without a
+        // string id, throws a TypeError out of the reducer and bricks the room — so
+        // require the container array and a well-formed id on every member. `node.id`
+        // must equal the op id: the reducer keys pos/births by `op.id` but stores the
+        // node under `node.id`, so a mismatch silently diverges the deck (XIN-1835 P0-1).
+        if (node.id !== o.id) return false
+        const children = node[SLIDES_SHAPE.children]
+        if (!Array.isArray(children)) return false
+        for (const el of children) {
+          if (typeof el !== 'object' || el === null) return false
+          if (!isNonEmptyString((el as Record<string, unknown>).id)) return false
+        }
+        return true
+      }
+      // element: the parent slide id (`sl`) is REQUIRED (the reducer dereferences
+      // `op.sl!`), and `op.id` MUST be the composite element key `elKey(sl, node.id)`
+      // the reducer/differ assume (`crdt.ts:579,618-620`) — otherwise the element is
+      // keyed inconsistently and diverges from every peer's next diff (XIN-1835 P0-1).
+      if (!isSafeKeyString(o.sl)) return false
+      if (!isNonEmptyString(node.id)) return false
+      if (o.id !== elKey(o.sl, node.id)) return false
       return true
+    }
     case 'del':
       if (o.kind !== 'slide' && o.kind !== 'element') return false
       if (!isSafeKeyString(o.id)) return false

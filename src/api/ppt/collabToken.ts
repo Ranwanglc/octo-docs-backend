@@ -47,8 +47,14 @@ export async function collabTokenHandler(req: Request, res: Response): Promise<v
   // UNSUPPORTED_DOCUMENT_TYPE); `role` may be 'none'. `spaceMember` is the SAME
   // membership decision the effective role was resolved with (XIN-1739): the
   // relay ticket signs THIS value so a later live downgrade recheck agrees with
-  // issuance, and a direct writer/admin resolved no membership IO.
-  const { meta, role, spaceMember } = await loadPptDocForRead(uid, spaceId, docId, { token })
+  // issuance, and a direct writer/admin resolved no membership IO. The ticket path
+  // uses the fail-closed membership resolver (XIN-1835 spec deviation): a lookup
+  // throw must degrade to non-member so the ticket carries a concrete signable
+  // boolean, never break issuance.
+  const { meta, role, spaceMember } = await loadPptDocForRead(uid, spaceId, docId, {
+    token,
+    membershipErrorMode: 'fail-closed',
+  })
 
   // Access floor FIRST: a caller with no role must be told only that it has no
   // access — never a stored-name/type defect below. Checking access before the

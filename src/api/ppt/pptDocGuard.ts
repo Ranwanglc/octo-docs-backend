@@ -16,7 +16,7 @@
  */
 import { docMetaRepo, type DocMeta } from '../../db/repos/docMetaRepo.js'
 import { resolveRole } from '../../permission/resolveRole.js'
-import { resolveEffectiveRoleWithMembership } from '../../permission/resolveEffectiveRole.js'
+import { resolveEffectiveRole, resolveEffectiveRoleWithMembership } from '../../permission/resolveEffectiveRole.js'
 import type { ResolvedRole } from '../../permission/role.js'
 import { HTML_PPT_DOC_TYPE } from '../../db/docType.js'
 import { PptApiError } from './envelope.js'
@@ -40,6 +40,21 @@ export interface PptDocGuard {
 export interface PptDocGuardCaller {
   /** Human octo session token — threaded to the share-scope membership resolver. */
   token?: string
+  /**
+   * How an `isSpaceMember` lookup ERROR is handled while resolving an
+   * `anyone_in_space` share grant (XIN-1835 spec deviation):
+   *   · `'fail-closed'` — the relay TICKET path: degrade to non-member on a lookup
+   *     throw. The ticket must carry a concrete signable boolean and a live downgrade
+   *     recheck must match issuance, so a throw here would break issuance/reauth
+   *     rather than degrade gracefully. Consumes the returned `spaceMember`.
+   *   · `'propagate'` (DEFAULT) — the LIVE REST read route (`GET .../source`): let an
+   *     identity-service outage PROPAGATE as a 5xx instead of silently degrading a
+   *     legitimate `anyone_in_space` reader to 403/404. The fail-closed swallow was
+   *     never meant to ride the live REST route; narrowing it to the ticket path keeps
+   *     that route surfacing real errors. `spaceMember` is not load-bearing here and is
+   *     reported `false`.
+   */
+  membershipErrorMode?: 'fail-closed' | 'propagate'
 }
 
 /**
@@ -80,9 +95,21 @@ export async function loadPptDocForRead(
   const direct = await resolveRole(uid, docId)
   // #64 share-scope layering: effectiveRole = max(direct, share-derived). Zero
   // extra IO for the default restricted doc or a caller already at writer/admin.
-  // Resolve the effective role AND the membership it depended on in ONE call so a
-  // later consumer (the collab-token claim) signs the SAME `spaceMember` the role
-  // decision used (XIN-1739 spaceMember single resolution).
-  const { role, spaceMember } = await resolveEffectiveRoleWithMembership(uid, direct, meta, { token: caller.token })
+  // Membership-lookup ERROR handling is caller-scoped (XIN-1835 spec deviation):
+  //   · ticket path ('fail-closed') resolves BOTH role and the `spaceMember` the
+  //     collab-token signs, in ONE call, so a downgrade recheck agrees with issuance
+  //     (XIN-1739 spaceMember single resolution), and a lookup throw degrades to
+  //     non-member rather than breaking issuance.
+  //   · the live REST read route ('propagate', the default) uses the non-swallowing
+  //     resolver so an identity outage surfaces as a 5xx, never a silent 403/404 for a
+  //     legitimate reader; `spaceMember` is not load-bearing there.
+  let role: ResolvedRole
+  let spaceMember: boolean
+  if (caller.membershipErrorMode === 'fail-closed') {
+    ;({ role, spaceMember } = await resolveEffectiveRoleWithMembership(uid, direct, meta, { token: caller.token }))
+  } else {
+    role = await resolveEffectiveRole(uid, direct, meta, { token: caller.token })
+    spaceMember = false
+  }
   return { meta, role, spaceMember }
 }

@@ -270,6 +270,17 @@ interface Conn {
    */
   ephemeralFrameTimes: number[]
   /**
+   * Timestamps of recent DUPLICATE re-acks (a resend of an already-durable frameId,
+   * XIN-1835 P1-4). A pure re-ack is deliberately exempt from the `frameTimes`
+   * mutation budget (idempotent-resend contract), so without a separate window a
+   * reader looping ONE harvested-valid frameId could drive an unbounded
+   * getSnapshot + ack amplification. When this window is saturated the EXCESS
+   * re-acks are SHED (dropped, never `refused`): a genuine client resends a lost-ack
+   * frame far too infrequently to approach the window, so a real re-ack is never
+   * dropped — only a tight loop is throttled.
+   */
+  dedupReackTimes: number[]
+  /**
    * True once this connection's first replay reached a stable boundary. Until
    * then — and while any replay is in flight — a peer's live op/presence frame is
    * BUFFERED (see {@link liveBuffer}) instead of delivered, so a peer op is never
@@ -734,6 +745,7 @@ export class PptRelay {
       reauthGeneration: 0,
       frameTimes: [],
       ephemeralFrameTimes: [],
+      dedupReackTimes: [],
       caughtUp: false,
       replayInFlight: false,
       flushDepth: 0,
@@ -1288,6 +1300,12 @@ export class PptRelay {
         await this.runSerialized(conn.docId, () => this.handleOps(conn, frame as OpsFrame, rawBytes))
         return
       case 'snap':
+        // `handleSnap` refuses persistence outright (snapshots are server-managed),
+        // so a client `snap` is ADMISSION-only — byte-cap + rate-limit it as an
+        // ephemeral frame BEFORE the room-chain enqueue, exactly like hello/need/p,
+        // so an oversized or looped `snap` cannot force a JSON-parsed doc onto the
+        // ordering chain before it is refused (XIN-1835 P1-3).
+        if (this.enforceEphemeralLimits(conn, rawBytes)) return
         await this.runSerialized(conn.docId, () => this.handleSnap(conn, frame as SnapFrame, rawBytes))
         return
       default:
@@ -1411,6 +1429,16 @@ export class PptRelay {
    * than forcing a full reconnect + replay.
    */
   private async handleReauth(conn: Conn, ticket: string): Promise<void> {
+    // Terminal-window guard (XIN-1835 P1-5): if this socket is already condemned —
+    // a `terminalClose` set with its close QUEUED on the outbound chain (e.g. the
+    // share-expiry grace timer fired, or role was revoked) — an in-place reauth must
+    // NOT resurrect it. Adopting fresh authority would launder the withdrawn state and
+    // re-enable a subsequent `ops` commit before the queued close runs; the client must
+    // reconnect fresh, which re-runs the full connect gate. Return WITHOUT overwriting
+    // the existing terminal state (its close code/reason is already authoritative). A
+    // socket merely in the `pendingReauth` grace window is NOT terminal, so the normal
+    // reauth recovery still proceeds (terminalRefusal returns null for pendingReauth).
+    if (this.terminalRefusal(conn) !== null) return
     let claims: PptCollabClaims & { jti: string }
     try {
       claims = this.verifyTicket(ticket)
@@ -1506,6 +1534,12 @@ export class PptRelay {
 
   private async refreshReadAuth(conn: Conn, _reason: string): Promise<boolean> {
     if (conn.socket.readyState !== WebSocket.OPEN) return false
+    // Terminal-window guard FIRST (XIN-1835 P1-5): once a `terminalClose` is set (its
+    // socket close is only QUEUED on the outbound chain) — or read was otherwise
+    // withdrawn — a `hello`/`need`/`p` must NOT be able to re-serve state or, worse,
+    // launder the socket back to a live authority before the close runs. Refuse the
+    // read here without rebuilding `conn.auth`, so the queued close stays authoritative.
+    if (this.terminalRefusal(conn) !== null) return false
     if (this.docStatusProvider) {
       let deleted: boolean
       try {
@@ -1540,6 +1574,13 @@ export class PptRelay {
       await this.closeConn(conn, CLOSE_FORBIDDEN, 'access revoked')
       return false
     }
+    // A concurrent path (share-expiry, an epoch bump, a deletion recheck) may have
+    // condemned this socket by setting `terminalClose` WHILE we awaited the doc-status
+    // / epoch reads above. NEVER overwrite that terminal state with a live authority
+    // here — doing so would launder the withdrawn state and re-enable reads (and a
+    // subsequent `ops` commit) before the queued close runs (XIN-1835 P1-5). Preserve
+    // it and refuse, the same way the top-of-function guard does for a pre-existing one.
+    if (conn.auth.terminalClose) return false
     // A pending re-auth flag is STICKY (XIN-1739 P0-1): a periodic timer refresh
     // or a `hello`/`need`/`p` must NOT silently clear a socket's awaiting-reauth
     // state just because its cached role/epoch still validate — the FROZEN
@@ -2154,6 +2195,18 @@ export class PptRelay {
       this.refuse(conn, 'protocol-version', { k, message: 'ops frame requires frameId' })
       return
     }
+    // Byte cap FIRST (XIN-1835 P1-4), before the identity gate / canonical hash /
+    // frameId ledger SELECT / getSnapshot. `guardMutation` also enforces this cap,
+    // but only on the genuinely-new path — a KNOWN-duplicate resend re-acks BEFORE
+    // that gate, so an over-cap resend used to pay all of the above expensive work
+    // before anything rejected it. A frame that was legitimately persisted was
+    // `<= maxFrameBytes` when accepted, so a resend ABOVE the cap cannot be a genuine
+    // idempotent resend of a durable original — refusing it here `too-large` sheds the
+    // abuse without ever refusing a real re-ack, preserving the resend contract exactly.
+    if (rawBytes > this.limits.maxFrameBytes) {
+      this.refuse(conn, 'too-large', { k, frameId, message: 'frame exceeds size limit' })
+      return
+    }
     if (!opsAreValid(frame.ops)) {
       this.refuse(conn, 'protocol-version', { k, frameId, message: 'ops must be an array of whitelisted op kinds' })
       return
@@ -2240,6 +2293,17 @@ export class PptRelay {
       }
     } catch {
       /* fall through: appendOp's ledger PK remains the authoritative dedup */
+    }
+    // Duplicate-path admission throttle (XIN-1835 P1-4). A pure re-ack is exempt from
+    // the `frameTimes` mutation budget, so a reader looping ONE harvested-valid frameId
+    // would otherwise drive an unbounded `getSnapshot` + `ack` per iteration. Once this
+    // connection's SEPARATE duplicate window saturates, SHED the excess (drop silently —
+    // NEVER a `refused`, so a real client is never told a durable write is unsynced). A
+    // genuine idempotent resend arrives far too rarely to approach the window; only a
+    // tight loop trips it. The slot is consumed ONLY on the duplicate path (`known !==
+    // null`), so a genuinely-new frame never touches this window.
+    if (known !== null && this.rateLimited(conn.dedupReackTimes) !== null) {
+      return
     }
     if (known !== null && known.payloadHash !== null) {
       // Canonical-ops hashes (XIN-1736 P1-A) are epoch/key-order independent, so
