@@ -55,6 +55,18 @@ beforeEach(() => {
   vi.mocked(docViewHistoryRepo.upsertViewWithPrune).mockResolvedValue(new Date())
 })
 
+// The ingest fires inside a NON-AWAITED async block whose await-depth before
+// upsertViewWithPrune is an implementation detail. A fixed 2x setImmediate flush
+// would silently become vacuous if a future refactor adds an await layer, turning
+// the negative `not.toHaveBeenCalled()` assertions into always-pass. Drain the
+// event loop to idle (N far exceeds any plausible depth) so the block fully
+// settles regardless of depth.
+async function drainMicrotasks(iterations = 10) {
+  for (let i = 0; i < iterations; i++) {
+    await new Promise((r) => setImmediate(r))
+  }
+}
+
 describe('issueCollabToken — MF2 recent-view fallback ingest', () => {
   it('fires a best-effort UPSERT with the trusted uid + doc_id + space_id on the authorized branch', async () => {
     asUser('u_doc')
@@ -64,7 +76,7 @@ describe('issueCollabToken — MF2 recent-view fallback ingest', () => {
 
     const out = await issueCollabToken('octo_session_doc', DOC_KEY)
     expect(out.ok).toBe(true)
-    expect(docViewHistoryRepo.upsertViewWithPrune).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(docViewHistoryRepo.upsertViewWithPrune).toHaveBeenCalledTimes(1))
     const arg = vi.mocked(docViewHistoryRepo.upsertViewWithPrune).mock.calls[0]![0]
     expect(arg.uid).toBe('u_doc')
     expect(arg.docId).toBe(DOC_ID)
@@ -82,6 +94,9 @@ describe('issueCollabToken — MF2 recent-view fallback ingest', () => {
 
     const out = await issueCollabToken('octo_session_x', DOC_KEY)
     expect(out).toEqual({ ok: false, status: 403, error: 'forbidden' })
+    // The 403 result above IS the sentinel that issuance ran to its terminal
+    // (pre-ingest) decision; draining then confirms no deferred write appears.
+    await drainMicrotasks()
     expect(docViewHistoryRepo.upsertViewWithPrune).not.toHaveBeenCalled()
   })
 
@@ -90,6 +105,8 @@ describe('issueCollabToken — MF2 recent-view fallback ingest', () => {
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(null)
     const out = await issueCollabToken('octo_session_doc', DOC_KEY)
     expect(out.ok).toBe(false)
+    // 404 result is the sentinel that issuance reached its terminal decision.
+    await drainMicrotasks()
     expect(docViewHistoryRepo.upsertViewWithPrune).not.toHaveBeenCalled()
   })
 
@@ -104,8 +121,7 @@ describe('issueCollabToken — MF2 recent-view fallback ingest', () => {
     const out = await issueCollabToken('octo_session_doc', DOC_KEY)
     expect(out.ok).toBe(true) // issuance unaffected
     // let the fire-and-forget rejection settle into its .catch (warn).
-    await new Promise((r) => setImmediate(r))
-    expect(warn).toHaveBeenCalled()
+    await vi.waitFor(() => expect(warn).toHaveBeenCalled())
     warn.mockRestore()
   })
 })
