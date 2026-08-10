@@ -144,19 +144,54 @@ export async function issueCollabToken(
   // header) do we fall back to the document's home space (meta.space_id) — the
   // pre-fix behavior, so same-space opens do not regress.
   const trimmedViewerSpace = typeof viewerSpaceId === 'string' ? viewerSpaceId.trim() : ''
-  const ingestSpaceId = trimmedViewerSpace !== '' ? trimmedViewerSpace : meta.space_id
-  void docViewHistoryRepo
-    .upsertViewWithPrune({
+  // recent-view ingest is a best-effort side effect and MUST NOT influence token
+  // issuance (no added latency, no thrown error). It is fired non-awaited inside
+  // its own async block; every await + the isSpaceMember lookup live in there, so
+  // the signing path below stays zero-blocking and a failure only warns.
+  //
+  // Space membership gate (load-bearing): X-Space-Id is a client-injected header
+  // that also leaks via share links, so it is only a RESOURCE SELECTOR, never a
+  // credential. Having a role on THIS doc (doc_member / owner / share) does NOT
+  // imply membership of the header space — a doc_member or invited reader may not
+  // belong to trimmedViewerSpace at all. So a NON-EMPTY header is only honored
+  // after isSpaceMember confirms the caller actually belongs to it; otherwise we
+  // SKIP this write entirely (we do NOT fall back to meta.space_id, which could
+  // still be a space the caller is not a member of). An empty header (legacy
+  // client) keeps the pre-fix fallback to the document's home space.
+  void (async () => {
+    let ingestSpaceId: string | null
+    if (trimmedViewerSpace === '') {
+      // Legacy client: no viewer space supplied — record under the document's
+      // home space (unchanged pre-fix behavior, no regression for same-space opens).
+      ingestSpaceId = meta.space_id
+    } else if (spaceMember === true && trimmedViewerSpace === meta.space_id) {
+      // Reuse the already-confirmed membership from the anyone_in_space branch
+      // ONLY when it is a positive result for THIS exact space. A `false`/unset
+      // spaceMember is NOT "confirmed non-member" (it may simply never have been
+      // queried), so it can never short-circuit the check below.
+      ingestSpaceId = trimmedViewerSpace
+    } else {
+      // Confirm membership of the viewer's current space before writing under it.
+      // isSpaceMember fails closed to `false` on any lookup error; a rejected
+      // promise would bubble, so it is caught to `false`. Non-member / unconfirmed
+      // => skip the write (never fall back to meta.space_id).
+      const member = await getOctoIdentity()
+        .isSpaceMember(uid, trimmedViewerSpace, octoToken)
+        .catch(() => false)
+      ingestSpaceId = member ? trimmedViewerSpace : null
+    }
+    if (ingestSpaceId === null) return
+    await docViewHistoryRepo.upsertViewWithPrune({
       uid,
       docId: meta.doc_id,
       spaceId: ingestSpaceId,
       retainCount: config.docView.retainCount,
       retainDays: config.docView.retainDays,
     })
-    .catch((err) => {
-      // eslint-disable-next-line no-console
-      console.warn(`[octo-docs] recent-view fallback ingest failed for ${meta.doc_id}:`, err)
-    })
+  })().catch((err) => {
+    // eslint-disable-next-line no-console
+    console.warn(`[octo-docs] recent-view fallback ingest failed for ${meta.doc_id}:`, err)
+  })
 
   // Sign with the document's current epoch (§4.4 / §4.5). The token carries the
   // exact connection documentName (incl. the `:wb:` whiteboard form) so the WS

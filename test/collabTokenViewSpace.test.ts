@@ -50,12 +50,21 @@ const docMeta = (ownerId: string) =>
     permission_epoch: 2,
   }) as never
 
-function asUser(uid: string | null) {
+function asUser(uid: string | null, isSpaceMember?: (u: string, s: string, t: string) => Promise<boolean>) {
+  // Wrap the membership resolver in a spy so negative tests can assert the
+  // POSITIVE sentinel "the gate was actually reached" (isSpaceMember called),
+  // proving the drain waited past the decision point rather than asserting early.
+  const spy = vi.fn(isSpaceMember ?? (async () => true))
   setOctoIdentity({
     verifyToken: async (token: string) => (token && uid ? { uid } : null),
     getUser: async () => null,
     getUsers: async () => [],
-  })
+    // Default: viewer is a member of any space we ask about, unless a test
+    // overrides this to model a non-member / failing lookup. Callers whose
+    // assertions do not depend on membership keep the permissive default.
+    isSpaceMember: spy,
+  } as never)
+  return spy
 }
 
 beforeEach(() => {
@@ -65,6 +74,22 @@ beforeEach(() => {
   vi.mocked(docViewHistoryRepo.upsertViewWithPrune).mockReset()
   vi.mocked(docViewHistoryRepo.upsertViewWithPrune).mockResolvedValue(new Date())
 })
+
+// The ingest fires inside a NON-AWAITED async block whose depth (number of
+// awaits before upsertViewWithPrune) is an implementation detail: today it is
+// `await isSpaceMember -> await upsert`, but a future refactor could add layers.
+// A fixed 2x setImmediate flush would then resolve BEFORE the write decision and
+// silently turn every `not.toHaveBeenCalled()` into a vacuous pass. Instead we
+// drain the event loop until it is idle (N iterations, N chosen far larger than
+// any plausible await depth) so the block fully settles regardless of depth.
+// Negative assertions additionally carry a positive SENTINEL (isSpaceMember was
+// called / the block ran) so "nothing happened" can never be mistaken for
+// "we asserted too early".
+async function drainMicrotasks(iterations = 10) {
+  for (let i = 0; i < iterations; i++) {
+    await new Promise((r) => setImmediate(r))
+  }
+}
 
 describe('issueCollabToken — recent-view space 口径统一 (XIN-1237)', () => {
   it('records the view under the VIEWER current space, not the document home space', async () => {
@@ -77,7 +102,7 @@ describe('issueCollabToken — recent-view space 口径统一 (XIN-1237)', () =>
     // from the collab-token request's X-Space-Id header).
     const out = await issueCollabToken('octo_session_viewer', DOC_KEY, VIEWER_SPACE)
     expect(out.ok).toBe(true)
-    expect(docViewHistoryRepo.upsertViewWithPrune).toHaveBeenCalledTimes(1)
+    await vi.waitFor(() => expect(docViewHistoryRepo.upsertViewWithPrune).toHaveBeenCalledTimes(1))
     const arg = vi.mocked(docViewHistoryRepo.upsertViewWithPrune).mock.calls[0]![0]
     expect(arg.uid).toBe('u_viewer')
     expect(arg.docId).toBe(DOC_ID)
@@ -95,6 +120,7 @@ describe('issueCollabToken — recent-view space 口径统一 (XIN-1237)', () =>
 
     const out = await issueCollabToken('octo_session_viewer', DOC_KEY)
     expect(out.ok).toBe(true)
+    await vi.waitFor(() => expect(docViewHistoryRepo.upsertViewWithPrune).toHaveBeenCalledTimes(1))
     const arg = vi.mocked(docViewHistoryRepo.upsertViewWithPrune).mock.calls[0]![0]
     expect(arg.spaceId).toBe(DOC_SPACE)
   })
@@ -107,7 +133,76 @@ describe('issueCollabToken — recent-view space 口径统一 (XIN-1237)', () =>
 
     const out = await issueCollabToken('octo_session_viewer', DOC_KEY, '   ')
     expect(out.ok).toBe(true)
+    await vi.waitFor(() => expect(docViewHistoryRepo.upsertViewWithPrune).toHaveBeenCalledTimes(1))
     const arg = vi.mocked(docViewHistoryRepo.upsertViewWithPrune).mock.calls[0]![0]
     expect(arg.spaceId).toBe(DOC_SPACE)
+  })
+
+  // --- membership gate on the viewer header space (space-guard fix) ---
+
+  it('① writes under the viewer space when the viewer is a REAL member of it', async () => {
+    // Explicit member override for clarity (default is also true).
+    asUser('u_viewer', async (_u, s) => s === VIEWER_SPACE)
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(docMeta('owner_z'))
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta('owner_z'))
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader')
+
+    const out = await issueCollabToken('octo_session_viewer', DOC_KEY, VIEWER_SPACE)
+    expect(out.ok).toBe(true)
+    await vi.waitFor(() => expect(docViewHistoryRepo.upsertViewWithPrune).toHaveBeenCalledTimes(1))
+    expect(vi.mocked(docViewHistoryRepo.upsertViewWithPrune).mock.calls[0]![0].spaceId).toBe(VIEWER_SPACE)
+  })
+
+  it('② does NOT write at all when the viewer is NOT a member of the header space (no fallback to home space)', async () => {
+    const member = asUser('u_viewer', async () => false) // not a member of anything
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(docMeta('owner_z'))
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta('owner_z'))
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader') // has doc access, but not space member
+
+    const out = await issueCollabToken('octo_session_viewer', DOC_KEY, VIEWER_SPACE)
+    expect(out.ok).toBe(true) // token still issued (doc role is enough)
+    // Drain to idle, then SENTINEL: the gate was actually evaluated (isSpaceMember
+    // ran). This makes the negative assertion meaningful — it fires only after
+    // "everything that should happen has happened", not because we asserted early.
+    await drainMicrotasks()
+    await vi.waitFor(() => expect(member).toHaveBeenCalledWith('u_viewer', VIEWER_SPACE, expect.anything()))
+    // Strict policy: a non-member header must NOT write, and must NOT fall back
+    // to meta.space_id either.
+    expect(docViewHistoryRepo.upsertViewWithPrune).not.toHaveBeenCalled()
+  })
+
+  it('③ skips the write but still issues the token (200) when the membership lookup REJECTS', async () => {
+    const member = asUser('u_viewer', async () => {
+      throw new Error('identity service down')
+    })
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(docMeta('owner_z'))
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta('owner_z'))
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader')
+
+    const out = await issueCollabToken('octo_session_viewer', DOC_KEY, VIEWER_SPACE)
+    expect(out.ok).toBe(true) // issuance unaffected by the best-effort ingest
+    await drainMicrotasks()
+    await vi.waitFor(() => expect(member).toHaveBeenCalledWith('u_viewer', VIEWER_SPACE, expect.anything()))
+    expect(docViewHistoryRepo.upsertViewWithPrune).not.toHaveBeenCalled()
+  })
+
+  it('⑤ does NOT write when header === meta.space_id but the viewer is not a member (no "equal ⇒ skip check" shortcut)', async () => {
+    // Viewer opens the doc while in its HOME space, but is not actually a member
+    // of that space (e.g. only a direct doc_member / invited reader). The equal-
+    // space case must STILL be gated by isSpaceMember, not written blindly.
+    const member = asUser('u_viewer', async () => false)
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(docMeta('owner_z'))
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta('owner_z'))
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader') // doc access, non-member
+
+    // meta.share_scope is NOT anyone_in_space here, so the issuance-time
+    // spaceMember probe never ran (spaceMember stays false) — the fix must not
+    // treat that unset `false` as "confirmed member" and must not treat
+    // header===home as an auto-pass.
+    const out = await issueCollabToken('octo_session_viewer', DOC_KEY, DOC_SPACE)
+    expect(out.ok).toBe(true)
+    await drainMicrotasks()
+    await vi.waitFor(() => expect(member).toHaveBeenCalledWith('u_viewer', DOC_SPACE, expect.anything()))
+    expect(docViewHistoryRepo.upsertViewWithPrune).not.toHaveBeenCalled()
   })
 })
