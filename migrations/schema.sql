@@ -33,6 +33,7 @@ CREATE TABLE doc_meta (
   folder_id     VARCHAR(64)  NOT NULL DEFAULT 'f_default', -- docs 原生文件夹（documentName 第 3 段 {folder}）；v2.0：不再是 octo group_no，仅做组织/归类，不派生权限（见 §4 / §8.1）。**非空保留默认值 `f_default`**（省略 folderId 的新建文档归此保留文件夹）；**documentName 第 3 段必须等于本列值**（键与 folder_id 恒一致，见 §8.1）
   doc_type      VARCHAR(32)  NOT NULL DEFAULT 'doc', -- doc / template ...
   octo_doc_slug VARCHAR(128) NULL DEFAULT NULL, -- octo-doc 正文 slug；doc_type='html' 时用于路由回 octo-doc
+  html_idempotency_key_hash BINARY(32) NULL DEFAULT NULL,
   status        TINYINT      NOT NULL DEFAULT 1,  -- 1=正常 0=已删除(软删) 2=归档
   permission_epoch BIGINT    NOT NULL DEFAULT 0,   -- 权限版本号（单调递增，权威落 DB；v2.0 按 doc_member 变更 +1，见 §4.5）
   share_scope   TINYINT      NOT NULL DEFAULT 0,   -- 分享范围：0=restricted(默认) 1=anyone_in_space（#64 空间级分享，见 §4/§5）
@@ -50,6 +51,7 @@ CREATE TABLE doc_meta (
   -- 2026-07-13-add-doc-meta-octo-doc-slug upgrade adds this composite key
   -- directly, keeping fresh and upgraded DBs identical.
   UNIQUE KEY uk_octo_doc_slug (space_id, octo_doc_slug),
+  UNIQUE KEY uk_html_idempotency (space_id, owner_id, html_idempotency_key_hash, doc_type),
   KEY idx_space (space_id, status, updated_at),
   KEY idx_folder (folder_id, status, updated_at),
   KEY idx_owner (owner_id, status, updated_at),

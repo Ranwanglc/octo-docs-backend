@@ -107,6 +107,14 @@ export function requireSafeSigningSecret(secret: string): string {
   return secret
 }
 
+export function resolveHtmlDelegationSecret(raw: string): string {
+  if (raw === '') return ''
+  if (Buffer.byteLength(raw, 'utf8') < 32) {
+    throw new Error('DOCS_HTML_DELEGATION_SECRET must be at least 32 bytes when configured')
+  }
+  return raw
+}
+
 /**
  * Resolve the public, browser-reachable collab WS URL that collab-token responses
  * hand back as `collabWsUrl` (§4.4). The Hocuspocus WS server lives on its own
@@ -182,6 +190,8 @@ export const config = {
   hostname: str('HOSTNAME', 'octo-docs-local'),
   hocuspocusPort: num('HOCUSPOCUS_PORT', 1234),
   httpPort: num('HTTP_PORT', 3000),
+  // Empty disables the internal endpoint; configured values are validated above.
+  htmlDelegationSecret: resolveHtmlDelegationSecret(str('DOCS_HTML_DELEGATION_SECRET', '')),
 
   // Express `trust proxy` value. The REST API sits behind nginx, so this must be
   // set for req.ip (and thus the per-IP rate limiter) to see the real client

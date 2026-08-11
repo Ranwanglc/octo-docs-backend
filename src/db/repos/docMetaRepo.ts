@@ -5,6 +5,7 @@
  * Holds both doc_id (business PK) and document_name (Hocuspocus routing/
  * persistence key, unique). See appendix B for the naming convention.
  */
+import { createHash } from 'node:crypto'
 import { query, transaction, type Tx } from '../pool.js'
 import { docTypeUsesOctoDocSlug } from '../docType.js'
 import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
@@ -36,6 +37,28 @@ export class DocOwnershipError extends Error {
   }
 }
 
+/** A canonical create key is permanently consumed by a soft-deleted document. */
+export class CanonicalHtmlDeletedError extends Error {
+  constructor(message = 'canonical_document_deleted') {
+    super(message)
+    this.name = 'CanonicalHtmlDeletedError'
+  }
+}
+
+export class CanonicalHtmlArchivedError extends Error {
+  constructor(message = 'canonical_document_archived') {
+    super(message)
+    this.name = 'CanonicalHtmlArchivedError'
+  }
+}
+
+export class CanonicalHtmlLegacyConflictError extends Error {
+  constructor(message = 'canonical_document_conflict') {
+    super(message)
+    this.name = 'CanonicalHtmlLegacyConflictError'
+  }
+}
+
 export interface DocMeta {
   doc_id: string
   document_name: string
@@ -45,6 +68,7 @@ export interface DocMeta {
   folder_id: string
   doc_type: string
   octo_doc_slug: string | null
+  html_idempotency_key_hash: Buffer | null
   status: number // 1=active 0=deleted 2=archived
   permission_epoch: number
   /**
@@ -74,6 +98,11 @@ export interface CreateDocInput {
   docType: string
   octoDocSlug?: string
   createdBy: string
+}
+
+export interface CanonicalHtmlInput extends CreateDocInput {
+  octoDocSlug: string
+  idempotencyKey: string
 }
 
 const VALID_STORED_ROLES_SQL = STORED_ROLE_VALUES.join(', ')
@@ -151,6 +180,11 @@ export const docMetaRepo = {
       // would overwrite its title/updated_by and revive a soft-deleted row with
       // no auth. Owner固化: only the owning bot converges idempotently.
       if (existing.owner_id !== input.createdBy) throw new DocOwnershipError()
+      if (existing.html_idempotency_key_hash != null) {
+        if (existing.status === 0) throw new CanonicalHtmlDeletedError()
+        if (existing.status === 2) throw new CanonicalHtmlArchivedError()
+        throw new CanonicalHtmlLegacyConflictError()
+      }
       // space_id in the WHERE is defense-in-depth: `existing` is already
       // space-scoped, so pinning the space here means no cross-tenant row can
       // ever be the UPDATE target.
@@ -179,6 +213,11 @@ export const docMetaRepo = {
       // winner may be another bot's row, so a non-owner loser must be rejected
       // rather than silently overwriting/reviving it.
       if (raced.owner_id !== input.createdBy) throw new DocOwnershipError()
+      if (raced.html_idempotency_key_hash != null) {
+        if (raced.status === 0) throw new CanonicalHtmlDeletedError()
+        if (raced.status === 2) throw new CanonicalHtmlArchivedError()
+        throw new CanonicalHtmlLegacyConflictError()
+      }
       await query(
         `UPDATE doc_meta
          SET title = ?, updated_by = ?, status = 1
@@ -191,6 +230,49 @@ export const docMetaRepo = {
     }
     const created = await docMetaRepo.getByDocId(input.docId)
     if (!created) throw new Error('html doc missing after create')
+    return { meta: created, created: true }
+  },
+
+  async createCanonicalHtml(input: CanonicalHtmlInput): Promise<{ meta: DocMeta; created: boolean }> {
+    const keyHash = createHash('sha256').update(input.idempotencyKey, 'utf8').digest()
+    const find = async () => {
+      const rows = await query<DocMeta>(
+        `SELECT * FROM doc_meta
+         WHERE space_id = ? AND owner_id = ? AND html_idempotency_key_hash = ? AND doc_type = 'html'
+         LIMIT 1`,
+        [input.spaceId, input.ownerId, keyHash],
+      )
+      return rows[0] ?? null
+    }
+    const accept = (meta: DocMeta) => {
+      if (meta.space_id !== input.spaceId || meta.owner_id !== input.ownerId || input.createdBy !== input.ownerId) {
+        throw new DocOwnershipError()
+      }
+      // A canonical key remains consumed after deletion or archival.
+      if (meta.status === 0) throw new CanonicalHtmlDeletedError()
+      if (meta.status === 2) throw new CanonicalHtmlArchivedError()
+      return { meta, created: false as const }
+    }
+
+    const existing = await find()
+    if (existing) return accept(existing)
+    try {
+      await query(
+        `INSERT INTO doc_meta
+           (doc_id, document_name, title, owner_id, space_id, folder_id, doc_type, octo_doc_slug,
+            html_idempotency_key_hash, status, permission_epoch, created_by, updated_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
+        [input.docId, input.documentName, input.title, input.ownerId, input.spaceId, input.folderId,
+          'html', input.docId, keyHash, input.createdBy],
+      )
+    } catch (err) {
+      if (!isDupEntry(err)) throw err
+      const raced = await find()
+      if (!raced) throw err
+      return accept(raced)
+    }
+    const created = await docMetaRepo.getByDocId(input.docId)
+    if (!created) throw new Error('canonical html doc missing after create')
     return { meta: created, created: true }
   },
 
@@ -219,6 +301,17 @@ export const docMetaRepo = {
       [octoDocSlug, spaceId],
     )
     return rows[0] ?? null
+  },
+
+  /** Return two rows at most so a legacy globally ambiguous slug is detected,
+   * never resolved through an arbitrary cross-space LIMIT 1. */
+  async findHtmlBySlug(octoDocSlug: string): Promise<DocMeta[]> {
+    return query<DocMeta>(
+      `SELECT * FROM doc_meta
+       WHERE octo_doc_slug = ?
+       LIMIT 2`,
+      [octoDocSlug],
+    )
   },
 
   /** Resolve the canonical document_name for a doc_id (§7.3 resolveDocumentName). */
@@ -283,6 +376,21 @@ export const docMetaRepo = {
       const row = rows[0]
       if (!row) return null
       return { documentName: row.document_name, permissionEpoch: Number(row.permission_epoch) }
+    })
+  },
+
+  /** Active-to-deleted CAS: retries never bump the epoch a second time. */
+  async softDeleteActive(docId: string): Promise<{ documentName: string; permissionEpoch: number } | null> {
+    return transaction(async (tx) => {
+      const result = await tx.query('UPDATE doc_meta SET status = 0 WHERE doc_id = ? AND status = 1', [docId])
+      if (Number((result as unknown as { affectedRows?: number }).affectedRows ?? 0) !== 1) return null
+      await docMetaRepo.bumpEpochTx(tx, docId)
+      const rows = await tx.query<{ document_name: string; permission_epoch: number }>(
+        'SELECT document_name, permission_epoch FROM doc_meta WHERE doc_id = ? LIMIT 1',
+        [docId],
+      )
+      const row = rows[0]
+      return row ? { documentName: row.document_name, permissionEpoch: Number(row.permission_epoch) } : null
     })
   },
 

@@ -37,6 +37,7 @@ import { membersRouter } from './routes/members.js'
 import { forwardGrantRouter } from './routes/forwardGrant.js'
 import { accessRequestsRouter } from './routes/accessRequests.js'
 import { cardActionDecideHandler, CARD_ACTION_DECIDE_PATH } from './routes/cardActionDecide.js'
+import { htmlDelegatedDeleteHandler, HTML_DELEGATED_DELETE_PATH } from './routes/htmlDelegatedDelete.js'
 import { invitesRouter, acceptInviteRouter, botAcceptInviteRouter } from './routes/invites.js'
 import { attachmentsRouter } from './routes/attachments.js'
 import { linkCardRouter } from './routes/linkCard.js'
@@ -139,6 +140,14 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
     cardActionLimiter,
     express.raw({ type: 'application/json', limit: '64kb' }),
     cardActionDecideHandler,
+  )
+
+  // Raw body and HMAC are the only authentication accepted on this path.
+  app.delete(
+    HTML_DELEGATED_DELETE_PATH,
+    createRateLimiter(opts.rateLimit),
+    express.raw({ type: 'application/json', limit: '4kb' }),
+    htmlDelegatedDeleteHandler,
   )
 
   const jsonBodyParser = express.json({ limit: '1mb' })
