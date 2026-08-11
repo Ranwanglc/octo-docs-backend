@@ -99,7 +99,16 @@ function stub(overrides: Partial<OctoIdentity>): OctoIdentity {
     getUser: async (): Promise<OctoUser | null> => null,
     getUserAsBot: async (): Promise<OctoUser | null> => null,
     getUsers: async (): Promise<OctoUser[]> => [],
+    // Fail-closed default, matching the production seam: the read route
+    // (GET /docs/:docId/source) deliberately carries NO membership gate — it
+    // resolves the caller's effective role on an existing deck instead — so a
+    // fixture that reports "member" here would erase the very precondition these
+    // cases need to cover: a legitimate doc_member who is NOT a space member must
+    // still be served. A case that wants membership opts in explicitly.
     isSpaceMember: async () => false,
+    // Required on OctoIdentity; unused by this surface. Present so the stub is a
+    // complete implementation rather than relying on the `as never` cast.
+    ownedBotsInSpace: async () => [],
     ...overrides,
   }
 }

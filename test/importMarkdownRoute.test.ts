@@ -46,12 +46,10 @@ describe('human Markdown import route', () => {
     await importMarkdownHandler(req(Buffer.from('![local](./missing.png)\n\n# 标题')), response as unknown as Response)
 
     expect(requireDocRole).toHaveBeenCalledWith(
+      expect.objectContaining({ uid: 'human_u1', params: { docId: 'd1' } }),
       response,
-      'human_u1',
       'd1',
-      's1',
       'writer',
-      { isBot: false, token: undefined },
     )
     expect(response.statusCode).toBe(200)
     expect(response.body?.doc).toMatchObject({ type: 'doc', content: expect.any(Array) })

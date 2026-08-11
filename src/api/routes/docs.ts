@@ -26,6 +26,11 @@ import { buildDocShareUrl } from '../../util/docShareLink.js'
 import { config } from '../../config/env.js'
 import { getOctoIdentity } from '../../auth/octoIdentity.js'
 import { requireDocRole } from '../guard.js'
+import { resolveRole } from '../../permission/resolveRole.js'
+import { resolveEffectiveRole } from '../../permission/resolveEffectiveRole.js'
+import { issueCollabTokenByDocId } from '../../auth/issueCollabToken.js'
+import { recordVerifiedRecentView } from '../services/recordRecentView.js'
+import { requireSpaceMembership, spaceContextMiddleware } from '../middleware/spaceContext.js'
 import { searchDocs, VisibleTermsTooLargeError, encodeSearchCursor, decodeSearchCursor } from '../../search/osClient.js'
 
 export const docsRouter: ExpressRouter = Router()
@@ -282,13 +287,38 @@ export async function createDocHandler(req: Request, res: Response) {
   })
 }
 
-docsRouter.post('/', createDocHandler)
+// WRITE routes whose target is chosen by the space alone carry
+// requireSpaceMembership: `POST /` mints a NEW row into the named space, so no
+// document exists yet to resolve a role from and the header IS the whole
+// authorization. Confirming it here is what stops a session holder from planting
+// a doc into a space they do not belong to.
+//
+// The COLLECTION READS below (`GET /`, `POST /search`, `GET /recent`,
+// `GET /recent/creators`) deliberately do NOT carry it, even though the space is
+// their selector too. They are not authorized by space membership in the first
+// place: each pushes a row-level predicate down to the repo that admits only
+// `owner OR doc_member`, and ADDS the `share_scope = anyone_in_space` branch only
+// when `isSpaceMember` is confirmed (docMetaRepo.listForUser's `includeSpaceShare`,
+// listVisibleDocIdSet's `spaceShare`, docViewHistoryRepo.visibilityPredicate). A
+// non-member naming someone else's space therefore already sees nothing of that
+// space — the predicate collapses to their own direct grants. Gating the route
+// instead would SUBTRACT: a legitimate cross-space owner / doc_member, whose grant
+// is independent of space membership by design (members.ts / forwardGrant.ts
+// verify only that the grantee is a real octo user), would be 404'd out of listing
+// or searching documents they own. That violates the contract's supplemental-only
+// rule (docs/contract/backend-design.md:1514, only-adds) — the same subtraction
+// that split this middleware off the global mount in the first place.
+//
+// The `/:docId` routes below also do NOT carry it: requireDocRole is strictly
+// stronger there (real-uid role resolution + requireSameSpace pinning req.spaceId
+// to meta.space_id).
+// See api/middleware/spaceContext.ts for why this is per-route, not global.
+docsRouter.post('/', requireSpaceMembership, createDocHandler)
 
 /** GET /api/v1/docs/{docId} — fetch one doc's metadata (needs reader). */
 export async function getDocHandler(req: Request, res: Response) {
-  const uid = req.uid!
   const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, docId, 'reader')
   if (!guard) return
   const { meta, role } = guard
   res.status(200).json({
@@ -490,26 +520,27 @@ docsRouter.post('/search', searchDocsHandler)
 
 /**
  * POST /api/v1/docs/{docId}/view — record that the caller opened this doc
- * (FEAT-B ingest, §3.1). Idempotent UPSERT on (uid, doc_id): a re-open only
- * refreshes viewed_at, never adds a row. uid is derived server-side; any uid /
- * viewedBy in the body is ignored. Needs reader (reuses requireDocRole guard).
+ * (FEAT-B ingest, §3.1). Needs reader (reuses requireDocRole guard). The recent-
+ * view WRITE is verified-or-skip (remove-sp §7.1): a bot records under its
+ * server-resolved Space; a human records ONLY under a viewer Space whose active
+ * membership is confirmed (never an unverified header, never the doc home Space),
+ * otherwise the write is skipped and the response reports `recorded: false`.
  */
 export async function recordDocViewHandler(req: Request, res: Response) {
   const uid = req.uid!
   const docId = req.params.docId!
-  const guard = await requireDocRole(res, uid, docId, req.spaceId!, 'reader', {
-    isBot: req.botToken !== undefined,
-    token: req.octoToken,
-  })
+  const guard = await requireDocRole(req, res, docId, 'reader')
   if (!guard) return
-  const viewedAt = await docViewHistoryRepo.upsertViewWithPrune({
+  const viewedAt = await recordVerifiedRecentView({
+    scope: req.docSpaceScope ?? { mode: 'human' },
     uid,
     docId,
-    spaceId: req.spaceId!,
-    retainCount: config.docView.retainCount,
-    retainDays: config.docView.retainDays,
+    viewerSpaceId: req.viewerSpaceId,
+    token: req.octoToken,
   })
-  res.status(200).json({ ok: true, viewedAt: new Date(viewedAt).toISOString() })
+  res
+    .status(200)
+    .json(viewedAt ? { ok: true, viewedAt: viewedAt.toISOString() } : { ok: true, recorded: false })
 }
 
 docsRouter.post('/:docId/view', recordDocViewHandler)
@@ -614,11 +645,14 @@ docsRouter.get('/:docId', getDocHandler)
 
 async function resolveDocIdBySlug(req: Request, res: Response): Promise<string | null> {
   const octoDocSlug = req.params.octoDocSlug!
-  // Tenant isolation (P0): resolve the slug within the caller's enforced space
-  // (req.spaceId; set by spaceContextMiddleware on the human mount and injected
-  // by verifyBot on the bot mount). A slug is only unique per space, so this
-  // never resolves another space's row (which requireDocRole would 404 anyway).
-  const meta = await docMetaRepo.getByOctoDocSlug(octoDocSlug, req.spaceId!)
+  // A slug is only unique per Space, so it MUST be resolved within a Space. The
+  // Space follows the per-mount policy (remove-sp §6): a bot uses its
+  // server-resolved Space; a human uses the optional viewer Space (X-Space-Id).
+  // octo-doc slug operations are bot-facing (html registration); a human with no
+  // viewer Space simply cannot resolve a slug (404) — never another Space's row.
+  const scope = req.docSpaceScope
+  const slugSpace = scope?.mode === 'bot' ? scope.spaceId : (req.viewerSpaceId ?? '')
+  const meta = await docMetaRepo.getByOctoDocSlug(octoDocSlug, slugSpace)
   if (!meta || meta.status === 0) {
     res.status(404).json({ error: 'not_found' })
     return null
@@ -627,7 +661,7 @@ async function resolveDocIdBySlug(req: Request, res: Response): Promise<string |
 }
 
 async function renameDocById(req: Request, res: Response, docId: string): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
+  const guard = await requireDocRole(req, res, docId, 'admin')
   if (!guard) return
   const { title } = req.body ?? {}
   if (typeof title !== 'string' || title === '') {
@@ -657,7 +691,7 @@ async function renameDocById(req: Request, res: Response, docId: string): Promis
 }
 
 async function deleteDocById(req: Request, res: Response, docId: string): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
+  const guard = await requireDocRole(req, res, docId, 'admin')
   if (!guard) return
   const deleted = await docMetaRepo.softDelete(docId)
   // Broadcast the epoch invalidation so connected writers recheck and get cut
@@ -669,27 +703,32 @@ async function deleteDocById(req: Request, res: Response, docId: string): Promis
   res.status(200).json({ docId, status: 'deleted' })
 }
 
-docsRouter.patch('/octo-doc/:octoDocSlug', async (req: Request, res: Response) => {
+export async function octoDocRenameHandler(req: Request, res: Response): Promise<void> {
   const docId = await resolveDocIdBySlug(req, res)
   if (!docId) return
   await renameDocById(req, res, docId)
-})
+}
 
-docsRouter.delete('/octo-doc/:octoDocSlug', async (req: Request, res: Response) => {
+export async function octoDocDeleteHandler(req: Request, res: Response): Promise<void> {
   const docId = await resolveDocIdBySlug(req, res)
   if (!docId) return
   await deleteDocById(req, res, docId)
-})
+}
 
 /** PATCH /api/v1/docs/{docId} — rename (needs admin). */
-docsRouter.patch('/:docId', async (req: Request, res: Response) => {
+export async function renameDocHandler(req: Request, res: Response): Promise<void> {
   await renameDocById(req, res, req.params.docId!)
-})
+}
 
 /** DELETE /api/v1/docs/{docId} — soft delete (needs admin). */
-docsRouter.delete('/:docId', async (req: Request, res: Response) => {
+export async function deleteDocHandler(req: Request, res: Response): Promise<void> {
   await deleteDocById(req, res, req.params.docId!)
-})
+}
+
+docsRouter.patch('/octo-doc/:octoDocSlug', octoDocRenameHandler)
+docsRouter.delete('/octo-doc/:octoDocSlug', octoDocDeleteHandler)
+docsRouter.patch('/:docId', renameDocHandler)
+docsRouter.delete('/:docId', deleteDocHandler)
 
 /**
  * GET /api/v1/docs/{docId}/share — read a doc's share settings (#64, needs
@@ -699,10 +738,7 @@ docsRouter.delete('/:docId', async (req: Request, res: Response) => {
  * caller has no effective role on the doc.
  */
 export async function getShareHandler(req: Request, res: Response) {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', {
-    isBot: req.botToken !== undefined,
-    token: req.octoToken,
-  })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
   res.status(200).json({
     docId: guard.meta.doc_id,
@@ -730,9 +766,7 @@ export async function getShareHandler(req: Request, res: Response) {
  * every non-member's live session, exactly like soft-delete.
  */
 export async function putShareHandler(req: Request, res: Response) {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin', {
-    isBot: req.botToken !== undefined,
-  })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'admin')
   if (!guard) return
   const { shareScope, shareRole } = req.body ?? {}
   const scopeNum = parseShareScope(shareScope)
@@ -772,3 +806,122 @@ export async function putShareHandler(req: Request, res: Response) {
 // count). Registered here alongside the other single-doc routes.
 docsRouter.get('/:docId/share', getShareHandler)
 docsRouter.put('/:docId/share', putShareHandler)
+
+// ---------------------------------------------------------------------------
+// remove-sp §4 / §6: Open Context + docId-first physical router split.
+// ---------------------------------------------------------------------------
+
+/** doc_id shape gate for the open-context locate (mirrors newDocId/segment charset). */
+const DOC_ID_MAX_LEN = 128
+function isPlausibleDocId(id: unknown): id is string {
+  return typeof id === 'string' && id.length > 0 && id.length <= DOC_ID_MAX_LEN && /^[A-Za-z0-9_-]+$/.test(id)
+}
+
+/**
+ * GET /api/v1/docs/{docId}/open-context (remove-sp §4). The browser `/d/:docId`
+ * bootstrap: locate the doc by docId ALONE (no `sp`, no `X-Space-Id` for
+ * selection) and return the canonical context needed to start REST + collab.
+ * Human-only — mounted on the DocumentResourceRouter after authMiddleware,
+ * NEVER behind spaceContextMiddleware.
+ *
+ * Fixed status order so NOTHING is leaked before authorization (§4):
+ *   locate/exist → compute role → role=none ⇒ 403 → archived ⇒ 409 → context.
+ * A `none` caller gets 403 WITHOUT learning archived/locked state; any failure
+ * response carries no title / Space / owner / documentName.
+ *
+ * The 403-vs-404 distinction is deliberately preserved (§4): it is what keeps
+ * "hold a doc link, request access" working; enumeration resistance is a later
+ * sharing-security phase, not this one.
+ */
+export async function openContextHandler(req: Request, res: Response): Promise<void> {
+  const uid = req.uid!
+  const docId = req.params.docId
+  if (!isPlausibleDocId(docId)) {
+    res.status(404).json({ error: 'not_found' })
+    return
+  }
+  const meta = await docMetaRepo.getByDocId(docId)
+  if (!meta || meta.status === 0) {
+    res.status(404).json({ error: 'not_found' })
+    return
+  }
+  // Compute role WITHOUT returning any metadata. Human open-context: membership
+  // for an anyone_in_space doc is resolved against the doc's HOME Space
+  // (meta.space_id) via the caller's own token — never a client header.
+  const direct = await resolveRole(uid, docId)
+  const role = await resolveEffectiveRole(uid, direct, meta, { isBot: false, token: req.octoToken })
+  if (role === 'none') {
+    res.status(403).json({ error: 'forbidden' })
+    return
+  }
+  // Only now — the caller is at least a reader — may archived/locked state be
+  // revealed (§4: 409 comes AFTER the role gate, never before).
+  if (meta.status === 2) {
+    res.status(409).json({ error: 'conflict' })
+    return
+  }
+  res.status(200).json({
+    docId: meta.doc_id,
+    homeSpaceId: meta.space_id,
+    documentName: meta.document_name,
+    folderId: meta.folder_id,
+    docType: meta.doc_type,
+    role,
+    permissionEpoch: meta.permission_epoch,
+    title: meta.title,
+    ...(meta.octo_doc_slug ? { octoDocSlug: meta.octo_doc_slug } : {}),
+  })
+}
+
+/**
+ * POST /api/v1/docs/{docId}/collab-token (remove-sp §7.1) — docId-first, v2.
+ * Human-only. Resolves the canonical documentName + home Space by docId and
+ * issues a v2 token bound to them; never derives the doc from `sp`/`X-Space-Id`.
+ */
+export async function docIdCollabTokenHandler(req: Request, res: Response): Promise<void> {
+  const out = await issueCollabTokenByDocId(req.uid!, req.params.docId!, req.octoToken ?? '', req.viewerSpaceId)
+  if (!out.ok) {
+    res.status(out.status).json({ error: out.error })
+    return
+  }
+  res.status(200).json(out.result)
+}
+
+/**
+ * Human SpaceCollectionRouter (remove-sp §6): the Space-scoped collection ops.
+ * `X-Space-Id` is REQUIRED here (per-route spaceContextMiddleware, so a
+ * single-document request passing through this router without a match never
+ * trips the 400). Mounted BEFORE the DocumentResourceRouter so the fixed paths
+ * (`/`, `/search`, `/recent`, `/recent/creators`) are never shadowed by `/:docId`.
+ */
+export const spaceCollectionRouter: ExpressRouter = Router()
+// Creating a document has no existing doc role to authorize against, so the
+// caller must prove membership in the requested Space. Collection reads keep
+// their row-level owner/doc_member predicates and only add Space-shared rows for
+// confirmed members; gating those reads would subtract legitimate cross-Space
+// direct grants.
+spaceCollectionRouter.post('/', spaceContextMiddleware, requireSpaceMembership, createDocHandler)
+spaceCollectionRouter.get('/', spaceContextMiddleware, listDocsHandler)
+spaceCollectionRouter.post('/search', spaceContextMiddleware, searchDocsHandler)
+spaceCollectionRouter.get('/recent', spaceContextMiddleware, listRecentHandler)
+spaceCollectionRouter.get('/recent/creators', spaceContextMiddleware, listRecentCreatorsHandler)
+
+/**
+ * Human DocumentResourceRouter (remove-sp §6): every single-document operation,
+ * located by path docId with NO spaceContextMiddleware. open-context and the
+ * docId-first collab-token are human-only foundation routes and live only here
+ * (not on the shared/bot `docsRouter`). The shared single-doc handlers
+ * (get/view/rename/delete/share/octo-doc) are reused verbatim — no fork.
+ */
+export const documentResourceRouter: ExpressRouter = Router()
+documentResourceRouter.get('/:docId/open-context', openContextHandler)
+documentResourceRouter.post('/:docId/collab-token', docIdCollabTokenHandler)
+documentResourceRouter.post('/:docId/view', recordDocViewHandler)
+documentResourceRouter.get('/:docId/share', getShareHandler)
+documentResourceRouter.put('/:docId/share', putShareHandler)
+// `/octo-doc/:slug` is intentionally bot-only on `docsRouter`: a slug is unique
+// only within a server-resolved Bot Space and cannot be made docId-first safely
+// on the human mount. Humans rename/delete through canonical `/:docId` routes.
+documentResourceRouter.get('/:docId', getDocHandler)
+documentResourceRouter.patch('/:docId', renameDocHandler)
+documentResourceRouter.delete('/:docId', deleteDocHandler)

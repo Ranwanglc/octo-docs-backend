@@ -63,7 +63,9 @@ function mockRes(): MockRes {
   }
 }
 function req(uid: string, params: Record<string, string>, opts: { body?: unknown; headers?: Record<string, string> } = {}) {
-  return { uid, spaceId: 's1', params, body: opts.body, headers: opts.headers ?? {} } as never
+  // Human open-context mount policy (remove-sp §6): locate by docId, resolve
+  // anyone_in_space membership against the doc home space.
+  return { uid, spaceId: 's1', docSpaceScope: { mode: 'human' as const }, params, body: opts.body, headers: opts.headers ?? {} } as never
 }
 
 const SPACE = 's1'

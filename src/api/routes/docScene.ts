@@ -68,7 +68,7 @@ function readBaseVersion(req: Request): string | null {
 docSceneRouter.get('/:docId/scene', getDocSceneHandler)
 
 export async function getDocSceneHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
   if (!requireBoardDocType(res, guard.meta.doc_type)) return
 
@@ -156,7 +156,7 @@ function checkOpsBounds(ops: BoardOps): { status: number; error: string } | null
 docSceneRouter.patch('/:docId/scene', patchDocSceneHandler)
 
 export async function patchDocSceneHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
   if (!guard) return
   if (!requireBoardDocType(res, guard.meta.doc_type)) return
 

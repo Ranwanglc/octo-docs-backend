@@ -151,7 +151,7 @@ commentsRouter.get('/:docId/comments', listCommentsHandler)
 
 /** Fetch one grouped root by marker id without walking paginated thread pages. */
 export async function getCommentThreadHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
   const id = parseId(req.params.id)
   if (id === null) {
@@ -169,7 +169,7 @@ export async function getCommentThreadHandler(req: Request, res: Response): Prom
 
 /** Paginated lightweight marker feed; every page contains unresolved roots only. */
 export async function listCommentMarkersHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
   if (guard.meta.doc_type !== 'board') {
     res.status(409).json({ error: 'unsupported_doc_type' })
@@ -197,7 +197,7 @@ export async function listCommentMarkersHandler(req: Request, res: Response): Pr
 }
 
 export async function listCommentsHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
 
   const includeResolved = req.query.includeResolved === '1'
@@ -227,7 +227,7 @@ export async function listCommentsHandler(req: Request, res: Response): Promise<
 commentsRouter.post('/:docId/comments', createCommentHandler)
 
 export async function createCommentHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'commenter', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'commenter')
   if (!guard) return
 
   const { body, anchorStart, anchorEnd, anchorText, parentId } = req.body ?? {}
@@ -261,7 +261,7 @@ export async function createCommentHandler(req: Request, res: Response): Promise
       return
     }
     // Best-effort: notify mentions and invalidate live comment views.
-    void notifyDocMentioned({ docId, spaceId: req.spaceId!, title: guard.meta.title, authorUid: req.uid!, body })
+    void notifyDocMentioned({ docId, spaceId: guard.meta.space_id, title: guard.meta.title, authorUid: req.uid!, body })
     void publishCommentMutation(documentName, docId, id, 'created')
     res.status(201).json({ id })
     return
@@ -354,7 +354,7 @@ export async function createCommentHandler(req: Request, res: Response): Promise
     anchorText: typeof anchorText === 'string' ? anchorText.slice(0, 512) : '',
   })
   // Best-effort: notify mentions and invalidate live comment views.
-  void notifyDocMentioned({ docId, spaceId: req.spaceId!, title: guard.meta.title, authorUid: req.uid!, body })
+  void notifyDocMentioned({ docId, spaceId: guard.meta.space_id, title: guard.meta.title, authorUid: req.uid!, body })
   void publishCommentMutation(documentName, docId, id, 'created')
   res.status(201).json({ id })
 }
@@ -367,7 +367,7 @@ export async function patchCommentHandler(req: Request, res: Response): Promise<
   // This runs FIRST so it 404s on missing/deleted docs, 409s on archived ones,
   // and 403s a caller whose role is 'none' (e.g. revoked author) — before the
   // author check below ever gets a chance to allow a write.
-  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'commenter', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, docId, 'commenter')
   if (!guard) return
 
   const id = parseId(req.params.id)
@@ -430,7 +430,7 @@ export async function deleteCommentHandler(req: Request, res: Response): Promise
   const docId = req.params.docId!
   // Commenter floor (see patchCommentHandler): blocks readers/revoked authors and
   // enforces doc-status 404/409 semantics before the author check below.
-  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'commenter', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, docId, 'commenter')
   if (!guard) return
 
   const id = parseId(req.params.id)

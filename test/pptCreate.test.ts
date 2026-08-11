@@ -146,6 +146,11 @@ function stub(overrides: Partial<OctoIdentity>): OctoIdentity {
     getUser: async (): Promise<OctoUser | null> => null,
     getUserAsBot: async (): Promise<OctoUser | null> => null,
     getUsers: async (): Promise<OctoUser[]> => [],
+    // pptSpaceContextMiddleware now gates X-Space-Id on a confirmed space
+    // membership. These cases all exercise a caller acting inside their OWN
+    // space, so default to member; the non-member refusal is asserted
+    // explicitly below.
+    isSpaceMember: async () => true,
     ...overrides,
   }
 }
@@ -206,8 +211,14 @@ describe('PPT-HUMAN-001 — human creates a PPT from a template', () => {
       draftRevision: 0,
       snapshotVersion: 0,
     })
-    expect(String(body.data.editorUrl)).toContain('d_ppt1')
-    expect(String(body.data.shareUrl)).toContain('d_ppt1')
+    // shareUrl is the canonical type-agnostic bare link. The client obtains the
+    // deck's canonical home Space from /:docId/open-context when opening it.
+    expect(body.data.shareUrl).toBe('/d/d_ppt1')
+    expect(String(body.data.shareUrl)).not.toContain('sp=')
+    expect(String(body.data.shareUrl)).not.toContain('sid=')
+    // The old PPT editor transport remains compatible during migration; unlike
+    // shareUrl it may still carry the create mount's Space.
+    expect(body.data.editorUrl).toBe('/d/d_ppt1/edit?sp=s_1')
 
     // Persisted inside ONE transaction (atomic create).
     expect(transactionMock).toHaveBeenCalledTimes(1)
@@ -416,6 +427,54 @@ describe('PPT create auth/space guards are enveloped (not bare JSON)', () => {
     const res = await post({ title: 'ok', templateId: 'pitch' }, { key: 'idem-a', token: 'bad' })
     expect(res.status).toBe(401)
     expect((await res.json()) as { error: { code: string } }).toMatchObject({ error: { code: 'AUTH_REQUIRED' } })
+  })
+
+  it('returns enveloped 404 NOT_FOUND for a space the caller is NOT a member of', async () => {
+    // A spoofed X-Space-Id: valid session token, arbitrary space. The header is
+    // client-supplied, so shape validity must not be mistaken for authority —
+    // otherwise the deck would be minted INTO another space.
+    setOctoIdentity(stub({ verifyToken: async () => ({ uid: 'u_1' }), isSpaceMember: async () => false }))
+    const res = await post({ title: 'ok', templateId: 'pitch' }, { key: 'idem-nm', space: 's_someone_elses' })
+    expect(res.status).toBe(404)
+    // NOT_FOUND, never FORBIDDEN: a permission-style error would confirm the
+    // space exists and turn this into a space-existence oracle.
+    expect((await res.json()) as { error: { code: string } }).toMatchObject({ error: { code: 'NOT_FOUND' } })
+  })
+
+  it('fails CLOSED (404) when the membership lookup itself throws', async () => {
+    setOctoIdentity(
+      stub({
+        verifyToken: async () => ({ uid: 'u_1' }),
+        isSpaceMember: async () => {
+          throw new Error('octo-server unreachable')
+        },
+      }),
+    )
+    const res = await post({ title: 'ok', templateId: 'pitch' }, { key: 'idem-fc', space: 's_1' })
+    // A transient identity outage must not open the boundary, nor surface as 500.
+    expect(res.status).toBe(404)
+    expect((await res.json()) as { error: { code: string } }).toMatchObject({ error: { code: 'NOT_FOUND' } })
+  })
+
+  it('fails CLOSED (404) when the membership lookup throws SYNCHRONOUSLY', async () => {
+    // Distinct from the case above: that stub is `async`, so it fails via a
+    // REJECTED PROMISE, which `.catch()` alone would already contain. Here the
+    // throw happens BEFORE any promise exists — the shape an injected identity
+    // missing the method produces (a TypeError on call). Express `^4.19.2` does
+    // not adopt a rejected promise from an async middleware, so if this were
+    // uncontained the request would HANG rather than refuse — the one failure
+    // mode a fail-closed authz gate must never have.
+    setOctoIdentity(
+      stub({
+        verifyToken: async () => ({ uid: 'u_1' }),
+        isSpaceMember: (() => {
+          throw new TypeError('isSpaceMember is not a function')
+        }) as never,
+      }),
+    )
+    const res = await post({ title: 'ok', templateId: 'pitch' }, { key: 'idem-fc-sync', space: 's_1' })
+    expect(res.status).toBe(404)
+    expect((await res.json()) as { error: { code: string } }).toMatchObject({ error: { code: 'NOT_FOUND' } })
   })
 
   it('returns enveloped 400 VALIDATION_ERROR when X-Space-Id is missing', async () => {

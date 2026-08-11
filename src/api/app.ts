@@ -1,30 +1,38 @@
 /**
  * Express REST app (§8.4). All endpoints mounted under /api/v1/docs/*.
  *
- * Mount order:
+ * Human mount order (remove-sp §6 physical router split):
  *   1. public routes (collab-token, invite accept) — verify octo identity
  *      themselves and return their own 401, so they are mounted BEFORE
  *      authMiddleware.
  *   2. authMiddleware (octo identity -> req.uid) for the metadata operations.
- *   3. spaceContextMiddleware (X-Space-Id header -> req.spaceId) for the
- *      metadata operations; a missing header is a hard 400.
- *   4. metadata routers (docs / members / invites-admin / attachments).
+ *   3. humanDocSpaceScopeMiddleware -> req.docSpaceScope = { mode: 'human' }
+ *      (locate single docs by path docId; X-Space-Id never scopes selection).
+ *   4a. SpaceCollectionRouter — create/list/search/recent, EACH behind its own
+ *       spaceContextMiddleware (X-Space-Id still required for collection ops).
+ *   4b. DocumentResourceRouter — open-context, docId-first collab-token, and the
+ *       single-doc get/view/rename/delete/share/octo-doc ops, WITHOUT any Space
+ *       context middleware.
+ *   4c. the remaining single-doc routers (members / invites-admin / attachments /
+ *       comments / versions / content / sheet / scene / export / import).
  *
- * A second, bot-facing mount (§ v4.3) re-mounts the same metadata routers under
+ * A second, bot-facing mount (§ v4.3) re-mounts the SAME metadata routers under
  * /v1/bot/docs behind verifyBot (bot token -> req.uid + server-resolved
- * req.spaceId) instead of authMiddleware + spaceContextMiddleware. The human
- * mount below is unchanged.
+ * req.spaceId + req.docSpaceScope = { mode: 'bot', spaceId }) instead of
+ * authMiddleware. The bot keeps the shared `docsRouter` (collection + single-doc)
+ * and its current same-space isolation unchanged — it never uses the human-only
+ * DocumentResourceRouter (open-context / docId-first collab-token).
  */
 import express, { type Express, Router, type Request, type Response, type NextFunction } from 'express'
 import { config } from '../config/env.js'
 import { corsMiddleware } from './cors.js'
 import { attachmentBlobGateway, localBlobGatewayEnabled, isSignedBlobRequest } from './routes/attachmentBlob.js'
 import { authMiddleware } from './middleware/auth.js'
-import { spaceContextMiddleware } from './middleware/spaceContext.js'
 import { verifyBotMiddleware } from './middleware/verifyBot.js'
+import { humanDocSpaceScopeMiddleware } from './middleware/docSpaceScope.js'
 import { createRateLimiter, type RateLimiterOptions } from './middleware/rateLimit.js'
 import { collabTokenRouter } from './routes/collabToken.js'
-import { docsRouter } from './routes/docs.js'
+import { docsRouter, documentResourceRouter, spaceCollectionRouter } from './routes/docs.js'
 import { membersRouter } from './routes/members.js'
 import { forwardGrantRouter } from './routes/forwardGrant.js'
 import { accessRequestsRouter } from './routes/accessRequests.js'
@@ -175,11 +183,29 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   // 2. require octo identity for everything below
   api.use(authMiddleware)
 
-  // 3. require a space context (X-Space-Id header) for the metadata operations
-  api.use(spaceContextMiddleware)
+  // 3. Human doc space-scoping policy (remove-sp §6). Declares `req.docSpaceScope
+  //    = { mode: 'human' }` so the shared doc guards locate single documents by
+  //    path `docId` ALONE (X-Space-Id never scopes selection/authz), and parses
+  //    the OPTIONAL viewer Space for the verified-or-skip recent-view write. The
+  //    hard-400 X-Space-Id parser and the membership gate now live per-route in
+  //    SpaceCollectionRouter, so `/d/:docId` opens never depend on that header.
+  api.use(humanDocSpaceScopeMiddleware)
 
-  // 4. metadata operations
-  api.use(docsRouter) // / , /:docId
+  // 4a. SpaceCollectionRouter (remove-sp §6): the Space-scoped collection ops
+  //     (create / list / search / recent). Each route carries its OWN
+  //     spaceContextMiddleware (X-Space-Id required). Mounted BEFORE the
+  //     DocumentResourceRouter so the fixed paths (`/`, `/search`, `/recent`,
+  //     `/recent/creators`) are never shadowed by the router's `/:docId`.
+  api.use(spaceCollectionRouter)
+
+  // 4b. DocumentResourceRouter (remove-sp §6): every single-document operation,
+  //     located by path docId with NO spaceContextMiddleware — open-context, the
+  //     docId-first collab-token, view, share, get/rename/delete, octo-doc slug.
+  api.use(documentResourceRouter)
+
+  // 4c. the remaining single-document routers. All locate by path `/:docId/...`
+  //     via the shared requireDocRole guard (which reads req.docSpaceScope), so
+  //     none require an X-Space-Id header on the human chain any longer.
   api.use(membersRouter) // /:docId/members ...
   api.use(forwardGrantRouter) // /:docId/forward-grant (forward-to-chat authorization, max-merge)
   api.use(accessRequestsRouter) // /:docId/access-requests ... (screen 4c request/approve/deny)

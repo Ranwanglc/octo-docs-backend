@@ -101,8 +101,7 @@ describe('role gating (server authority)', () => {
   it('PATCH /sheet requires writer in the caller space', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(null)
     await patchDocSheetHandler(req({ docId: 'd_1' }), mockRes() as never)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('writer')
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('writer')
     // A blocked guard short-circuits before touching the live document.
     expect(vi.mocked(readLiveSheet)).not.toHaveBeenCalled()
   })
