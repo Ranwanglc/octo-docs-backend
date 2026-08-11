@@ -175,7 +175,14 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   // 2. require octo identity for everything below
   api.use(authMiddleware)
 
-  // 3. require a space context (X-Space-Id header) for the metadata operations
+  // 3. require a space context (X-Space-Id header) for the metadata operations.
+  //    This PARSES the header only — it is deliberately not the membership gate.
+  //    `requireSpaceMembership` is attached per-route by the routers themselves,
+  //    on the space-selector routes (docs create / list / search / recent) where
+  //    the space is the only selector. Gating the whole mount would 404 a legitimate cross-space doc_member on every
+  //    /:docId route — and asymmetrically, since collabTokenRouter and
+  //    acceptInviteRouter above are mounted ahead of authMiddleware and bypass
+  //    the chain entirely. See api/middleware/spaceContext.ts for the argument.
   api.use(spaceContextMiddleware)
 
   // 4. metadata operations
