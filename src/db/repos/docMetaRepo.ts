@@ -76,11 +76,6 @@ export interface CreateDocInput {
   createdBy: string
 }
 
-export type HtmlRegistrationDeleteResult =
-  | { outcome: 'deleted'; documentName: string; permissionEpoch: number }
-  | { outcome: 'not_found_or_deleted' }
-  | { outcome: 'owner_conflict' }
-
 const VALID_STORED_ROLES_SQL = STORED_ROLE_VALUES.join(', ')
 const validMemberRole = `dm.role IN (${VALID_STORED_ROLES_SQL})`
 
@@ -224,39 +219,6 @@ export const docMetaRepo = {
       [octoDocSlug, spaceId],
     )
     return rows[0] ?? null
-  },
-
-  async deleteHtmlRegistration(
-    spaceId: string,
-    octoDocSlug: string,
-    ownerId: string,
-  ): Promise<HtmlRegistrationDeleteResult> {
-    return transaction(async (tx) => {
-      const rows = await tx.query<Pick<DocMeta, 'doc_id' | 'document_name' | 'owner_id' | 'status' | 'permission_epoch'>>(
-        `SELECT doc_id, document_name, owner_id, status, permission_epoch
-         FROM doc_meta
-         WHERE space_id = ? AND octo_doc_slug = ? AND doc_type = 'html'
-         LIMIT 1 FOR UPDATE`,
-        [spaceId, octoDocSlug],
-      )
-      const row = rows[0]
-      if (!row) return { outcome: 'not_found_or_deleted' }
-      if (row.owner_id !== ownerId) return { outcome: 'owner_conflict' }
-      if (Number(row.status) !== 1) return { outcome: 'not_found_or_deleted' }
-
-      await tx.query(
-        `UPDATE doc_meta
-         SET status = 0, permission_epoch = permission_epoch + 1
-         WHERE doc_id = ? AND space_id = ? AND octo_doc_slug = ?
-           AND owner_id = ? AND doc_type = 'html' AND status = 1`,
-        [row.doc_id, spaceId, octoDocSlug, ownerId],
-      )
-      return {
-        outcome: 'deleted',
-        documentName: row.document_name,
-        permissionEpoch: Number(row.permission_epoch) + 1,
-      }
-    })
   },
 
   /** Resolve the canonical document_name for a doc_id (§7.3 resolveDocumentName). */

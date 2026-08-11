@@ -9,7 +9,6 @@ import {
 import { config } from '../../config/env.js'
 import { HTML_DOC_TYPE } from '../../db/docType.js'
 import { DocOwnershipError, docMetaRepo } from '../../db/repos/docMetaRepo.js'
-import { refreshAndPublish } from '../../permission/epoch.js'
 import { buildHtmlDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { enqueueDocIndex, isSearchIndexedDoc } from '../../search/docIndexQueue.js'
 import { buildDocShareUrl } from '../../util/docShareLink.js'
@@ -125,23 +124,6 @@ export async function internalHtmlRegistrationHandler(req: Request, res: Respons
   })
 }
 
-export async function internalHtmlDeleteHandler(req: Request, res: Response): Promise<void> {
-  if (!authorize(req, res)) return
-  const identity = delegatedIdentity(req, res)
-  if (!identity) return
-  const { octoDocSlug, spaceId, owner } = identity
-
-  const result = await docMetaRepo.deleteHtmlRegistration(spaceId, octoDocSlug, owner)
-  if (result.outcome === 'owner_conflict') {
-    res.status(403).json({ error: 'forbidden' })
-    return
-  }
-  if (result.outcome === 'deleted') {
-    await refreshAndPublish(result.documentName, result.permissionEpoch)
-  }
-  res.status(200).json({ octoDocSlug, spaceId, deleted: result.outcome === 'deleted' })
-}
-
 function asyncHandler(handler: (req: Request, res: Response) => Promise<void>) {
   return (req: Request, res: Response, next: NextFunction): void => {
     handler(req, res).catch(next)
@@ -149,4 +131,3 @@ function asyncHandler(handler: (req: Request, res: Response) => Promise<void>) {
 }
 
 internalHtmlRegistrationRouter.post('/register', asyncHandler(internalHtmlRegistrationHandler))
-internalHtmlRegistrationRouter.delete('/', asyncHandler(internalHtmlDeleteHandler))
