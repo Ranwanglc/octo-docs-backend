@@ -86,7 +86,7 @@ describe('trusted user HTML registration', () => {
     }))
     expect(res.body).toMatchObject({
       docId: 'd_new', docType: 'html', mountType: 'space', created: true,
-      shareUrl: 'https://docs.example.test/d/d_new?sp=space-1',
+      shareUrl: 'https://docs.example.test/d/d_new',
     })
   })
 

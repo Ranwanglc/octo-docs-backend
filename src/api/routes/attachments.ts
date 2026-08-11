@@ -146,10 +146,7 @@ attachmentsRouter.post('/:docId/attachments/presign', presignHandler)
 attachmentsRouter.post('/:docId/attachments/svg', svgUploadHandler)
 
 export async function svgUploadHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', {
-    isBot: req.botToken !== undefined,
-    token: req.octoToken,
-  })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
   if (!guard) return
 
   const declaredLength = Number(req.headers['content-length'] ?? 0)
@@ -226,7 +223,7 @@ export async function svgUploadHandler(req: Request, res: Response): Promise<voi
 }
 
 export async function presignHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
   if (!guard) return
 
   const { fileName, mime, sizeBytes } = req.body ?? {}
@@ -311,7 +308,7 @@ export async function presignHandler(req: Request, res: Response): Promise<void>
 attachmentsRouter.get('/:docId/attachments/:attachId', readHandler)
 
 export async function readHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
 
   const attachment = await docAttachmentRepo.getById(req.params.attachId!)
@@ -346,7 +343,7 @@ export async function readHandler(req: Request, res: Response): Promise<void> {
 attachmentsRouter.post('/:docId/attachments/resolve', resolveHandler)
 
 export async function resolveHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
 
   const { attachIds } = req.body ?? {}
@@ -441,7 +438,7 @@ interface CopySourceRef {
 
 export async function copyHandler(req: Request, res: Response): Promise<void> {
   // Copy WRITES into the target doc → writer role, default-deny.
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
+  const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
   if (!guard) return
   const targetDocId = guard.meta.doc_id
 
@@ -492,11 +489,18 @@ export async function copyHandler(req: Request, res: Response): Promise<void> {
     const fail = (reason: string) =>
       notCopied.push({ sourceDocId: ref.docId, sourceAttachId: ref.attachId, reason })
 
-    // Reader on the SOURCE doc: you may only copy bytes you are allowed to read. A cross-space
-    // or missing source resolves to a guard failure below; we translate it into notCopied
-    // (no existence leak) rather than aborting the whole batch.
+    // Reader on the SOURCE doc: you may only copy bytes you are allowed to read.
+    // Source location follows the SAME per-mount policy as the target guard
+    // (remove-sp §6): a Human locates the source by docId alone (a cross-Space
+    // source the caller can read is fine — the reader gate below is the real
+    // authority), while a Bot keeps its server-resolved same-Space isolation. A
+    // missing/soft-deleted (or, for a bot, out-of-space) source resolves to a
+    // guard failure translated into notCopied (no existence leak) rather than
+    // aborting the whole batch.
     const srcMeta = await docMetaRepo.getByDocId(ref.docId)
-    if (!srcMeta || srcMeta.status === 0 || srcMeta.space_id !== req.spaceId!) {
+    const scope = req.docSpaceScope
+    const srcOutOfBotSpace = scope?.mode === 'bot' && srcMeta != null && srcMeta.space_id !== scope.spaceId
+    if (!srcMeta || srcMeta.status === 0 || srcOutOfBotSpace) {
       fail('source_not_found')
       continue
     }
@@ -623,7 +627,7 @@ export async function cleanupCopiedAttachment(attachId: string): Promise<void> {
 attachmentsRouter.post('/:docId/attachments/ingest', ingestHandler)
 
 export async function ingestHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer')
+  const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
   if (!guard) return
   const targetDocId = guard.meta.doc_id
 

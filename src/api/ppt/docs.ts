@@ -35,7 +35,7 @@ import { config } from '../../config/env.js'
 import { getPptTemplate } from '../../ppt/templates.js'
 import { instantiateTemplate } from '../../ppt/bentoDoc.js'
 import { PptApiError, sendPptData } from './envelope.js'
-import { pptAuthMiddleware, pptSpaceContextMiddleware } from './auth.js'
+import { pptAuthMiddleware, pptSpaceContextMiddleware, pptRequireSpaceMembership } from './auth.js'
 
 const DEFAULT_FOLDER = 'f_default'
 /** Matches `doc_meta.title VARCHAR(512)` and the legacy create title bound. */
@@ -279,6 +279,15 @@ function asyncHandler(fn: (req: Request, res: Response) => Promise<void>) {
  */
 export function createPptDocsRouter(): ExpressRouter {
   const router = Router()
-  router.post('/docs', pptAuthMiddleware, pptSpaceContextMiddleware, asyncHandler(createPptDocHandler))
+  // Create is a space-selector route (the deck does not exist yet, so there is no
+  // role to resolve) — hence the membership gate. The sibling read route in
+  // ppt/source.ts deliberately omits it; see pptRequireSpaceMembership.
+  router.post(
+    '/docs',
+    pptAuthMiddleware,
+    pptSpaceContextMiddleware,
+    pptRequireSpaceMembership,
+    asyncHandler(createPptDocHandler),
+  )
   return router
 }

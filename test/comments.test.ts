@@ -81,7 +81,7 @@ const adminGuard = { meta: { doc_id: 'd_1', document_name: 'octo:s:f:d_1', doc_t
 
 /** Make requireDocRole emulate a 403 the way the real guard does (write + null). */
 function forbidGuard() {
-  vi.mocked(requireDocRole).mockImplementation((async (res: MockRes) => {
+  vi.mocked(requireDocRole).mockImplementation((async (_req: MockRes, res: MockRes) => {
     res.status(403).json({ error: 'forbidden' })
     return null
   }) as never)
@@ -89,7 +89,7 @@ function forbidGuard() {
 
 /** Make requireDocRole emulate a doc-status block (404 missing/deleted, 409 archived). */
 function blockGuard(code: number, error: string) {
-  vi.mocked(requireDocRole).mockImplementation((async (res: MockRes) => {
+  vi.mocked(requireDocRole).mockImplementation((async (_req: MockRes, res: MockRes) => {
     res.status(code).json({ error })
     return null
   }) as never)
@@ -149,8 +149,7 @@ describe('POST create (commenter minimum)', () => {
     expect(res.statusCode).toBe(201)
     expect((res.body as { id: number }).id).toBe(123)
     // The space (4th arg) is threaded from req.spaceId; minRole is the 5th arg.
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('commenter')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('commenter')
   })
 
   it('rejects an html_ppt doc on the legacy comment surface with 409 (Spec #1)', async () => {
@@ -523,7 +522,7 @@ describe('PATCH resolve / body edit', () => {
     // Single guard call: the floor gate with the commenter minimum; writer is
     // enforced from guard.role, not a second requireDocRole call.
     expect(vi.mocked(requireDocRole).mock.calls).toHaveLength(1)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('commenter')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('commenter')
   })
 
   it('resolves a thread for a writer and stamps resolved_by', async () => {
@@ -611,7 +610,7 @@ describe('DELETE soft / hard', () => {
     )
     expect(res.statusCode).toBe(403)
     expect(vi.mocked(requireDocRole).mock.calls).toHaveLength(1)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('commenter')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('commenter')
   })
 
   it('hard-deletes for an admin', async () => {
@@ -650,7 +649,7 @@ describe('commenter floor gate on body-edit / soft-delete (revoked author + doc 
     expect(res.statusCode).toBe(403)
     // The floor gate fired (commenter minimum) and short-circuited before getById.
     expect(vi.mocked(requireDocRole).mock.calls).toHaveLength(1)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('commenter')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('commenter')
     // No DB read of the comment happened — the gate blocked first.
     expect(vi.mocked(query)).not.toHaveBeenCalled()
   })
@@ -664,7 +663,7 @@ describe('commenter floor gate on body-edit / soft-delete (revoked author + doc 
     )
     expect(res.statusCode).toBe(403)
     expect(vi.mocked(requireDocRole).mock.calls).toHaveLength(1)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('commenter')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('commenter')
     expect(vi.mocked(query)).not.toHaveBeenCalled()
   })
 
@@ -721,7 +720,7 @@ describe('GET one grouped comment thread', () => {
     await getCommentThreadHandler(req({ params: { docId: 'd_1', id: '10' } }), res as never)
     expect(res.statusCode).toBe(200)
     expect(res.body).toMatchObject({ id: 10, replies: [{ id: 11, parentId: 10 }] })
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
   })
 
   it('404s cross-doc ids and reply ids without loading replies', async () => {

@@ -113,7 +113,7 @@ describe('PUT /api/v1/docs/:docId/members — anti ghost-member check', () => {
     expect(res.body).toEqual({ ok: true })
     expect(vi.mocked(docMemberRepo.upsertDirect)).toHaveBeenCalledTimes(1)
     // The doc guard is scoped to req.spaceId (4th arg).
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('admin')
   })
 
   it('add member with role=commenter -> 200 ok (commentable tier assignable)', async () => {

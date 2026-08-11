@@ -16,18 +16,18 @@
  * Authorization (resolveRole = doc_member + owner) and signing are identical for
  * both — a board owner gets admin, a board member gets their stored role.
  */
-import { signCollabToken, type CollabTokenResult } from './collabToken.js'
+import { signCollabToken, signCollabTokenV2, type CollabTokenResult } from './collabToken.js'
 import { getOctoIdentity } from './octoIdentity.js'
 import { parseDocumentName, isDocTypeConsistentWithName } from '../permission/documentName.js'
 import { resolveRole, resolveDocMetaByName } from '../permission/resolveRole.js'
-import { docViewHistoryRepo } from '../db/repos/docViewHistoryRepo.js'
-import { config } from '../config/env.js'
+import { docMetaRepo } from '../db/repos/docMetaRepo.js'
+import { recordVerifiedRecentView } from '../api/services/recordRecentView.js'
 import { effectiveRole, SHARE_SCOPE_ANYONE } from '../permission/shareScope.js'
 import { HTML_DOC_TYPE, HTML_PPT_DOC_TYPE } from '../db/docType.js'
 
 export type IssueResult =
   | { ok: true; result: CollabTokenResult }
-  | { ok: false; status: 401 | 403 | 404 | 422; error: string }
+  | { ok: false; status: 401 | 403 | 404 | 409 | 422; error: string }
 
 /**
  * Issue a collab token for (octoToken, documentName).
@@ -126,41 +126,30 @@ export async function issueCollabToken(
   const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
   if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
 
-  // FEAT-B recent-view fallback ingest (MF2, default-on). Every document open —
-  // read-only INCLUDED — passes through here, so this is the reliable "open ==
-  // viewed" seam even if the front-end never calls POST /docs/{id}/view. We now
-  // hold a trusted uid + doc_id + role(!=none), everything the UPSERT needs.
-  // Best-effort: fire-and-forget (never awaited) so it can't slow or fail token
-  // issuance, and a failure only warns. It shares the (uid, doc_id) PK with the
-  // explicit endpoint, so a front-end that ALSO calls view never double-counts.
-  //
-  // SPACE 口径统一 (XIN-1237): recent-view is READ scoped to the viewer's CURRENT
-  // space (GET /docs/recent filters doc_view_history.space_id = X-Space-Id). To
-  // stay readable, the WRITE must land in that SAME space. So when the caller
-  // supplies its current space (viewerSpaceId, from the collab-token request's
-  // X-Space-Id header), record under it. This is what lets a doc opened from a
-  // chat share link (standalone page) show up in the viewer's current-space
-  // recent-view. Only when it is absent (legacy client that doesn't send the
-  // header) do we fall back to the document's home space (meta.space_id) — the
-  // pre-fix behavior, so same-space opens do not regress.
-  const trimmedViewerSpace = typeof viewerSpaceId === 'string' ? viewerSpaceId.trim() : ''
-  const ingestSpaceId = trimmedViewerSpace !== '' ? trimmedViewerSpace : meta.space_id
-  void docViewHistoryRepo
-    .upsertViewWithPrune({
-      uid,
-      docId: meta.doc_id,
-      spaceId: ingestSpaceId,
-      retainCount: config.docView.retainCount,
-      retainDays: config.docView.retainDays,
-    })
-    .catch((err) => {
-      // eslint-disable-next-line no-console
-      console.warn(`[octo-docs] recent-view fallback ingest failed for ${meta.doc_id}:`, err)
-    })
+  // Keep legacy issuance aligned with the docId-first and open-context paths.
+  // This check deliberately follows authorization so archived state is not
+  // disclosed to a caller who has no role.
+  if (meta.status === 2) return { ok: false, status: 409, error: 'conflict' }
+
+  // FEAT-B recent-view ingest, now VERIFIED-OR-SKIP (remove-sp §7.1). Every
+  // document open — read-only INCLUDED — passes through here, so this remains
+  // the reliable "open == viewed" seam. But phase-1 no longer writes an
+  // unverified viewer Space nor falls back to the document's home Space: the row
+  // lands ONLY when the caller is a confirmed active member of the viewer Space
+  // they supplied (X-Space-Id), otherwise it is skipped. Fire-and-forget so it
+  // can neither slow nor fail token issuance.
+  void recordVerifiedRecentView({
+    scope: { mode: 'human' },
+    uid,
+    docId: meta.doc_id,
+    viewerSpaceId,
+    token: octoToken,
+  })
 
   // Sign with the document's current epoch (§4.4 / §4.5). The token carries the
   // exact connection documentName (incl. the `:wb:` whiteboard form) so the WS
-  // handshake's documentName match (§4.1 step 2) holds.
+  // handshake's documentName match (§4.1 step 2) holds. Legacy documentName-
+  // addressed issuance signs a v1 token; the docId-first path (§7.1) signs v2.
   const result = signCollabToken({
     uid,
     documentName,
@@ -168,6 +157,98 @@ export async function issueCollabToken(
     permission_epoch: meta.permission_epoch,
     ...(displayName !== '' ? { name: displayName } : {}),
     ...(spaceMember ? { space_member: true } : {}),
+  })
+  return { ok: true, result }
+}
+
+/**
+ * docId-first collab-token issuance (remove-sp §7.1). Locates the doc by its
+ * business `docId` (never a client-supplied Space / header), reuses the exact
+ * role model, and signs a v2 token bound to docId + canonical documentName +
+ * home Space + epoch. Called from the authenticated `POST /:docId/collab-token`
+ * route, so the caller identity (`uid`, `octoToken`) is already trusted.
+ *
+ *   - doc missing/deleted        => 404
+ *   - role === none              => 403 (no token)
+ *   - html / html_ppt            => 422 (authorized caller, but no Hocuspocus/Yjs collaboration)
+ *   - archived                   => 409 (authorized, supported document only)
+ */
+export async function issueCollabTokenByDocId(
+  uid: string,
+  docId: string,
+  octoToken: string,
+  viewerSpaceId?: string,
+): Promise<IssueResult> {
+  const meta = await docMetaRepo.getByDocId(docId)
+  if (!meta || meta.status === 0) return { ok: false, status: 404, error: 'not_found' }
+
+  // Authorization: resolveRole (owner + doc_member) merged with #64 space-share.
+  // This MUST precede every state/type-specific response: the docId-first route
+  // is reachable from the bare `/d/:docId` locator, so returning 422 for an
+  // unauthorized html/html_ppt row would disclose its type/existence details.
+  const direct = await resolveRole(uid, meta.doc_id)
+  let spaceMember = false
+  if (meta.share_scope === SHARE_SCOPE_ANYONE) {
+    spaceMember = await getOctoIdentity().isSpaceMember(uid, meta.space_id, octoToken)
+  }
+  const role = effectiveRole(direct, spaceMember, meta.share_scope, meta.share_role)
+  if (role === 'none') return { ok: false, status: 403, error: 'forbidden' }
+
+  // Treat a malformed or internally inconsistent persisted identity as absent.
+  // This guard deliberately follows authorization: otherwise a caller holding
+  // only a docId could distinguish corrupt rows from ordinary forbidden rows.
+  // The v2 token must bind one canonical identity across doc_meta, its room key,
+  // and the explicit docId/homeSpaceId claims used by the WebSocket handshake.
+  let parsed
+  try {
+    parsed = parseDocumentName(meta.document_name)
+  } catch {
+    return { ok: false, status: 404, error: 'not_found' }
+  }
+  const nameDocId = parsed.kind === 'whiteboard' ? parsed.board : parsed.doc
+  if (
+    !isDocTypeConsistentWithName(parsed, meta.doc_type) ||
+    nameDocId !== meta.doc_id ||
+    parsed.space !== meta.space_id ||
+    parsed.folder !== meta.folder_id
+  ) {
+    return { ok: false, status: 404, error: 'not_found' }
+  }
+
+  // Authorized wrong-kind callers receive the precise API error. HTML uses its
+  // own body backend; html_ppt uses the Bento relay. Neither may mint a
+  // Hocuspocus token, but that fact is revealed only after authorization.
+  if (meta.doc_type === HTML_DOC_TYPE || meta.doc_type === HTML_PPT_DOC_TYPE) {
+    return { ok: false, status: 422, error: 'unsupported_document_type' }
+  }
+
+  // Match open-context's non-leaking order: unauthorized callers receive 403;
+  // only an authorized caller can observe that the document is archived.
+  if (meta.status === 2) return { ok: false, status: 409, error: 'conflict' }
+
+  // Trusted display name (best-effort; never blocks issuance).
+  let displayName = ''
+  const profile = await getOctoIdentity().getUser(uid, octoToken)
+  if (profile && typeof profile.name === 'string') displayName = profile.name.trim()
+
+  // Verified-or-skip recent view (§7.1) — human path, fire-and-forget.
+  void recordVerifiedRecentView({
+    scope: { mode: 'human' },
+    uid,
+    docId: meta.doc_id,
+    viewerSpaceId,
+    token: octoToken,
+  })
+
+  const result = signCollabTokenV2({
+    uid,
+    docId: meta.doc_id,
+    documentName: meta.document_name,
+    homeSpaceId: meta.space_id,
+    role,
+    permissionEpoch: meta.permission_epoch,
+    ...(displayName !== '' ? { name: displayName } : {}),
+    ...(spaceMember ? { spaceMember: true } : {}),
   })
   return { ok: true, result }
 }

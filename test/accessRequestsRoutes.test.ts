@@ -115,8 +115,18 @@ beforeEach(() => {
 // ── submit ────────────────────────────────────────────────────────────────
 describe('POST /:docId/access-requests — submit', () => {
   const submitHandler = () => handlerFor('/:docId/access-requests', 'post')
-  const req = (body: Record<string, unknown>) =>
-    ({ uid: 'u_applicant', spaceId: 's_1', params: { docId: 'd_1' }, body }) as never
+  // Human open-context mount policy by default (remove-sp §6.1): a Human submit
+  // locates by docId ALONE (no requireSameSpace). `over` lets a test swap in a
+  // Bot scope to assert the preserved cross-space 404 isolation.
+  const req = (body: Record<string, unknown>, over: Record<string, unknown> = {}) =>
+    ({
+      uid: 'u_applicant',
+      spaceId: 's_1',
+      docSpaceScope: { mode: 'human' as const },
+      params: { docId: 'd_1' },
+      body,
+      ...over,
+    }) as never
 
   it('doc missing/deleted -> 404, no row written', async () => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(null)
@@ -126,20 +136,35 @@ describe('POST /:docId/access-requests — submit', () => {
     expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
   })
 
-  it('cross-space doc -> 404 (indistinguishable from missing), no row, no oracle', async () => {
-    // Doc exists but lives in space s_other; the caller is scoped to s_1. The
-    // submit path is role-less, so this space gate is the only thing standing
-    // between a caller in one space and a doc in another. It must 404 (same
-    // shape as a missing doc) BEFORE the status branches so neither the doc's
-    // existence nor its archived/active state leaks, and no request row is
-    // written into the other space.
+  it('BOT mount: cross-space doc -> 404 (indistinguishable from missing), no row, no oracle', async () => {
+    // remove-sp §6.1: the cross-space 404 gate on submit is preserved for the BOT
+    // mount (server-resolved Space). A bot in s_1 hitting a doc in s_other must
+    // 404 (same shape as missing) BEFORE the status branches so neither existence
+    // nor archived/active state leaks, and no request row is written cross-space.
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_other' } as never)
     const res = mockRes()
-    await submitHandler()(req({ requestedRole: 'writer' }), res as never)
+    await submitHandler()(
+      req({ requestedRole: 'writer' }, { docSpaceScope: { mode: 'bot', spaceId: 's_1' } }),
+      res as never,
+    )
     expect(res.statusCode).toBe(404)
     expect(res.body).toEqual({ error: 'not_found' })
     expect(vi.mocked(resolveRole)).not.toHaveBeenCalled()
     expect(vi.mocked(docAccessRequestRepo.submit)).not.toHaveBeenCalled()
+  })
+
+  it('HUMAN mount: a doc in ANOTHER space is submittable (locate by docId, no requireSameSpace)', async () => {
+    // The §6.1 point: the 403 "request access" button on a no-`sp` page must work
+    // for a doc in any space the caller can see. The Human submit locates by docId
+    // and never runs requireSameSpace, so a cross-space doc reaches the normal
+    // role-less pending create — this does NOT widen approval/grant.
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_other' } as never)
+    vi.mocked(resolveRole).mockResolvedValue('none')
+    vi.mocked(docAccessRequestRepo.submit).mockResolvedValue({ requestId: 'req_cross', status: 1 })
+    const res = mockRes()
+    await submitHandler()(req({ requestedRole: 'reader' }), res as never)
+    expect(res.statusCode).toBe(201)
+    expect(res.body).toEqual({ requestId: 'req_cross', status: 'pending' })
   })
 
   it('archived doc (status=2) -> 409', async () => {
@@ -235,7 +260,14 @@ describe('POST /:docId/access-requests — submit', () => {
 describe('POST /:docId/access-requests — bot_uids snapshot subset gate', () => {
   const submitHandler = () => handlerFor('/:docId/access-requests', 'post')
   const req = (body: Record<string, unknown>) =>
-    ({ uid: 'u_applicant', spaceId: 's_1', octoToken: 'caller-tok', params: { docId: 'd_1' }, body }) as never
+    ({
+      uid: 'u_applicant',
+      spaceId: 's_1',
+      octoToken: 'caller-tok',
+      docSpaceScope: { mode: 'human' as const },
+      params: { docId: 'd_1' },
+      body,
+    }) as never
 
   beforeEach(() => {
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ status: 1, space_id: 's_1' } as never)
@@ -348,10 +380,18 @@ describe('POST /:docId/access-requests — bot_uids snapshot subset gate', () =>
   })
 
   it('a bot-mount submit (no session token) cannot carry bots \u2014 owned set empty => 403', async () => {
-    // Bot mount: req.octoToken is undefined. ownedBotsInSpace gets '' and returns
-    // [] (fail-closed), so any submitted bot is rejected.
+    // Bot mount: verifyBot sets docSpaceScope={mode:'bot',spaceId} and never sets
+    // req.octoToken. Same-space doc (s_1) passes the cross-space gate, so we reach
+    // the ownership check: ownedBotsInSpace gets '' and returns [] (fail-closed),
+    // so any submitted bot is rejected.
     mockOwnedBotsInSpace.mockResolvedValue([])
-    const botReq = ({ uid: 'bot_self', spaceId: 's_1', params: { docId: 'd_1' }, body: { botUids: ['bot_a'] } }) as never
+    const botReq = ({
+      uid: 'bot_self',
+      spaceId: 's_1',
+      docSpaceScope: { mode: 'bot', spaceId: 's_1' },
+      params: { docId: 'd_1' },
+      body: { botUids: ['bot_a'] },
+    }) as never
     const res = mockRes()
     await submitHandler()(botReq, res as never)
     expect(res.statusCode).toBe(403)

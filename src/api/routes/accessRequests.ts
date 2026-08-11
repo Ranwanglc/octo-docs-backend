@@ -62,6 +62,26 @@ function callerSessionToken(req: Request): string | undefined {
  * POST submit — any authenticated octo user (no doc role required). Idempotent
  * by (doc_id, uid). If the caller already holds >= the requested role and no
  * bots are requested, returns 200 already_granted without writing a row.
+ *
+ * ★ Deliberately NOT behind `requireSpaceMembership`, unlike the space-selector
+ * routes. The whole persona this route serves is an OUTSIDER: octo-web's
+ * forbidden landing (`packages/docs/src/pages/StandaloneDocPage.tsx`, feature
+ * #511 screen 4c) renders `RequestAccessButton` for "a receiver who lands on a
+ * doc they cannot open", passing `preflightSpace` — which is
+ * `standaloneLinkSpace()`, i.e. the `?sp=` value from the doc's OWN space that
+ * `util/docShareLink.ts` minted. Such a receiver is by definition not a member of
+ * that space; that is the design premise, not an anomaly. A membership gate here
+ * makes the preflight 403 render the button and the button itself 404 — the same
+ * defect as gating the `/:docId` read path, one route over. Nor does
+ * forward-grant substitute for it: `forwardGrant.ts:36` requires `admin`, so it
+ * is the doc admin GRANTING, never the outsider ASKING.
+ *
+ * `requireSameSpace` below therefore stays the only space check, and is honest
+ * about what it buys: it compares `meta.space_id` against the same unverified
+ * header, so it does not prove membership — it only pins the write to the doc's
+ * own space, keeping a cross-space row from ever landing. The residual is a
+ * (doc_id, space_id) existence probe, which needs a `newDocId()` guess first:
+ * `util/ids.ts:14` is `d_` + `randomBytes(12)`, i.e. 96 bits.
  */
 accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: Response) => {
   const docId = req.params.docId!
@@ -70,15 +90,21 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
     res.status(404).json({ error: 'not_found' })
     return
   }
-  // Space-scope gate (P2): a doc in another space must be indistinguishable
-  // from a missing one, so a cross-space hit returns 404 BEFORE any status
-  // branch. This submit route is the only one in the router that skips
-  // requireDocRole (submit needs no doc role), so without this check a caller
-  // whose server-resolved space is A could probe or write an access-request row
-  // against a doc in space B — a cross-space existence/state oracle plus a
-  // cross-space write. Reusing the shared guard helper keeps this identical to
-  // the role-guarded routes and hardens both the human and bot mounts at once.
-  if (!requireSameSpace(res, meta, req.spaceId!)) {
+  // Space-scope policy split (remove-sp §6.1). This submit route is the only one
+  // in the router that skips requireDocRole (submit needs no doc role), so it
+  // must apply the SAME explicit per-mount policy the shared guard uses — never
+  // infer the boundary from req.botToken here.
+  //   - Bot ({ mode: 'bot', spaceId }): keep the pre-existing cross-space 404
+  //     gate against the server-resolved Space, so a bot cannot probe or write an
+  //     access-request row against a doc in another Space (existence/state oracle
+  //     + cross-space write). Unchanged bot semantics.
+  //   - Human ({ mode: 'human' }): locate by path docId ALONE — no requireSameSpace
+  //     and no client-supplied home Space — so the 403 "request access" button on
+  //     a no-`sp` page works for a doc in any Space the caller can see. This does
+  //     NOT widen approval/grant: it only lets the request be submitted.
+  // Fail CLOSED (unset scope => bot-empty-space => 404), matching the guard.
+  const scope = req.docSpaceScope ?? { mode: 'bot' as const, spaceId: '' }
+  if (scope.mode === 'bot' && !requireSameSpace(res, meta, scope.spaceId)) {
     return
   }
   if (meta.status === 2) {
@@ -168,7 +194,7 @@ accessRequestsRouter.post('/:docId/access-requests', async (req: Request, res: R
 
 /** GET list requests by status (needs admin; default pending). */
 accessRequestsRouter.get('/:docId/access-requests', async (req: Request, res: Response) => {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'admin')
   if (!guard) return
   const statusParam = req.query.status
   const statusNum =
@@ -205,7 +231,7 @@ accessRequestsRouter.get('/:docId/access-requests', async (req: Request, res: Re
 accessRequestsRouter.post(
   '/:docId/access-requests/:requestId/approve',
   async (req: Request, res: Response) => {
-    const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
+    const guard = await requireDocRole(req, res, req.params.docId!, 'admin')
     if (!guard) return
     const request = await docAccessRequestRepo.getByRequestId(req.params.docId!, req.params.requestId!)
     if (!request) {
@@ -300,7 +326,7 @@ accessRequestsRouter.post(
 accessRequestsRouter.post(
   '/:docId/access-requests/:requestId/deny',
   async (req: Request, res: Response) => {
-    const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
+    const guard = await requireDocRole(req, res, req.params.docId!, 'admin')
     if (!guard) return
     const request = await docAccessRequestRepo.getByRequestId(req.params.docId!, req.params.requestId!)
     if (!request) {

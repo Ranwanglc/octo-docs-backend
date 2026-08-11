@@ -82,8 +82,7 @@ describe('GET /scene — role gating', () => {
   it('requires reader in the caller space and short-circuits when blocked', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(null)
     await getDocSceneHandler(req({ docId: 'b_1' }), mockRes() as never)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
     expect(vi.mocked(readLiveBoard)).not.toHaveBeenCalled()
   })
 })

@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest'
-import { signCollabToken, verifyCollabToken } from '../src/auth/collabToken.js'
+import jwt from 'jsonwebtoken'
+import { signCollabToken, signCollabTokenV2, verifyCollabToken } from '../src/auth/collabToken.js'
 import { config } from '../src/config/env.js'
 
 // NOTE: config (incl. COLLAB_TOKEN_SECRET) is captured at module import time,
@@ -90,6 +91,60 @@ describe('collab token sign/verify (§4.4)', () => {
       role: 'reader',
       permission_epoch: 0,
     })
+  })
+})
+
+describe('collab token v2 wire contract (remove-sp §7)', () => {
+  it('signs camelCase v2 claims and maps them to the internal verifier shape', () => {
+    const result = signCollabTokenV2({
+      uid: 'u_2',
+      docId: 'd_2',
+      documentName: 'octo:s_2:f_default:d_2',
+      homeSpaceId: 's_2',
+      role: 'writer',
+      permissionEpoch: 12,
+      spaceMember: true,
+    })
+    const wire = jwt.decode(result.token) as Record<string, unknown>
+    expect(wire).toMatchObject({
+      ver: 2,
+      uid: 'u_2',
+      docId: 'd_2',
+      documentName: 'octo:s_2:f_default:d_2',
+      homeSpaceId: 's_2',
+      role: 'writer',
+      permissionEpoch: 12,
+      spaceMember: true,
+    })
+    expect(wire).not.toHaveProperty('permission_epoch')
+    expect(wire).not.toHaveProperty('home_space_id')
+    expect(verifyCollabToken(result.token)).toEqual({
+      ver: 2,
+      uid: 'u_2',
+      docId: 'd_2',
+      documentName: 'octo:s_2:f_default:d_2',
+      homeSpaceId: 's_2',
+      role: 'writer',
+      permission_epoch: 12,
+      space_member: true,
+    })
+  })
+
+  it.each([1, 3, '2', 2.5])('rejects an unknown/non-exact version %j', (ver) => {
+    const token = jwt.sign(
+      {
+        ver,
+        uid: 'u_2',
+        docId: 'd_2',
+        documentName: 'octo:s_2:f_default:d_2',
+        homeSpaceId: 's_2',
+        role: 'writer',
+        permissionEpoch: 12,
+      },
+      config.collabToken.secret,
+      { algorithm: 'HS256', expiresIn: 60 },
+    )
+    expect(() => verifyCollabToken(token)).toThrow(/unsupported collab token version/)
   })
 })
 

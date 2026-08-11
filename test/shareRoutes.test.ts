@@ -68,7 +68,7 @@ describe('GET /api/v1/docs/:docId/share (#64)', () => {
     vi.mocked(requireDocRole).mockResolvedValue(guardMeta({ share_scope: 1, share_role: 2 }) as never)
     const res = mockRes()
     await getShareHandler(req(undefined), res as never)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
     expect(res.statusCode).toBe(200)
     expect(res.body).toEqual({ docId: 'd_1', shareScope: 'anyone_in_space', shareRole: 'edit' })
   })
@@ -94,7 +94,7 @@ describe('PUT /api/v1/docs/:docId/share (#64)', () => {
     vi.mocked(requireDocRole).mockResolvedValue(guardMeta() as never)
     const res = mockRes()
     await putShareHandler(req({ shareScope: 'anyone_in_space', shareRole: 'edit' }), res as never)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('admin')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('admin')
     expect(docMetaRepo.setShareSettings).toHaveBeenCalledWith('d_1', 1, 2)
     // doc-wide invalidation: refreshAndPublish called with (documentName, newEpoch)
     // and NO uid — the setShareSettings tx already bumped the epoch atomically.

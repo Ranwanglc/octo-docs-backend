@@ -77,8 +77,7 @@ describe('GET /api/v1/docs/:docId — read one (§8.4)', () => {
     vi.mocked(requireDocRole).mockResolvedValue(null)
     await getDocHandler(req({ docId: 'd_1' }), mockRes() as never)
     // The space (4th arg) is sourced from req.spaceId; the minRole (5th arg) is 'reader'.
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
   })
 
   it('returns 200 with the camelCase doc shape for an authorized reader', async () => {
@@ -99,7 +98,7 @@ describe('GET /api/v1/docs/:docId — read one (§8.4)', () => {
       role: 'reader',
       createdAt: new Date(0),
       updatedAt: new Date(1000),
-      shareUrl: '/d/d_1?sp=s1',
+      shareUrl: '/d/d_1',
       // #64 additive share-scope fields; a doc with no share settings set reads
       // as the fail-safe default (restricted / read).
       shareScope: 'restricted',
@@ -130,7 +129,7 @@ describe('GET /api/v1/docs/:docId — read one (§8.4)', () => {
 
   it('returns 404 for a missing/deleted doc (guard writes it and blocks)', async () => {
     // The real guard writes 404 and returns null; emulate that contract here.
-    vi.mocked(requireDocRole).mockImplementation(async (res) => {
+    vi.mocked(requireDocRole).mockImplementation(async (_req, res) => {
       ;(res as unknown as MockRes).status(404).json({ error: 'not_found' })
       return null
     })
@@ -141,7 +140,7 @@ describe('GET /api/v1/docs/:docId — read one (§8.4)', () => {
   })
 
   it('returns 403 for a non-member (guard writes forbidden and blocks)', async () => {
-    vi.mocked(requireDocRole).mockImplementation(async (res) => {
+    vi.mocked(requireDocRole).mockImplementation(async (_req, res) => {
       ;(res as unknown as MockRes).status(403).json({ error: 'forbidden' })
       return null
     })

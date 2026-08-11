@@ -83,6 +83,9 @@ function stub(overrides: Partial<OctoIdentity>): OctoIdentity {
     getUser: async (): Promise<OctoUser | null> => null,
     getUserAsBot: async (): Promise<OctoUser | null> => null,
     getUsers: async (): Promise<OctoUser[]> => [],
+    // Fail-closed default, matching the production gate: a test must opt IN to
+    // membership to exercise a human-mount happy path.
+    isSpaceMember: async () => false,
     ...overrides,
   }
 }
@@ -173,7 +176,10 @@ describe('bot doc create auto-grants the bot owner admin (XIN-576)', () => {
   })
 
   it('does not grant on the human create path (owner is already the creator)', async () => {
-    setOctoIdentity(stub({ verifyToken: async () => ({ uid: 'u_1' }) }))
+    // Human mount: X-Space-Id is gated on a confirmed space membership
+    // (spaceContextMiddleware), so this path needs isSpaceMember => true to
+    // reach the create handler at all.
+    setOctoIdentity(stub({ verifyToken: async () => ({ uid: 'u_1' }), isSpaceMember: async () => true }))
     const res = await fetch(`${base}/api/v1/docs`, {
       method: 'POST',
       headers: { token: 'user-tok', 'X-Space-Id': 's_human', 'content-type': 'application/json' },
@@ -475,9 +481,10 @@ describe('bot html doc registration', () => {
     expect(body.ownerId).toBe('s_bot_b')
     expect(body.docId).not.toBe('d_html')
     expect(body.spaceId).not.toBe('s_1')
-    // shareUrl uses the canonical response space/doc (not the throwaway create id).
+    // Ordinary shareUrl uses the canonical response doc and never serializes Space.
     expect(body.shareUrl).toContain('d_html_B')
-    expect(body.shareUrl).toContain('s_B')
+    expect(body.shareUrl).not.toContain('sp=')
+    expect(body.shareUrl).not.toContain('sid=')
   })
 
   it('renames and soft-deletes html docs by octo-doc slug', async () => {

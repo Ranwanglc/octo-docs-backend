@@ -113,6 +113,23 @@ export async function authenticate(data: AuthInput): Promise<AuthContext> {
     throw forbidden() // 4403
   }
 
+  // 5b. v2 identity binding (remove-sp §7.3). A v2 token carries docId +
+  //     homeSpaceId alongside documentName; bind them to the connection so the
+  //     token cannot be replayed against a room whose canonical key disagrees
+  //     with the identity it was minted for. Zero-IO: step 2 already proved
+  //     `claims.documentName === documentName` (the room key), and that key is
+  //     canonical `octo:{space}:{folder}:{doc|wb:board}`, so comparing the token
+  //     claims to the parsed segments enforces "token docId == this doc" and
+  //     "token homeSpaceId == doc_meta.space_id" without a doc_meta read. Legacy
+  //     v1 tokens (no `ver`) skip this — they carry neither claim (compat window).
+  if (claims.ver === 2) {
+    const boundDocId =
+      parsed.kind === 'document' ? parsed.doc : parsed.kind === 'whiteboard' ? parsed.board : undefined
+    if (boundDocId === undefined || claims.docId !== boundDocId || claims.homeSpaceId !== parsed.space) {
+      throw forbidden() // 4403 — identity claims disagree with the canonical room
+    }
+  }
+
   // 6. reader/commenter: set readOnly so body writes are rejected BEFORE being
   //    applied (v4). A commenter may comment via the REST API but must not edit
   //    the doc body over the collab connection, so it is read-only here too.

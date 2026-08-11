@@ -84,7 +84,7 @@ describe('POST /api/v1/docs/:docId/invites — create response (#6)', () => {
     expect(typeof body.inviteToken).toBe('string')
     expect(body.role).toBe('writer')
     // The doc guard is scoped to req.spaceId (4th arg).
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('admin')
 
     // No host-derived link of any kind in the response.
     expect(body).not.toHaveProperty('url')

@@ -137,6 +137,9 @@ function humanReq(over: Record<string, unknown> = {}) {
   return {
     uid: HUMAN,
     spaceId: SPACE,
+    // Human open-context mount policy (remove-sp §6): locate by docId, resolve
+    // anyone_in_space membership against the doc home space via req.octoToken.
+    docSpaceScope: { mode: 'human' as const },
     params: { docId: DOC },
     query: {},
     body: undefined,

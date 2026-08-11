@@ -1,19 +1,20 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-// XIN-1237 — recent-view space 口径统一 (write/read space must agree).
+// Recent-view space 口径统一, updated for the remove-sp §7.1 verified-or-skip
+// contract.
 //
 // The read side (GET /docs/recent) filters doc_view_history rows by the VIEWER's
-// CURRENT space (the X-Space-Id header). For a doc opened from a chat share link
-// the standalone page never calls POST /docs/{id}/view; the only ingest is the
-// collab-token fallback in issueCollabToken. If that fallback records the row
-// under the DOCUMENT's home space (meta.space_id) instead of the viewer's current
-// space, the read-by-current-space never returns it — exactly the bug from
-// XIN-1234.
+// verified current space. The only ingest for a doc opened from a chat share link
+// is the collab-token fallback in issueCollabToken. Phase-1 tightens the write:
 //
-// Contract asserted here: when the collab-token request carries the viewer's
-// current space, the fallback ingest MUST record under THAT space (so it matches
-// the read filter). When it does not (legacy client), it falls back to the
-// document's home space — no regression for same-space opens.
+//   - it records under the VIEWER's supplied current space ONLY after confirming
+//     the caller is an active member of that space (so it matches the read
+//     filter);
+//   - it NO LONGER falls back to the document's home space when no viewer space
+//     is supplied (or the header is blank / unverified) — it SKIPS the write.
+//
+// This closes the "unverified header writes an arbitrary space" hole while
+// keeping same-space opens (member of their current space) working.
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   docMetaRepo: { getByDocId: vi.fn(), getByDocumentName: vi.fn() },
 }))
@@ -50,11 +51,13 @@ const docMeta = (ownerId: string) =>
     permission_epoch: 2,
   }) as never
 
-function asUser(uid: string | null) {
+/** Inject an identity for uid whose isSpaceMember returns `member`. */
+function asUser(uid: string | null, member = true) {
   setOctoIdentity({
     verifyToken: async (token: string) => (token && uid ? { uid } : null),
     getUser: async () => null,
     getUsers: async () => [],
+    isSpaceMember: async () => member,
   })
 }
 
@@ -66,48 +69,62 @@ beforeEach(() => {
   vi.mocked(docViewHistoryRepo.upsertViewWithPrune).mockResolvedValue(new Date())
 })
 
-describe('issueCollabToken — recent-view space 口径统一 (XIN-1237)', () => {
-  it('records the view under the VIEWER current space, not the document home space', async () => {
-    asUser('u_viewer')
+describe('issueCollabToken — verified-or-skip recent-view space (remove-sp §7.1)', () => {
+  it('records under the VIEWER current space when membership is CONFIRMED', async () => {
+    asUser('u_viewer', true)
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(docMeta('owner_z'))
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta('owner_z'))
     vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader') // read-only share open still counts
 
     // Viewer opens the shared doc while in VIEWER_SPACE (passed by the caller
-    // from the collab-token request's X-Space-Id header).
+    // from the collab-token request's X-Space-Id header) AND is a member of it.
     const out = await issueCollabToken('octo_session_viewer', DOC_KEY, VIEWER_SPACE)
     expect(out.ok).toBe(true)
+    await new Promise((r) => setImmediate(r))
     expect(docViewHistoryRepo.upsertViewWithPrune).toHaveBeenCalledTimes(1)
     const arg = vi.mocked(docViewHistoryRepo.upsertViewWithPrune).mock.calls[0]![0]
     expect(arg.uid).toBe('u_viewer')
     expect(arg.docId).toBe(DOC_ID)
-    // The write space MUST equal the viewer's current space so the read
-    // (filtered by X-Space-Id) can return this row. This is the bug fix.
+    // The write space MUST equal the viewer's verified current space so the read
+    // (filtered by X-Space-Id) can return this row — never the doc home space.
     expect(arg.spaceId).toBe(VIEWER_SPACE)
     expect(arg.spaceId).not.toBe(DOC_SPACE)
   })
 
-  it('falls back to the document home space when no viewer space is supplied (legacy client, no regression)', async () => {
-    asUser('u_viewer')
+  it('SKIPS the write (no home-space fallback) when no viewer space is supplied', async () => {
+    asUser('u_viewer', true)
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(docMeta('owner_z'))
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta('owner_z'))
     vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader')
 
     const out = await issueCollabToken('octo_session_viewer', DOC_KEY)
     expect(out.ok).toBe(true)
-    const arg = vi.mocked(docViewHistoryRepo.upsertViewWithPrune).mock.calls[0]![0]
-    expect(arg.spaceId).toBe(DOC_SPACE)
+    await new Promise((r) => setImmediate(r))
+    // Phase-1: no fallback to DOC_SPACE — the row is simply not written.
+    expect(docViewHistoryRepo.upsertViewWithPrune).not.toHaveBeenCalled()
   })
 
-  it('ignores an empty viewer space and falls back to the document home space', async () => {
-    asUser('u_viewer')
+  it('SKIPS the write for a blank viewer space (no home-space fallback)', async () => {
+    asUser('u_viewer', true)
     vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(docMeta('owner_z'))
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta('owner_z'))
     vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader')
 
     const out = await issueCollabToken('octo_session_viewer', DOC_KEY, '   ')
     expect(out.ok).toBe(true)
-    const arg = vi.mocked(docViewHistoryRepo.upsertViewWithPrune).mock.calls[0]![0]
-    expect(arg.spaceId).toBe(DOC_SPACE)
+    await new Promise((r) => setImmediate(r))
+    expect(docViewHistoryRepo.upsertViewWithPrune).not.toHaveBeenCalled()
+  })
+
+  it('SKIPS the write when the viewer is NOT a member of the supplied space', async () => {
+    asUser('u_viewer', false) // isSpaceMember => false
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(docMeta('owner_z'))
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(docMeta('owner_z'))
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue('reader')
+
+    const out = await issueCollabToken('octo_session_viewer', DOC_KEY, VIEWER_SPACE)
+    expect(out.ok).toBe(true)
+    await new Promise((r) => setImmediate(r))
+    expect(docViewHistoryRepo.upsertViewWithPrune).not.toHaveBeenCalled()
   })
 })

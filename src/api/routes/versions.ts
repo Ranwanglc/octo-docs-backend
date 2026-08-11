@@ -99,7 +99,7 @@ function parseVersionId(raw: string | undefined): number | null {
 versionsRouter.get('/:docId/versions', listVersionsHandler)
 
 export async function listVersionsHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
   if (contentKindFromDocType(guard.meta.doc_type) === 'ppt') {
     // html_ppt has no Yjs `doc_version` rows (§1.3); answer wrong-kind uniformly
@@ -144,7 +144,7 @@ export async function listVersionsHandler(req: Request, res: Response): Promise<
 versionsRouter.post('/:docId/versions', createVersionHandler)
 
 export async function createVersionHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
   if (!guard) return
   const kind = contentKindFromDocType(guard.meta.doc_type)
   if (kind === 'ppt') {
@@ -193,7 +193,7 @@ export async function createVersionHandler(req: Request, res: Response): Promise
 versionsRouter.get('/:docId/versions/:versionId/state', getVersionStateHandler)
 
 export async function getVersionStateHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
   const kind = contentKindFromDocType(guard.meta.doc_type)
   if (kind === 'ppt') {
@@ -288,7 +288,7 @@ export async function getVersionStateHandler(req: Request, res: Response): Promi
 versionsRouter.patch('/:docId/versions/:versionId', renameVersionHandler)
 
 export async function renameVersionHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'writer', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'writer')
   if (!guard) return
   if (contentKindFromDocType(guard.meta.doc_type) === 'ppt') {
     res.status(422).json({ error: 'unsupported_document_type' })
@@ -322,7 +322,7 @@ export async function renameVersionHandler(req: Request, res: Response): Promise
 versionsRouter.delete('/:docId/versions/:versionId', deleteVersionHandler)
 
 export async function deleteVersionHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'admin')
   if (!guard) return
   if (contentKindFromDocType(guard.meta.doc_type) === 'ppt') {
     res.status(422).json({ error: 'unsupported_document_type' })
@@ -350,7 +350,7 @@ export async function restoreVersionHandler(req: Request, res: Response): Promis
   const docId = req.params.docId!
   // Initial authorization (admin-only). The authoritative recheck happens again
   // under the row lock inside the service — this is the cheap pre-check / 404 pass.
-  const guard = await requireDocRole(res, req.uid!, docId, req.spaceId!, 'admin', { isBot: req.botToken !== undefined })
+  const guard = await requireDocRole(req, res, docId, 'admin')
   if (!guard) return
   const kind = contentKindFromDocType(guard.meta.doc_type)
   if (kind === 'ppt') {
