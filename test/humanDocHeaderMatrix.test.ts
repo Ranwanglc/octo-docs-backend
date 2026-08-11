@@ -199,12 +199,19 @@ describe('Human single-document X-Space-Id tri-state router matrix (remove-sp St
       .toEqual({ status: 404, body: { error: 'not_found' } })
   })
 
-  it.each(['missing', 'correct', 'wrong'] as const)('open-context returns non-leaking 403 with %s header', async (space) => {
+  it.each(['missing', 'correct', 'wrong'] as const)('open-context 403 names the doc and nothing else, with %s header', async (space) => {
     const outcome = await request('GET', `/${DOC_ID}/open-context`, space)
-    expect(outcome).toEqual({ status: 403, body: { error: 'forbidden' } })
-    expect(outcome.body).not.toHaveProperty('title')
+    // Product decision (leader): the no-access landing must name the document it asks the viewer to
+    // request access to, so this ONE 403 carries `title`. Header-independence is the property under
+    // test here — the disclosure must not vary with X-Space-Id, since this route has no same-space
+    // gate and a 403 can reach a caller from any Space.
+    expect(outcome).toEqual({ status: 403, body: { error: 'forbidden', title: 'Secret title' } })
+    // Everything that would let a refused caller act on the doc, or locate it, still stays out.
     expect(outcome.body).not.toHaveProperty('homeSpaceId')
     expect(outcome.body).not.toHaveProperty('documentName')
+    expect(outcome.body).not.toHaveProperty('role')
+    expect(outcome.body).not.toHaveProperty('permissionEpoch')
+    expect(outcome.body).not.toHaveProperty('folderId')
   })
 
   it.each(['missing', 'correct', 'wrong'] as const)('docId collab-token returns non-leaking 403 with %s header', async (space) => {
