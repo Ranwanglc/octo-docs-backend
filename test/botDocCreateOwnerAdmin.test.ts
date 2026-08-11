@@ -237,33 +237,47 @@ describe('bot html doc registration', () => {
     updated_by: '',
   }
 
-  it('creates a canonical HTML doc from idempotencyKey and rejects mixing in octoDocSlug', async () => {
+  it.each([
+    ['missing', {}],
+    ['empty string', { mountType: '' }],
+    ['null', { mountType: null }],
+  ])('creates an unmounted canonical HTML doc when mountType is %s', async (_label, mount) => {
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1', ownerUid: 'u_human' }) }))
     createCanonicalHtml.mockResolvedValue({
       meta: { ...htmlMeta, doc_id: 'd_canonical', octo_doc_slug: 'd_canonical' }, created: true,
     } as never)
 
-    const good = await fetch(`${base}/v1/bot/docs`, {
+    const response = await fetch(`${base}/v1/bot/docs`, {
       method: 'POST', headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
-      body: JSON.stringify({ title: 'First title', docType: 'html', idempotencyKey: 'run-42', mountType: 'group' }),
+      body: JSON.stringify({ title: 'First title', docType: 'html', idempotencyKey: 'run-42', ...mount }),
     })
-    expect(good.status).toBe(201)
-    expect(await good.json()).toMatchObject({
+    expect(response.status).toBe(201)
+    expect(await response.json()).toMatchObject({
       docId: 'd_canonical', octoDocSlug: 'd_canonical', created: true,
-      publisherUid: 's_tmos_bot', spaceId: 's_1',
+      publisherUid: 's_tmos_bot', spaceId: 's_1', folderId: 'f_default',
+      documentName: 'octo:s_1:f_default:html:d_html',
     })
     expect(createCanonicalHtml).toHaveBeenCalledWith(expect.objectContaining({
       idempotencyKey: 'run-42', ownerId: 's_tmos_bot', humanOwnerUid: 'u_human',
-      spaceId: 's_1', octoDocSlug: expect.stringMatching(/^d_/),
+      spaceId: 's_1', folderId: 'f_default', octoDocSlug: expect.stringMatching(/^d_/),
+      documentName: expect.stringMatching(/^octo:s_1:f_default:html:d_/),
     }))
+    expect(createCanonicalHtml.mock.calls[0]![0]).not.toHaveProperty('mountType')
+    expect(createCanonicalHtml.mock.calls[0]![0]).not.toHaveProperty('groupId')
+    expect(createCanonicalHtml.mock.calls[0]![0]).not.toHaveProperty('threadId')
+    expect(upsertHtmlByOctoDocSlug).not.toHaveBeenCalled()
     expect(upsertDirect).not.toHaveBeenCalled()
+  })
+
+  it('rejects mixing a canonical idempotencyKey with a legacy octoDocSlug', async () => {
+    setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1', ownerUid: 'u_human' }) }))
 
     const mixed = await fetch(`${base}/v1/bot/docs`, {
       method: 'POST', headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
       body: JSON.stringify({ docType: 'html', idempotencyKey: 'run-43', octoDocSlug: 'legacy', mountType: 'group' }),
     })
     expect(mixed.status).toBe(400)
-    expect(createCanonicalHtml).toHaveBeenCalledTimes(1)
+    expect(createCanonicalHtml).not.toHaveBeenCalled()
   })
 
   it('leaves membership and epoch untouched on a canonical retry without enqueueing before content is ready', async () => {
@@ -317,6 +331,9 @@ describe('bot html doc registration', () => {
     expect(createCanonicalHtml).toHaveBeenLastCalledWith(expect.objectContaining({ idempotencyKey: 'key' }))
     expect((await post({ docType: 'html', idempotencyKey: '   ', mountType: 'group' })).status).toBe(400)
     expect((await post({ docType: 'html', idempotencyKey: 'x'.repeat(129), mountType: 'group' })).status).toBe(400)
+    const invalidMount = await post({ docType: 'html', idempotencyKey: 'key', mountType: 'channel' })
+    expect(invalidMount.status).toBe(400)
+    expect(await invalidMount.json()).toEqual({ error: 'mountType must be group, space, or thread' })
     expect((await post({ docType: 'doc', idempotencyKey: 'key' })).status).toBe(400)
   })
 

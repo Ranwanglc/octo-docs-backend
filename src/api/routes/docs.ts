@@ -180,7 +180,9 @@ export async function createDocHandler(req: Request, res: Response) {
       res.status(400).json({ error: 'html registration requires bot mount' })
       return
     }
-    if (mountType !== 'group' && mountType !== 'space' && mountType !== 'thread') {
+    const canonicalUnmounted = idempotencyKey !== undefined
+      && (mountType === undefined || mountType === null || mountType === '')
+    if (!canonicalUnmounted && mountType !== 'group' && mountType !== 'space' && mountType !== 'thread') {
       res.status(400).json({ error: 'mountType must be group, space, or thread' })
       return
     }
