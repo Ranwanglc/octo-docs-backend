@@ -345,7 +345,7 @@ export async function exportFileHandler(req: Request, res: Response): Promise<vo
     return
   }
 
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
   const expectedType = format === 'xlsx' ? 'sheet' : 'doc'
   if (guard.meta.doc_type !== expectedType) {
@@ -505,7 +505,7 @@ export function readBoundedSvgDimensions(svg: Buffer): { width: number; height: 
 }
 
 export async function exportPdfHandler(req: Request, res: Response): Promise<void> {
-  const guard = await requireDocRole(res, req.uid!, req.params.docId!, req.spaceId!, 'reader', { isBot: req.botToken !== undefined, token: req.octoToken })
+  const guard = await requireDocRole(req, res, req.params.docId!, 'reader')
   if (!guard) return
   if (guard.meta.doc_type !== 'doc') {
     res.status(409).json({ error: 'unsupported_doc_type' })

@@ -14,6 +14,7 @@ vi.mock('../src/db/repos/docMemberRepo.js', () => ({
 }))
 
 import { requireDocRole } from '../src/api/guard.js'
+import type { DocSpaceScope } from '../src/api/middleware/docSpaceScope.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
 import { setOctoIdentity } from '../src/auth/octoIdentity.js'
@@ -77,21 +78,21 @@ async function run(opts: {
   minRole: Role
   metaOver?: Record<string, unknown>
   directRole?: ResolvedRole
-  spaceId?: string
-  isBot?: boolean
+  // Per-mount policy (remove-sp §6). Defaults to the Human open-context mount
+  // (locate by docId, no cross-space gate); Bot tests pass an explicit bot scope.
+  scope?: DocSpaceScope
+  octoToken?: string
 }) {
   vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta(opts.metaOver) as never)
   const dr = opts.directRole ?? 'none'
   vi.mocked(docMemberRepo.getRole).mockResolvedValue((dr === 'none' ? null : dr) as never)
   const res = mockRes()
-  const guard = await requireDocRole(
-    res,
-    opts.uid,
-    DOC,
-    opts.spaceId ?? SPACE,
-    opts.minRole,
-    { isBot: opts.isBot },
-  )
+  const req = {
+    uid: opts.uid,
+    octoToken: opts.octoToken,
+    docSpaceScope: opts.scope ?? { mode: 'human' as const },
+  }
+  const guard = await requireDocRole(req as never, res as never, DOC, opts.minRole)
   return { res, guard }
 }
 
@@ -101,18 +102,37 @@ beforeEach(() => {
   memberReturns(false)
 })
 
-describe('requireDocRole — cross-space (§5.2.a, before any share logic)', () => {
-  it('C2: anyone_in_space + cross-space => 404, never reaches membership', async () => {
+describe('requireDocRole — cross-space (§5.2.a, BOT mount only, before any share logic)', () => {
+  it('C2: Bot mount + anyone_in_space + cross-space => 404, never reaches membership', async () => {
+    // remove-sp §6: the cross-space 404 gate now applies ONLY to the Bot mount
+    // (server-resolved Space). A verified bot in s_other hitting a doc in s1 must
+    // still 404 BEFORE any role/membership logic. (The Human mount deliberately
+    // has NO such gate — see the Human describe below.)
     const { res, guard } = await run({
       uid: 'u_x',
       minRole: 'reader',
       metaOver: { share_scope: 1, share_role: 2 },
-      spaceId: 's_other',
+      scope: { mode: 'bot', spaceId: 's_other' },
     })
     expect(res.statusCode).toBe(404)
     expect(res.body).toEqual({ error: 'not_found' })
     expect(guard).toBeNull()
     expect(calls).toBe(0)
+  })
+
+  it('C2b: Human mount + cross-space direct member resolves (NO 404 gate)', async () => {
+    // The whole point of remove-sp: a Human locates by docId alone, so a doc in
+    // ANOTHER space than any (now absent/wrong) header resolves on the caller's
+    // real role — here a direct writer — without a cross-space 404.
+    const { res, guard } = await run({
+      uid: 'u_w',
+      minRole: 'reader',
+      metaOver: { space_id: 's_other' },
+      directRole: 'writer',
+    })
+    expect(res.statusCode).toBe(0)
+    expect(guard?.role).toBe('writer')
+    expect(guard?.meta.space_id).toBe('s_other')
   })
 })
 
@@ -185,7 +205,7 @@ describe('requireDocRole — bot shortcut (§4.3) & §5.4 doc_member-not-member'
       minRole: 'writer',
       metaOver: { share_scope: 1, share_role: 2 },
       directRole: 'none',
-      isBot: true,
+      scope: { mode: 'bot', spaceId: SPACE },
     })
     expect(res.statusCode).toBe(0)
     expect(guard?.role).toBe('writer')

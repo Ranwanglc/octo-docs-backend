@@ -117,13 +117,12 @@ describe('role gating (server authority)', () => {
 
   it('GET /content requires reader', async () => {
     await getDocContentHandler(req({ docId: 'd_1' }), mockRes() as never)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
   })
 
   it('PATCH /content requires writer', async () => {
     await patchDocContentHandler(req({ docId: 'd_1' }, { body: {} }), mockRes() as never)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('writer')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('writer')
   })
 })
 

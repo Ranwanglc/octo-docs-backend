@@ -175,33 +175,32 @@ describe('role gating (server authority, §4.2 / §5.6)', () => {
   it('list requires reader', async () => {
     await listVersionsHandler(req({ docId: 'd_1' }), mockRes() as never)
     // The space (4th arg) is threaded from req.spaceId; the minRole is the 5th arg.
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
   })
 
   it('state preview requires reader', async () => {
     await getVersionStateHandler(req({ docId: 'd_1', versionId: '1' }), mockRes() as never)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('reader')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
   })
 
   it('snapshot requires writer', async () => {
     await createVersionHandler(req({ docId: 'd_1' }, { body: {} }), mockRes() as never)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('writer')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('writer')
   })
 
   it('rename requires writer', async () => {
     await renameVersionHandler(req({ docId: 'd_1', versionId: '1' }, { body: { name: 'x' } }), mockRes() as never)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('writer')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('writer')
   })
 
   it('delete requires admin (boss call)', async () => {
     await deleteVersionHandler(req({ docId: 'd_1', versionId: '1' }), mockRes() as never)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('admin')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('admin')
   })
 
   it('restore requires admin (boss call)', async () => {
     await restoreVersionHandler(req({ docId: 'd_1', versionId: '1' }), mockRes() as never)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('admin')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('admin')
   })
 })
 

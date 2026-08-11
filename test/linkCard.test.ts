@@ -72,7 +72,7 @@ describe('POST /link-card (§3.5 ⑰)', () => {
     expect(res.body).toEqual(sampleCard)
     expect(vi.mocked(fetchOgCard)).toHaveBeenCalledOnce()
     // The doc guard is scoped to req.spaceId (4th arg).
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('reader')
     // Cached under the og:v1:<sha256> namespace with the success TTL.
     const [key, value, mode, ttl] = redisStore.set.mock.calls[0]!
     expect(String(key)).toMatch(/^octo-docs:og:v1:[0-9a-f]{64}$/)

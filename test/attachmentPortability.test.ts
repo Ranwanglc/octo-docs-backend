@@ -26,7 +26,7 @@ function response(): Response & { statusCode: number; body?: Record<string, unkn
 
 beforeEach(() => {
   vi.clearAllMocks()
-  vi.mocked(requireDocRole).mockResolvedValue({ meta: { doc_id: 'd_target', document_name: 'octo:s1:f:d_target', doc_type: 'doc', permission_epoch: 1 } } as never)
+  vi.mocked(requireDocRole).mockResolvedValue({ meta: { doc_id: 'd_target', document_name: 'octo:s1:f:d_target', doc_type: 'doc', space_id: 's1', permission_epoch: 1 } } as never)
   vi.mocked(readLiveForEdit).mockResolvedValue({ pmDoc: { childCount: 0 }, baseSV: 'base' } as never)
   vi.mocked(editDocBody).mockResolvedValue({ ok: true, bytes: 1, baseVersion: 'v', newDocVersionSeq: 2 } as never)
   vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_source', space_id: 's1', status: 1 } as never)

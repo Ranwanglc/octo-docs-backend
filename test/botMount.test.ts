@@ -15,14 +15,39 @@ import type { Server } from 'node:http'
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   docMetaRepo: {
     listForUser: vi.fn(async () => ({ total: 0, items: [] })),
+    getByDocId: vi.fn(),
   },
+  DocOwnershipError: class DocOwnershipError extends Error {},
+}))
+vi.mock('../src/permission/resolveRole.js', () => ({
+  resolveRole: vi.fn(async () => 'reader'),
+  resolveDocMetaByName: vi.fn(),
 }))
 
 import { createApp } from '../src/api/app.js'
 import { setOctoIdentity, type OctoIdentity, type OctoUser } from '../src/auth/octoIdentity.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
+import { resolveRole } from '../src/permission/resolveRole.js'
 
 const listForUser = vi.mocked(docMetaRepo.listForUser)
+const getByDocId = vi.mocked(docMetaRepo.getByDocId)
+const resolveDocRole = vi.mocked(resolveRole)
+
+const docMeta = {
+  doc_id: 'd_bot',
+  document_name: 'octo:s_real:f_default:d_bot',
+  title: 'Bot doc',
+  owner_id: 'u_owner',
+  space_id: 's_real',
+  folder_id: 'f_default',
+  doc_type: 'doc',
+  status: 1,
+  permission_epoch: 1,
+  share_scope: 0,
+  share_role: 0,
+  created_at: new Date(0),
+  updated_at: new Date(0),
+}
 
 /** Identity stub: individual tests supply verifyToken / verifyBot behavior. */
 function stub(overrides: Partial<OctoIdentity>): OctoIdentity {
@@ -55,6 +80,8 @@ afterAll(async () => {
 beforeEach(() => {
   listForUser.mockClear()
   listForUser.mockResolvedValue({ total: 0, items: [] })
+  getByDocId.mockReset().mockResolvedValue(docMeta as never)
+  resolveDocRole.mockReset().mockResolvedValue('reader')
 })
 
 describe('bot mount /v1/bot/docs (§ v4.3)', () => {
@@ -81,6 +108,25 @@ describe('bot mount /v1/bot/docs (§ v4.3)', () => {
     })
     expect(res.status).toBe(200)
     expect(listForUser.mock.calls[0]![0]).toMatchObject({ spaceId: 's_real' })
+  })
+
+  it('uses the server-resolved Space for a single doc and ignores a spoofed header', async () => {
+    setOctoIdentity(stub({ verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_real' }) }))
+    const res = await fetch(`${base}/v1/bot/docs/d_bot`, {
+      headers: { authorization: 'Bearer ok', 'X-Space-Id': 's_spoofed' },
+    })
+    expect(res.status).toBe(200)
+    expect(resolveDocRole).toHaveBeenCalledWith('bot_1', 'd_bot')
+  })
+
+  it('keeps the Bot same-space gate: a server-resolved foreign Space gets 404', async () => {
+    setOctoIdentity(stub({ verifyBot: async () => ({ uid: 'bot_1', spaceId: 's_foreign' }) }))
+    const res = await fetch(`${base}/v1/bot/docs/d_bot`, {
+      headers: { authorization: 'Bearer ok', 'X-Space-Id': 's_real' },
+    })
+    expect(res.status).toBe(404)
+    expect(await res.json()).toEqual({ error: 'not_found' })
+    expect(resolveDocRole).not.toHaveBeenCalled()
   })
 })
 

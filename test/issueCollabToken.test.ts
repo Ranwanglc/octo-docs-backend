@@ -9,7 +9,7 @@ vi.mock('../src/db/repos/docMemberRepo.js', () => ({
   docMemberRepo: { getRole: vi.fn() },
 }))
 
-import { issueCollabToken } from '../src/auth/issueCollabToken.js'
+import { issueCollabToken, issueCollabTokenByDocId } from '../src/auth/issueCollabToken.js'
 import { verifyCollabToken } from '../src/auth/collabToken.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
 import { docMemberRepo } from '../src/db/repos/docMemberRepo.js'
@@ -201,6 +201,37 @@ describe('issueCollabToken (§4.4) — whiteboard support', () => {
   })
 })
 
+describe('collab-token archived-state gate', () => {
+  beforeEach(() => {
+    vi.mocked(docMetaRepo.getByDocId).mockReset()
+    vi.mocked(docMetaRepo.getByDocumentName).mockReset()
+    vi.mocked(docMemberRepo.getRole).mockReset()
+  })
+
+  it.each([
+    ['legacy', async () => issueCollabToken('session', DOC_KEY)],
+    ['docId-first', async () => issueCollabTokenByDocId('owner', DOC_ID, 'session')],
+  ])('%s returns 409 to an authorized caller after role resolution', async (_kind, issue) => {
+    asUser('owner')
+    const archived = { ...docMeta('owner'), status: 2 } as never
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(archived)
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(archived)
+    expect(await issue()).toEqual({ ok: false, status: 409, error: 'conflict' })
+  })
+
+  it.each([
+    ['legacy', async () => issueCollabToken('session', DOC_KEY)],
+    ['docId-first', async () => issueCollabTokenByDocId('stranger', DOC_ID, 'session')],
+  ])('%s does not disclose archived state to a caller with no role', async (_kind, issue) => {
+    asUser('stranger')
+    const archived = { ...docMeta('owner'), status: 2 } as never
+    vi.mocked(docMetaRepo.getByDocumentName).mockResolvedValue(archived)
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(archived)
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue(undefined)
+    expect(await issue()).toEqual({ ok: false, status: 403, error: 'forbidden' })
+  })
+})
+
 describe('issueCollabToken (§4.7(b) / XIN-694) — display name threading', () => {
   beforeEach(() => {
     vi.mocked(docMetaRepo.getByDocId).mockReset()
@@ -344,5 +375,84 @@ describe('issueCollabToken — html_ppt uses the Bento relay, not Hocuspocus', (
     const out = await issueCollabToken('octo_session_ppt_owner', PPT_KEY)
     expect(out).toEqual({ ok: false, status: 404, error: 'not_found' })
     expect(docMemberRepo.getRole).not.toHaveBeenCalled()
+  })
+})
+
+describe('issueCollabTokenByDocId — authorize before unsupported-type disclosure', () => {
+  beforeEach(() => {
+    vi.mocked(docMetaRepo.getByDocId).mockReset()
+    vi.mocked(docMetaRepo.getByDocumentName).mockReset()
+    vi.mocked(docMemberRepo.getRole).mockReset()
+  })
+
+  it.each([
+    ['html', htmlMeta('owner')],
+    ['html_ppt', pptMeta('owner')],
+  ] as const)('returns 403 for an unauthorized %s row instead of leaking 422', async (_kind, meta) => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta)
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue(undefined)
+
+    const out = await issueCollabTokenByDocId('stranger', meta.doc_id, 'session')
+
+    expect(out).toEqual({ ok: false, status: 403, error: 'forbidden' })
+    expect(docMemberRepo.getRole).toHaveBeenCalledWith(meta.doc_id, 'stranger')
+  })
+
+  it.each([
+    ['html owner', htmlMeta('owner'), 'owner', undefined],
+    ['html reader', htmlMeta('owner'), 'reader', 'reader'],
+    ['html_ppt owner', pptMeta('owner'), 'owner', undefined],
+    ['html_ppt reader', pptMeta('owner'), 'reader', 'reader'],
+  ] as const)('returns 422 for an authorized %s after role resolution', async (_label, meta, uid, memberRole) => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(meta)
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue(memberRole)
+
+    const out = await issueCollabTokenByDocId(uid, meta.doc_id, 'session')
+
+    expect(out).toEqual({ ok: false, status: 422, error: 'unsupported_document_type' })
+    if (uid === meta.owner_id) {
+      expect(docMemberRepo.getRole).not.toHaveBeenCalled()
+    } else {
+      expect(docMemberRepo.getRole).toHaveBeenCalledWith(meta.doc_id, uid)
+    }
+  })
+
+  it('keeps archived state hidden from an unauthorized caller', async () => {
+    const archived = { ...docMeta('owner'), status: 2 } as never
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(archived)
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue(undefined)
+
+    expect(await issueCollabTokenByDocId('stranger', DOC_ID, 'session')).toEqual({
+      ok: false,
+      status: 403,
+      error: 'forbidden',
+    })
+  })
+
+  it.each([
+    ['board row with a document room', { ...docMeta('owner'), doc_type: 'board' }],
+    ['document row with a whiteboard room', {
+      ...docMeta('owner'),
+      document_name: `octo:${SPACE}:f_default:wb:${DOC_ID}`,
+    }],
+    ['row whose room names a different docId', {
+      ...docMeta('owner'),
+      document_name: `octo:${SPACE}:f_default:d_other`,
+    }],
+  ] as const)('fails closed for an authorized corrupt %s', async (_label, corruptMeta) => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue(corruptMeta as never)
+
+    const out = await issueCollabTokenByDocId('owner', DOC_ID, 'session')
+
+    expect(out).toEqual({ ok: false, status: 404, error: 'not_found' })
+  })
+
+  it('does not disclose a corrupt row before authorization', async () => {
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ ...docMeta('owner'), doc_type: 'board' } as never)
+    vi.mocked(docMemberRepo.getRole).mockResolvedValue(undefined)
+
+    const out = await issueCollabTokenByDocId('stranger', DOC_ID, 'session')
+
+    expect(out).toEqual({ ok: false, status: 403, error: 'forbidden' })
   })
 })

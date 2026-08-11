@@ -102,7 +102,7 @@ describe('POST presign validation (§3.5 step 1)', () => {
     expect(res.statusCode).toBe(400)
     expect((res.body as { error: string }).error).toBe('mime_not_allowed')
     // The doc guard is scoped to req.spaceId (4th arg).
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('writer')
   })
 
   it('rejects image/svg+xml even though it matches the image/ prefix (XSS)', async () => {
@@ -622,13 +622,48 @@ describe('POST attachments/copy (markdown-import image migration)', () => {
     expect(storeDownload).not.toHaveBeenCalled()
   })
 
-  it('degrades to notCopied for a cross-space source (404 semantics, no existence leak)', async () => {
+  it('BOT mount: degrades to notCopied for a cross-space source (404 semantics, no existence leak)', async () => {
+    // remove-sp §6: the copy SOURCE keeps same-space isolation on the BOT mount.
+    // A bot in s1 copying from a source in s_OTHER must see source_not_found (no
+    // existence leak), exactly as before.
     vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's_OTHER', status: 1 } as never)
     const res = mockRes()
-    await copyHandler(req({ docId: 'd_1' }, { sources: [{ docId: 'd_src', attachId: 'att_src' }] }), res as never)
+    await copyHandler(
+      { uid: 'u_writer', spaceId: 's1', docSpaceScope: { mode: 'bot', spaceId: 's1' }, params: { docId: 'd_1' }, body: { sources: [{ docId: 'd_src', attachId: 'att_src' }] } } as never,
+      res as never,
+    )
     expect(res.statusCode).toBe(200)
     const body = res.body as { notCopied: Array<{ reason: string }> }
     expect(body.notCopied[0]!.reason).toBe('source_not_found')
+  })
+
+  it('HUMAN mount: a cross-space source the caller can READ is copyable (locate by docId, §6)', async () => {
+    // The Human copy locates the source by docId alone; a cross-Space source is
+    // fine — the reader gate on the source is the real authority. Here the caller
+    // is a reader on the s_OTHER source, so the copy proceeds (not source_not_found).
+    vi.mocked(docMetaRepo.getByDocId).mockResolvedValue({ doc_id: 'd_src', space_id: 's_OTHER', status: 1 } as never)
+    vi.mocked(resolveRole).mockResolvedValue('reader' as never)
+    vi.mocked(query)
+      .mockResolvedValueOnce([{ ...srcAttachment, size_bytes: 10 }] as never)
+      .mockResolvedValueOnce([] as never)
+      .mockResolvedValueOnce([{ ...srcAttachment, attach_id: 'att_new', doc_id: 'd_1', object_key: 'd_1/att_new/x.png' }] as never)
+    storeDownload.mockResolvedValueOnce(new Uint8Array([1, 2, 3]))
+    const res = mockRes()
+    await copyHandler(
+      { uid: 'u_writer', spaceId: 's1', docSpaceScope: { mode: 'human' as const }, params: { docId: 'd_1' }, body: { sources: [{ docId: 'd_src', attachId: 'att_src' }] } } as never,
+      res as never,
+    )
+    expect(res.statusCode).toBe(200)
+    const body = res.body as {
+      mappings: Array<{ sourceDocId: string; sourceAttachId: string; attachId: string }>
+      notCopied: Array<{ reason: string }>
+    }
+    expect(body.notCopied).toEqual([])
+    expect(body.mappings).toEqual([
+      expect.objectContaining({ sourceDocId: 'd_src', sourceAttachId: 'att_src' }),
+    ])
+    expect(body.mappings[0]!.attachId).toMatch(/^att_/)
+    expect(storeUpload).toHaveBeenCalledTimes(1)
   })
 
   it('re-sanitizes a readable stored SVG before copying it to another document', async () => {

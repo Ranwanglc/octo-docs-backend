@@ -103,8 +103,7 @@ describe('role gating (server authority)', () => {
   it('PATCH /scene requires writer in the caller space', async () => {
     vi.mocked(requireDocRole).mockResolvedValue(null)
     await patchDocSceneHandler(req({ docId: 'b_1' }), mockRes() as never)
-    expect(vi.mocked(requireDocRole).mock.calls[0]![4]).toBe('writer')
-    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('s1')
+    expect(vi.mocked(requireDocRole).mock.calls[0]![3]).toBe('writer')
     expect(vi.mocked(readLiveBoard)).not.toHaveBeenCalled()
   })
 })

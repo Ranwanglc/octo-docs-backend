@@ -46,6 +46,11 @@ export async function verifyBotMiddleware(
   // Space comes solely from the server-side reverse lookup; any client X-Space-Id
   // is deliberately ignored here (anti-spoof).
   req.spaceId = identity.spaceId
+  // Explicit bot doc space-scoping policy (remove-sp §6): the guard enforces
+  // requireSameSpace against this server-resolved Space, so a bot NEVER gains the
+  // Human open-context cross-Space locate. Set here (not inferred from
+  // req.botToken in shared logic) so the boundary is declared at the mount.
+  req.docSpaceScope = { mode: 'bot', spaceId: identity.spaceId }
   // Stash the bot's own bearer token so downstream handlers can authenticate
   // their octo-server lookups on the bot-token realm — specifically the anti
   // ghost-member existence check in members/forwardGrant, which calls
