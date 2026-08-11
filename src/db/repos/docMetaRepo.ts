@@ -21,9 +21,9 @@ function isDupEntry(err: unknown): boolean {
 }
 
 /**
- * Broken-object-level-authorization guard (P0 default-deny). Thrown when a
- * non-owner tries to upsert a slug an existing row already owns: the space-scoped
- * lookup resolves the OTHER bot's row, so mutating it here would overwrite its
+ * Delegated-owner guard (P0 default-deny). The trusted internal caller supplies
+ * the authenticated owner; a slug already bound to another owner cannot be
+ * mutated because doing so would overwrite that user's
  * title, restamp updated_by, and revive a soft-deleted row with no ownership
  * check. The route maps this to 403 (never fail-open). Ownership is owner-only
  * here (owner is implicit admin, §4.2); an admin-member override would need a
@@ -147,9 +147,9 @@ export const docMetaRepo = {
     const existing = await docMetaRepo.getByOctoDocSlug(input.octoDocSlug, input.spaceId)
     if (existing) {
       // Re-authorize before mutating the resolved row (P0). The space-scoped
-      // lookup can resolve a DIFFERENT bot's row for the same slug; updating it
+      // lookup can resolve a different user's row for the same slug; updating it
       // would overwrite its title/updated_by and revive a soft-deleted row with
-      // no auth. Owner固化: only the owning bot converges idempotently.
+      // no authorization. Only the delegated owner converges idempotently.
       if (existing.owner_id !== input.createdBy) throw new DocOwnershipError()
       // space_id in the WHERE is defense-in-depth: `existing` is already
       // space-scoped, so pinning the space here means no cross-tenant row can
@@ -176,7 +176,7 @@ export const docMetaRepo = {
       const raced = await docMetaRepo.getByOctoDocSlug(input.octoDocSlug, input.spaceId)
       if (!raced) throw err
       // Same P0 re-authorization on the TOCTOU recovery branch: the racing
-      // winner may be another bot's row, so a non-owner loser must be rejected
+      // winner may be another user's row, so an owner mismatch must be rejected
       // rather than silently overwriting/reviving it.
       if (raced.owner_id !== input.createdBy) throw new DocOwnershipError()
       await query(

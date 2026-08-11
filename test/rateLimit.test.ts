@@ -64,6 +64,20 @@ describe('rate limiter (§8.4)', () => {
     })
   })
 
+  it('throttles the internal HTML registration chain per IP', async () => {
+    const app = createApp({ rateLimit: { windowMs: 60_000, max: 2 } })
+    await withServer(app, async (base) => {
+      const options = { method: 'POST', headers: { 'x-internal-token': 'wrong' } }
+      const first = await fetch(`${base}/internal/html/register`, options)
+      const second = await fetch(`${base}/internal/html/register`, options)
+      const third = await fetch(`${base}/internal/html/register`, options)
+      expect(first.status).toBe(401)
+      expect(second.status).toBe(401)
+      expect(third.status).toBe(429)
+      expect(await third.json()).toEqual({ error: 'rate_limited' })
+    })
+  })
+
   it('never throttles /healthz', async () => {
     const app = createApp({ rateLimit: { windowMs: 60_000, max: 2 } })
     await withServer(app, async (base) => {
