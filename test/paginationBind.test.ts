@@ -15,7 +15,7 @@ vi.mock('../src/db/pool.js', () => ({
 import { docVersionRepo } from '../src/db/repos/docVersionRepo.js'
 import { docCommentRepo } from '../src/db/repos/docCommentRepo.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
-import { query } from '../src/db/pool.js'
+import { query, transaction } from '../src/db/pool.js'
 
 const mockQuery = vi.mocked(query)
 
@@ -29,6 +29,10 @@ function lastCall(): { sql: string; params: unknown[] } {
 beforeEach(() => {
   mockQuery.mockReset()
   mockQuery.mockResolvedValue([] as never)
+  vi.mocked(transaction).mockReset().mockImplementation(async (fn) => fn({
+    query: mockQuery,
+    execute: vi.fn(),
+  } as never))
 })
 
 describe('paginated repos inline a validated integer LIMIT/OFFSET (no numeric `?` bind)', () => {

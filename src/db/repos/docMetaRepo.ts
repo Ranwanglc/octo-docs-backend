@@ -9,7 +9,8 @@ import { createHash } from 'node:crypto'
 import { query, transaction, type Tx } from '../pool.js'
 import { docTypeUsesOctoDocSlug } from '../docType.js'
 import { SHARE_SCOPE_ANYONE, SHARE_ROLE_EDIT } from '../../permission/shareScope.js'
-import { STORED_ROLE_VALUES } from '../../permission/role.js'
+import { ROLE_ADMIN, STORED_ROLE_VALUES } from '../../permission/role.js'
+import { docMemberRepo } from './docMemberRepo.js'
 
 /**
  * True when a thrown DB error is a duplicate-key violation. mysql2 surfaces it
@@ -103,6 +104,8 @@ export interface CreateDocInput {
 export interface CanonicalHtmlInput extends CreateDocInput {
   octoDocSlug: string
   idempotencyKey: string
+  /** Human creator of the authenticated bot; distinct from ownerId (the bot UID). */
+  humanOwnerUid?: string
 }
 
 const VALID_STORED_ROLES_SQL = STORED_ROLE_VALUES.join(', ')
@@ -164,73 +167,71 @@ export const docMetaRepo = {
     return rows[0] ?? null
   },
 
-  async upsertHtmlByOctoDocSlug(input: CreateDocInput & { octoDocSlug: string }): Promise<{ meta: DocMeta; created: boolean }> {
-    // NOTE (R1 scope): the `doc_type = 'html'` predicates in this method and in
-    // getByOctoDocSlug are INTENTIONALLY html-only. PPT bot register (R2-B2)
-    // adds a `doc_type`-parametrized slug-upsert path; broadening these clauses
-    // to also match html_ppt now would let an html create resolve a PPT row (or
-    // vice-versa) sharing a slug, so they stay kind-scoped until R2 wires PPT.
-    // Tenant isolation (P0): resolve the slug WITHIN the caller's space only. A
-    // slug is unique per (space_id, octo_doc_slug), so a same-slug row in another
-    // space is invisible here and can never be updated/revived across tenants.
-    const existing = await docMetaRepo.getByOctoDocSlug(input.octoDocSlug, input.spaceId)
-    if (existing) {
-      // Re-authorize before mutating the resolved row (P0). The space-scoped
-      // lookup can resolve a DIFFERENT bot's row for the same slug; updating it
-      // would overwrite its title/updated_by and revive a soft-deleted row with
-      // no auth. Owner固化: only the owning bot converges idempotently.
+  async upsertHtmlByOctoDocSlug(
+    input: CreateDocInput & { octoDocSlug: string; humanOwnerUid?: string },
+  ): Promise<{ meta: DocMeta; created: boolean; memberReconciled: boolean; permissionEpoch?: number }> {
+    // Legacy slug registration remains kind- and tenant-scoped.
+    const updateExisting = async (existing: DocMeta) => {
       if (existing.owner_id !== input.createdBy) throw new DocOwnershipError()
       if (existing.html_idempotency_key_hash != null) {
         if (existing.status === 0) throw new CanonicalHtmlDeletedError()
         if (existing.status === 2) throw new CanonicalHtmlArchivedError()
         throw new CanonicalHtmlLegacyConflictError()
       }
-      // space_id in the WHERE is defense-in-depth: `existing` is already
-      // space-scoped, so pinning the space here means no cross-tenant row can
-      // ever be the UPDATE target.
-      await query(
-        `UPDATE doc_meta
-         SET title = ?, updated_by = ?, status = 1
-         WHERE doc_id = ? AND doc_type = 'html' AND space_id = ?`,
-        [input.title, input.createdBy, existing.doc_id, input.spaceId],
-      )
-      const updated = await docMetaRepo.getByDocId(existing.doc_id)
-      if (!updated) throw new Error('html doc disappeared after upsert')
-      return { meta: updated, created: false }
+      return transaction(async (tx) => {
+        await tx.query(
+          `UPDATE doc_meta
+           SET title = ?, updated_by = ?, status = 1
+           WHERE doc_id = ? AND doc_type = 'html' AND space_id = ?`,
+          [input.title, input.createdBy, existing.doc_id, input.spaceId],
+        )
+        let memberReconciled = false
+        if (input.humanOwnerUid && input.humanOwnerUid !== input.ownerId) {
+          memberReconciled = await docMemberRepo.insertDirectIfAbsentTx(tx, {
+            docId: existing.doc_id,
+            uid: input.humanOwnerUid,
+            roleNum: ROLE_ADMIN,
+            grantedBy: input.ownerId,
+          })
+          if (memberReconciled) await docMetaRepo.bumpEpochTx(tx, existing.doc_id)
+        }
+        const rows = await tx.query<DocMeta>('SELECT * FROM doc_meta WHERE doc_id = ? LIMIT 1', [existing.doc_id])
+        const meta = rows[0]
+        if (!meta) throw new Error('html doc disappeared after upsert')
+        return {
+          meta,
+          created: false as const,
+          memberReconciled,
+          ...(memberReconciled ? { permissionEpoch: Number(meta.permission_epoch) } : {}),
+        }
+      })
     }
 
+    const existing = await docMetaRepo.getByOctoDocSlug(input.octoDocSlug, input.spaceId)
+    if (existing) return updateExisting(existing)
+
     try {
-      await docMetaRepo.create(input)
+      const meta = await transaction(async (tx) => {
+        await docMetaRepo.createTx(tx, input)
+        if (input.humanOwnerUid && input.humanOwnerUid !== input.ownerId) {
+          await docMemberRepo.upsertDirectTx(tx, {
+            docId: input.docId,
+            uid: input.humanOwnerUid,
+            roleNum: ROLE_ADMIN,
+            grantedBy: input.ownerId,
+          })
+        }
+        const created = await docMetaRepo.getByDocIdTx(tx, input.docId)
+        if (!created) throw new Error('html doc missing after create')
+        return created
+      })
+      return { meta, created: true, memberReconciled: false }
     } catch (err) {
-      // TOCTOU: two concurrent registrations of the same (space, slug) both miss
-      // the SELECT, then race on INSERT. The composite unique key makes the loser
-      // fail with ER_DUP_ENTRY — re-fetch the now-committed row and fall through
-      // to the idempotent UPDATE branch instead of surfacing a 500.
       if (!isDupEntry(err)) throw err
       const raced = await docMetaRepo.getByOctoDocSlug(input.octoDocSlug, input.spaceId)
       if (!raced) throw err
-      // Same P0 re-authorization on the TOCTOU recovery branch: the racing
-      // winner may be another bot's row, so a non-owner loser must be rejected
-      // rather than silently overwriting/reviving it.
-      if (raced.owner_id !== input.createdBy) throw new DocOwnershipError()
-      if (raced.html_idempotency_key_hash != null) {
-        if (raced.status === 0) throw new CanonicalHtmlDeletedError()
-        if (raced.status === 2) throw new CanonicalHtmlArchivedError()
-        throw new CanonicalHtmlLegacyConflictError()
-      }
-      await query(
-        `UPDATE doc_meta
-         SET title = ?, updated_by = ?, status = 1
-         WHERE doc_id = ? AND doc_type = 'html' AND space_id = ?`,
-        [input.title, input.createdBy, raced.doc_id, input.spaceId],
-      )
-      const updated = await docMetaRepo.getByDocId(raced.doc_id)
-      if (!updated) throw new Error('html doc disappeared after upsert')
-      return { meta: updated, created: false }
+      return updateExisting(raced)
     }
-    const created = await docMetaRepo.getByDocId(input.docId)
-    if (!created) throw new Error('html doc missing after create')
-    return { meta: created, created: true }
   },
 
   async createCanonicalHtml(input: CanonicalHtmlInput): Promise<{ meta: DocMeta; created: boolean }> {
@@ -257,23 +258,34 @@ export const docMetaRepo = {
     const existing = await find()
     if (existing) return accept(existing)
     try {
-      await query(
-        `INSERT INTO doc_meta
-           (doc_id, document_name, title, owner_id, space_id, folder_id, doc_type, octo_doc_slug,
-            html_idempotency_key_hash, status, permission_epoch, created_by, updated_by)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
-        [input.docId, input.documentName, input.title, input.ownerId, input.spaceId, input.folderId,
-          'html', input.docId, keyHash, input.createdBy],
-      )
+      const created = await transaction(async (tx) => {
+        await tx.query(
+          `INSERT INTO doc_meta
+             (doc_id, document_name, title, owner_id, space_id, folder_id, doc_type, octo_doc_slug,
+              html_idempotency_key_hash, status, permission_epoch, created_by, updated_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, '')`,
+          [input.docId, input.documentName, input.title, input.ownerId, input.spaceId, input.folderId,
+            'html', input.docId, keyHash, input.createdBy],
+        )
+        if (input.humanOwnerUid && input.humanOwnerUid !== input.ownerId) {
+          await docMemberRepo.upsertDirectTx(tx, {
+            docId: input.docId,
+            uid: input.humanOwnerUid,
+            roleNum: ROLE_ADMIN,
+            grantedBy: input.ownerId,
+          })
+        }
+        const meta = await docMetaRepo.getByDocIdTx(tx, input.docId)
+        if (!meta) throw new Error('canonical html doc missing after create')
+        return meta
+      })
+      return { meta: created, created: true }
     } catch (err) {
       if (!isDupEntry(err)) throw err
       const raced = await find()
       if (!raced) throw err
       return accept(raced)
     }
-    const created = await docMetaRepo.getByDocId(input.docId)
-    if (!created) throw new Error('canonical html doc missing after create')
-    return { meta: created, created: true }
   },
 
   async getByDocId(docId: string): Promise<DocMeta | null> {
@@ -303,16 +315,6 @@ export const docMetaRepo = {
     return rows[0] ?? null
   },
 
-  /** Return two rows at most so a legacy globally ambiguous slug is detected,
-   * never resolved through an arbitrary cross-space LIMIT 1. */
-  async findHtmlBySlug(octoDocSlug: string): Promise<DocMeta[]> {
-    return query<DocMeta>(
-      `SELECT * FROM doc_meta
-       WHERE octo_doc_slug = ?
-       LIMIT 2`,
-      [octoDocSlug],
-    )
-  },
 
   /** Resolve the canonical document_name for a doc_id (§7.3 resolveDocumentName). */
   async resolveDocumentName(docId: string): Promise<string | null> {
@@ -379,20 +381,6 @@ export const docMetaRepo = {
     })
   },
 
-  /** Active-to-deleted CAS: retries never bump the epoch a second time. */
-  async softDeleteActive(docId: string): Promise<{ documentName: string; permissionEpoch: number } | null> {
-    return transaction(async (tx) => {
-      const result = await tx.query('UPDATE doc_meta SET status = 0 WHERE doc_id = ? AND status = 1', [docId])
-      if (Number((result as unknown as { affectedRows?: number }).affectedRows ?? 0) !== 1) return null
-      await docMetaRepo.bumpEpochTx(tx, docId)
-      const rows = await tx.query<{ document_name: string; permission_epoch: number }>(
-        'SELECT document_name, permission_epoch FROM doc_meta WHERE doc_id = ? LIMIT 1',
-        [docId],
-      )
-      const row = rows[0]
-      return row ? { documentName: row.document_name, permissionEpoch: Number(row.permission_epoch) } : null
-    })
-  },
 
   /**
    * List documents the caller can see in a space/folder.

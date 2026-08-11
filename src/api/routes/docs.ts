@@ -125,13 +125,13 @@ async function grantBotOwnerAdmin(req: Request, docId: string, documentName: str
   const uid = req.uid!
   const botOwnerUid = req.botOwnerUid
   if (botOwnerUid && botOwnerUid !== uid) {
-    const changed = await docMemberRepo.upsertDirectIfChanged({
+    await docMemberRepo.upsertDirect({
       docId,
       uid: botOwnerUid,
       roleNum: ROLE_ADMIN,
       grantedBy: uid,
     })
-    if (changed) await bumpEpoch(docId, documentName, botOwnerUid)
+    await bumpEpoch(docId, documentName, botOwnerUid)
   }
 }
 
@@ -155,6 +155,10 @@ export async function createDocHandler(req: Request, res: Response) {
   }
   const folder = typeof folderId === 'string' && folderId !== '' ? folderId : DEFAULT_FOLDER
   const resolvedDocType = typeof docType === 'string' && docType !== '' ? docType : 'doc'
+  if (resolvedDocType !== HTML_DOC_TYPE && idempotencyKey !== undefined) {
+    res.status(400).json({ error: 'idempotencyKey is only valid for html documents' })
+    return
+  }
   if (resolvedDocType === HTML_PPT_DOC_TYPE) {
     // html_ppt (Bento slide-deck) is created ONLY through /api/v1/ppt/** (§3.1 /
     // §5.2), never the legacy /api/v1/docs create path. Reject as wrong-kind so a
@@ -184,8 +188,12 @@ export async function createDocHandler(req: Request, res: Response) {
       res.status(400).json({ error: 'idempotencyKey and octoDocSlug are mutually exclusive' })
       return
     }
-    if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey === '')) {
+    if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.trim() === '')) {
       res.status(400).json({ error: 'idempotencyKey required' })
+      return
+    }
+    if (typeof idempotencyKey === 'string' && idempotencyKey.trim().length > 128) {
+      res.status(400).json({ error: 'idempotencyKey too long' })
       return
     }
     if (idempotencyKey === undefined && (typeof octoDocSlug !== 'string' || octoDocSlug === '')) {
@@ -208,6 +216,7 @@ export async function createDocHandler(req: Request, res: Response) {
     }
     throw err
   }
+  const normalizedIdempotencyKey = typeof idempotencyKey === 'string' ? idempotencyKey.trim() : undefined
   const createInput = {
     docId,
     documentName,
@@ -216,15 +225,29 @@ export async function createDocHandler(req: Request, res: Response) {
     spaceId,
     folderId: folder,
     docType: resolvedDocType,
-    ...(resolvedDocType === HTML_DOC_TYPE ? { octoDocSlug: idempotencyKey !== undefined ? docId : octoDocSlug } : {}),
+    ...(resolvedDocType === HTML_DOC_TYPE ? { octoDocSlug: normalizedIdempotencyKey !== undefined ? docId : octoDocSlug } : {}),
     createdBy: uid,
   }
-  let writeResult
+  let writeResult: {
+    meta: Awaited<ReturnType<typeof docMetaRepo.getByDocId>>
+    created: boolean
+    memberReconciled?: boolean
+    permissionEpoch?: number
+  }
   if (resolvedDocType === HTML_DOC_TYPE) {
     try {
-      writeResult = idempotencyKey !== undefined
-        ? await docMetaRepo.createCanonicalHtml({ ...createInput, octoDocSlug: docId, idempotencyKey })
-        : await docMetaRepo.upsertHtmlByOctoDocSlug({ ...createInput, octoDocSlug })
+      writeResult = normalizedIdempotencyKey !== undefined
+        ? await docMetaRepo.createCanonicalHtml({
+          ...createInput,
+          octoDocSlug: docId,
+          idempotencyKey: normalizedIdempotencyKey,
+          humanOwnerUid: req.botOwnerUid,
+        })
+        : await docMetaRepo.upsertHtmlByOctoDocSlug({
+          ...createInput,
+          octoDocSlug,
+          humanOwnerUid: req.botOwnerUid,
+        })
     } catch (err) {
       if (err instanceof CanonicalHtmlDeletedError) {
         res.status(410).json({ error: 'canonical_document_deleted' })
@@ -249,11 +272,19 @@ export async function createDocHandler(req: Request, res: Response) {
     }
   } else {
     await docMetaRepo.create(createInput)
-    writeResult = { meta: await docMetaRepo.getByDocId(docId), created: true }
+    writeResult = { meta: await docMetaRepo.getByDocId(docId), created: true, memberReconciled: false }
   }
   const meta = writeResult.meta
-  if (meta) {
+  // Fresh and historical legacy membership writes happen in the repository
+  // transaction. Publish only a committed historical reconcile.
+  if (meta && resolvedDocType !== HTML_DOC_TYPE) {
     await grantBotOwnerAdmin(req, meta.doc_id ?? docId, meta.document_name ?? documentName)
+  } else if (meta && normalizedIdempotencyKey === undefined && writeResult.memberReconciled) {
+    await refreshAndPublish(
+      meta.document_name ?? documentName,
+      writeResult.permissionEpoch ?? Number(meta.permission_epoch),
+      req.botOwnerUid,
+    )
   }
 
   const responseDocId = resolvedDocType === HTML_DOC_TYPE ? (meta?.doc_id ?? docId) : docId
@@ -261,6 +292,12 @@ export async function createDocHandler(req: Request, res: Response) {
   const responseSpaceId = resolvedDocType === HTML_DOC_TYPE ? (meta?.space_id ?? spaceId) : spaceId
   const responseFolderId = resolvedDocType === HTML_DOC_TYPE ? (meta?.folder_id ?? folder) : folder
   const responseOwnerId = resolvedDocType === HTML_DOC_TYPE ? (meta?.owner_id ?? uid) : uid
+  // Legacy slug registration historically signals immediately. Canonical HTML
+  // allocation waits for /:docId/published because its body is not durable yet.
+  if (resolvedDocType === HTML_DOC_TYPE && normalizedIdempotencyKey === undefined
+      && config.search.indexEnabled && isSearchIndexedDoc(responseDocumentName)) {
+    void enqueueDocIndex(responseDocumentName)
+  }
   res.status(201).json({
     docId: responseDocId,
     documentName: responseDocumentName,
@@ -270,7 +307,7 @@ export async function createDocHandler(req: Request, res: Response) {
     ownerId: responseOwnerId,
     docType: resolvedDocType,
     ...(resolvedDocType === HTML_DOC_TYPE ? { octoDocSlug: meta?.octo_doc_slug ?? octoDocSlug } : {}),
-    ...(resolvedDocType === HTML_DOC_TYPE ? { created: writeResult.created } : {}),
+    ...(resolvedDocType === HTML_DOC_TYPE ? { created: writeResult.created, publisherUid: uid } : {}),
     // The caller is always admin on this response: a fresh create makes the
     // caller the owner (implicit admin, §4.2), and the idempotent update branch
     // (created:false) is now reachable ONLY by the owning bot — the repo's

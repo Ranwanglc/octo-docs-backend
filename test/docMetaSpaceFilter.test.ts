@@ -10,13 +10,17 @@ vi.mock('../src/db/pool.js', () => ({
 }))
 
 import { docMetaRepo, DocOwnershipError } from '../src/db/repos/docMetaRepo.js'
-import { query } from '../src/db/pool.js'
+import { query, transaction } from '../src/db/pool.js'
 
 const mockQuery = vi.mocked(query)
 
 beforeEach(() => {
   mockQuery.mockReset()
   mockQuery.mockResolvedValue([] as never)
+  vi.mocked(transaction).mockReset().mockImplementation(async (fn) => fn({
+    query: mockQuery,
+    execute: vi.fn(),
+  } as never))
 })
 
 describe('docMetaRepo.listForUser always filters by space (P1 isolation)', () => {

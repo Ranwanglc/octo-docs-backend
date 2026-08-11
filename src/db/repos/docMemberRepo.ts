@@ -66,22 +66,6 @@ export const docMemberRepo = {
     )
   },
 
-  /** Precise direct upsert; true only when the stored membership changed. */
-  async upsertDirectIfChanged(params: {
-    docId: string
-    uid: string
-    roleNum: number
-    grantedBy: string
-  }): Promise<boolean> {
-    const [result] = await getPool().execute(
-      `INSERT INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
-       VALUES (?, ?, ?, ?, ${SOURCE_DIRECT}, '')
-       ON DUPLICATE KEY UPDATE role = VALUES(role), granted_by = VALUES(granted_by),
-                               source = VALUES(source), invite_token = VALUES(invite_token)`,
-      [params.docId, params.uid, params.roleNum, params.grantedBy] as never[],
-    )
-    return (result as unknown as { affectedRows?: number }).affectedRows! > 0
-  },
 
   async remove(docId: string, uid: string): Promise<void> {
     await query('DELETE FROM doc_member WHERE doc_id = ? AND uid = ?', [docId, uid])
@@ -173,5 +157,18 @@ export const docMemberRepo = {
        ON DUPLICATE KEY UPDATE role = VALUES(role), granted_by = VALUES(granted_by)`,
       [params.docId, params.uid, params.roleNum, params.grantedBy],
     )
+  },
+
+  /** Insert a direct member only when no row for (doc_id, uid) exists. */
+  async insertDirectIfAbsentTx(
+    tx: Tx,
+    params: { docId: string; uid: string; roleNum: number; grantedBy: string },
+  ): Promise<boolean> {
+    const result = await tx.execute(
+      `INSERT IGNORE INTO doc_member (doc_id, uid, role, granted_by, source, invite_token)
+       VALUES (?, ?, ?, ?, ${SOURCE_DIRECT}, '')`,
+      [params.docId, params.uid, params.roleNum, params.grantedBy],
+    )
+    return result.affectedRows === 1
   },
 }

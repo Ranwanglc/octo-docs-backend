@@ -50,7 +50,7 @@ vi.mock('../src/db/repos/docMetaRepo.js', () => ({
 }))
 vi.mock('../src/db/repos/docMemberRepo.js', () => ({
   docMemberRepo: {
-    upsertDirectIfChanged: vi.fn(async () => true),
+    upsertDirect: vi.fn(async () => undefined),
   },
 }))
 // Stub the epoch side-effects (Redis publish) — the create path calls bumpEpoch
@@ -78,7 +78,7 @@ import { ROLE_ADMIN } from '../src/permission/role.js'
 import { CanonicalHtmlDeletedError, DocOwnershipError } from '../src/db/repos/docMetaRepo.js'
 import { config } from '../src/config/env.js'
 
-const upsertDirect = vi.mocked(docMemberRepo.upsertDirectIfChanged)
+const upsertDirect = vi.mocked(docMemberRepo.upsertDirect)
 const create = vi.mocked(docMetaRepo.create)
 const upsertHtmlByOctoDocSlug = vi.mocked(docMetaRepo.upsertHtmlByOctoDocSlug)
 const createCanonicalHtml = vi.mocked(docMetaRepo.createCanonicalHtml)
@@ -248,10 +248,15 @@ describe('bot html doc registration', () => {
       body: JSON.stringify({ title: 'First title', docType: 'html', idempotencyKey: 'run-42', mountType: 'group' }),
     })
     expect(good.status).toBe(201)
-    expect(await good.json()).toMatchObject({ docId: 'd_canonical', octoDocSlug: 'd_canonical', created: true })
+    expect(await good.json()).toMatchObject({
+      docId: 'd_canonical', octoDocSlug: 'd_canonical', created: true,
+      publisherUid: 's_tmos_bot', spaceId: 's_1',
+    })
     expect(createCanonicalHtml).toHaveBeenCalledWith(expect.objectContaining({
-      idempotencyKey: 'run-42', ownerId: 's_tmos_bot', spaceId: 's_1', octoDocSlug: expect.stringMatching(/^d_/),
+      idempotencyKey: 'run-42', ownerId: 's_tmos_bot', humanOwnerUid: 'u_human',
+      spaceId: 's_1', octoDocSlug: expect.stringMatching(/^d_/),
     }))
+    expect(upsertDirect).not.toHaveBeenCalled()
 
     const mixed = await fetch(`${base}/v1/bot/docs`, {
       method: 'POST', headers: { authorization: 'Bearer bot-tok', 'content-type': 'application/json' },
@@ -261,7 +266,7 @@ describe('bot html doc registration', () => {
     expect(createCanonicalHtml).toHaveBeenCalledTimes(1)
   })
 
-  it('reconciles owner admin on a canonical retry without enqueueing before content is ready', async () => {
+  it('leaves membership and epoch untouched on a canonical retry without enqueueing before content is ready', async () => {
     ;(config as unknown as { search: { indexEnabled: boolean } }).search.indexEnabled = true
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1', ownerUid: 'u_human' }) }))
     createCanonicalHtml.mockResolvedValue({
@@ -273,13 +278,12 @@ describe('bot html doc registration', () => {
     })
     expect(res.status).toBe(201)
     expect(await res.json()).toMatchObject({ docId: 'd_existing', title: 'Original title', created: false })
-    expect(upsertDirect).toHaveBeenCalledWith(expect.objectContaining({ docId: 'd_existing', uid: 'u_human' }))
-    expect(bumpEpochMock).toHaveBeenCalledTimes(1)
+    expect(upsertDirect).not.toHaveBeenCalled()
+    expect(bumpEpochMock).not.toHaveBeenCalled()
     expect(enqueueDocIndexMock).not.toHaveBeenCalled()
   })
 
-  it('does not bump epoch when owner admin already matches', async () => {
-    upsertDirect.mockResolvedValueOnce(false)
+  it('does not restore or bump an adjusted owner role on canonical replay', async () => {
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1', ownerUid: 'u_human' }) }))
     createCanonicalHtml.mockResolvedValue({ meta: { ...htmlMeta, doc_id: 'd_existing', octo_doc_slug: 'd_existing' }, created: false } as never)
     const res = await fetch(`${base}/v1/bot/docs`, {
@@ -287,28 +291,33 @@ describe('bot html doc registration', () => {
       body: JSON.stringify({ docType: 'html', idempotencyKey: 'same', mountType: 'group' }),
     })
     expect(res.status).toBe(201)
-    expect(upsertDirect).toHaveBeenCalledTimes(1)
+    expect(upsertDirect).not.toHaveBeenCalled()
     expect(bumpEpochMock).not.toHaveBeenCalled()
   })
 
-  it('heals a canonical create whose first owner grant failed', async () => {
-    createCanonicalHtml
-      .mockResolvedValueOnce({ meta: { ...htmlMeta, doc_id: 'd_partial', octo_doc_slug: 'd_partial' }, created: true } as never)
-      .mockResolvedValueOnce({ meta: { ...htmlMeta, doc_id: 'd_partial', octo_doc_slug: 'd_partial' }, created: false } as never)
-    upsertDirect.mockRejectedValueOnce(new Error('grant failed')).mockResolvedValueOnce(true)
-    const request = async () => {
-      const response = mockHandlerRes()
-      await createDocHandler({
-        uid: 's_tmos_bot', spaceId: 's_1', botToken: 'bot', botOwnerUid: 'u_human', params: {}, query: {},
-        body: { docType: 'html', idempotencyKey: 'partial', mountType: 'group' },
-      } as never, response as never)
-      return response
-    }
-    await expect(request()).rejects.toThrow('grant failed')
-    const retry = await request()
-    expect(retry.statusCode).toBe(201)
-    expect(upsertDirect).toHaveBeenCalledTimes(2)
-    expect(bumpEpochMock).toHaveBeenCalledTimes(1)
+  it('does not attempt an out-of-transaction grant for a canonical create', async () => {
+    createCanonicalHtml.mockResolvedValueOnce({ meta: { ...htmlMeta, doc_id: 'd_atomic', octo_doc_slug: 'd_atomic' }, created: true } as never)
+    const response = mockHandlerRes()
+    await createDocHandler({
+      uid: 's_tmos_bot', spaceId: 's_1', botToken: 'bot', botOwnerUid: 'u_human', params: {}, query: {},
+      body: { docType: 'html', idempotencyKey: 'atomic', mountType: 'group' },
+    } as never, response as never)
+    expect(response.statusCode).toBe(201)
+    expect(upsertDirect).not.toHaveBeenCalled()
+    expect(createCanonicalHtml).toHaveBeenCalledWith(expect.objectContaining({ humanOwnerUid: 'u_human' }))
+  })
+
+  it('trims a bounded idempotency key and rejects invalid/non-html uses', async () => {
+    setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1', ownerUid: 'u_human' }) }))
+    createCanonicalHtml.mockResolvedValue({ meta: { ...htmlMeta, doc_id: 'd_trim', octo_doc_slug: 'd_trim' }, created: true } as never)
+    const post = (body: object) => fetch(`${base}/v1/bot/docs`, {
+      method: 'POST', headers: { authorization: 'Bearer bot', 'content-type': 'application/json' }, body: JSON.stringify(body),
+    })
+    expect((await post({ docType: 'html', idempotencyKey: '  key  ', mountType: 'group' })).status).toBe(201)
+    expect(createCanonicalHtml).toHaveBeenLastCalledWith(expect.objectContaining({ idempotencyKey: 'key' }))
+    expect((await post({ docType: 'html', idempotencyKey: '   ', mountType: 'group' })).status).toBe(400)
+    expect((await post({ docType: 'html', idempotencyKey: 'x'.repeat(129), mountType: 'group' })).status).toBe(400)
+    expect((await post({ docType: 'doc', idempotencyKey: 'key' })).status).toBe(400)
   })
 
   it('publishes content by doc_id, optionally syncs title, and reindexes idempotently', async () => {
@@ -355,6 +364,7 @@ describe('bot html doc registration', () => {
   })
 
   it('registers an html doc with docType=html and stores the octo-doc slug', async () => {
+    ;(config as unknown as { search: { indexEnabled: boolean } }).search.indexEnabled = true
     setOctoIdentity(
       stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1', ownerUid: 'u_human' }) }),
     )
@@ -391,14 +401,11 @@ describe('bot html doc registration', () => {
       spaceId: 's_1',
       folderId: 'f_default',
       ownerId: 's_tmos_bot',
+      humanOwnerUid: 'u_human',
     })
     expect(upsertHtmlByOctoDocSlug.mock.calls[0]![0].documentName).toMatch(/^octo:s_1:f_default:html:/)
-    expect(upsertDirect).toHaveBeenCalledWith({
-      docId: 'd_html',
-      uid: 'u_human',
-      roleNum: ROLE_ADMIN,
-      grantedBy: 's_tmos_bot',
-    })
+    expect(upsertDirect).not.toHaveBeenCalled()
+    expect(enqueueDocIndexMock).toHaveBeenCalledWith(htmlMeta.document_name)
   })
 
   it('keeps healing owner admin on the legacy octoDocSlug recovery path (created:false)', async () => {
@@ -409,7 +416,12 @@ describe('bot html doc registration', () => {
     setOctoIdentity(
       stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1', ownerUid: 'u_human' }) }),
     )
-    upsertHtmlByOctoDocSlug.mockResolvedValue({ meta: { ...htmlMeta, title: 'Renamed' }, created: false } as never)
+    upsertHtmlByOctoDocSlug.mockResolvedValue({
+      meta: { ...htmlMeta, title: 'Renamed', permission_epoch: 8 },
+      created: false,
+      memberReconciled: true,
+      permissionEpoch: 8,
+    } as never)
 
     const res = await fetch(`${base}/v1/bot/docs`, {
       method: 'POST',
@@ -430,18 +442,9 @@ describe('bot html doc registration', () => {
       created: false,
     })
     expect(upsertHtmlByOctoDocSlug).toHaveBeenCalledTimes(1)
-    // The heal fires: the human owner admin grant + epoch bump run even though
-    // the row already existed (created:false). Reverting the fix (guarding on
-    // writeResult.created) makes these assertions fail.
-    expect(upsertDirect).toHaveBeenCalledTimes(1)
-    expect(upsertDirect.mock.calls[0]![0]).toMatchObject({
-      docId: 'd_html',
-      uid: 'u_human',
-      roleNum: ROLE_ADMIN,
-      grantedBy: 's_tmos_bot',
-    })
-    expect(bumpEpochMock).toHaveBeenCalledTimes(1)
-    expect(bumpEpochMock.mock.calls[0]![2]).toBe('u_human')
+    expect(upsertDirect).not.toHaveBeenCalled()
+    expect(bumpEpochMock).not.toHaveBeenCalled()
+    expect(refreshAndPublishMock).toHaveBeenCalledWith(htmlMeta.document_name, 8, 'u_human')
   })
 
   it('does not grant on the recovery path when the bot has no distinct human owner (owner == bot)', async () => {
@@ -503,13 +506,8 @@ describe('bot html doc registration', () => {
       ownerId: 's_tmos_bot',
     })
     expect(create).not.toHaveBeenCalled()
-    expect(upsertDirect).toHaveBeenCalledTimes(2)
-    expect(upsertDirect).toHaveBeenLastCalledWith({
-      docId: 'd_html',
-      uid: 'u_human',
-      roleNum: ROLE_ADMIN,
-      grantedBy: 's_tmos_bot',
-    })
+    expect(upsertDirect).not.toHaveBeenCalled()
+    expect(refreshAndPublishMock).not.toHaveBeenCalled()
   })
 
   it.each([

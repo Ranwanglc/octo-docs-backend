@@ -38,6 +38,7 @@ export async function query<T = Row>(sql: string, params: unknown[] = []): Promi
 
 export interface Tx {
   query<T = Row>(sql: string, params?: unknown[]): Promise<T[]>
+  execute(sql: string, params?: unknown[]): Promise<{ affectedRows: number }>
 }
 
 /**
@@ -52,6 +53,10 @@ export async function transaction<R>(fn: (tx: Tx) => Promise<R>): Promise<R> {
       async query<T = Row>(sql: string, params: unknown[] = []): Promise<T[]> {
         const [rows] = await conn.execute(sql, params as never[])
         return rows as T[]
+      },
+      async execute(sql: string, params: unknown[] = []): Promise<{ affectedRows: number }> {
+        const [result] = await conn.execute(sql, params as never[])
+        return result as { affectedRows: number }
       },
     }
     const result = await fn(tx)
