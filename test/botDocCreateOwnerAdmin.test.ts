@@ -341,7 +341,7 @@ describe('bot html doc registration', () => {
     let res = await fetch(`${base}/api/v1/docs/d_html/published`, {
       method: 'POST', headers: { token: 'user', 'X-Space-Id': 's_1', 'content-type': 'application/json' }, body: '{}',
     })
-    expect(res.status).toBe(403)
+    expect(res.status).toBe(404)
     setOctoIdentity(stub({ verifyBot: async () => ({ uid: 's_tmos_bot', spaceId: 's_1' }) }))
     getByDocId.mockResolvedValue({ ...htmlMeta, doc_type: 'doc' } as never)
     res = await fetch(`${base}/v1/bot/docs/d_html/published`, {
