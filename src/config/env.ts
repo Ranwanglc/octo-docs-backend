@@ -29,17 +29,33 @@ function numMin(name: string, fallback: number, min: number): number {
 
 /**
  * Strict TCP-port parser for variables where a typo must NOT silently fall back
- * to "feature off". `num()` accepts -9090 and ' ' (Number(' ') === 0), both of
- * which would leave a `> 0` gate false while the operator believes the feature is
- * enabled. Accepts only the sentinel 0 (explicitly disabled) or 1..65535.
+ * to "feature off". `num()` accepts `-9090` (and `0x2382` / `9.09e3` / `+9090`,
+ * which all coerce to a plausible-looking number), any of which would leave a
+ * `> 0` gate false — or bind a port the operator never wrote — while they believe
+ * the feature is configured as typed.
+ *
+ * Accepts ONLY a plain decimal integer: the sentinel `0` (explicitly disabled)
+ * or `1..65535`. Digits are matched with `/^\d+$/` before any numeric coercion,
+ * so hex, exponent and sign forms are rejected rather than silently reinterpreted.
+ *
+ * Unset and whitespace-only are treated as "not configured" and return the
+ * fallback, consistent with `str()` / `num()` and with how an env file line like
+ * `INTERNAL_HTTP_PORT=` behaves. That is the one non-strict case, and it is
+ * documented as such everywhere it is described.
  *
  * Exported (like parseTrustProxy) so the rule is unit-testable without importing
  * the whole config module under a mutated environment.
  */
 export function parseTcpPort(name: string, raw: string | undefined, fallback: number): number {
   if (raw === undefined || raw.trim() === '') return fallback
-  const n = Number(raw)
-  if (!Number.isInteger(n) || n < 0 || n > 65535) {
+  const trimmed = raw.trim()
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(
+      `Env var ${name} must be a plain decimal 0 (disabled) or a TCP port in 1..65535, got: ${JSON.stringify(raw)} (refusing to run)`,
+    )
+  }
+  const n = Number(trimmed)
+  if (n > 65535) {
     throw new Error(
       `Env var ${name} must be 0 (disabled) or a TCP port in 1..65535, got: ${JSON.stringify(raw)} (refusing to run)`,
     )
@@ -228,9 +244,11 @@ export const config = {
   // because anything already inside the network (a compromised sibling container)
   // can still reach it.
   //
-  // Parsed with numPort (not num) so an operator typo cannot silently disable the
-  // split: -9090 / ' ' / 70000 abort boot instead of quietly falling back to the
-  // single-listener behaviour the operator believes they turned off.
+  // Parsed with numPort (not num) so an operator typo cannot silently change the
+  // split's state: -9090 / 70000 / nope / 0x2382 / 9.09e3 abort boot instead of
+  // quietly disabling it or binding a port that was never written. Unset and
+  // whitespace-only mean "not configured" and keep the documented default (0 =
+  // disabled), matching how every other optional var in this file behaves.
   internalHttpPort: numPort('INTERNAL_HTTP_PORT', 0),
 
   // Bind address for the internal listener. Defaults to all interfaces, which is
@@ -240,6 +258,22 @@ export const config = {
   // 0.0.0.0 makes the internal port immediately host-reachable and the isolation
   // is gone.
   internalHttpHost: str('INTERNAL_HTTP_HOST', '0.0.0.0'),
+
+  // Express `trust proxy` value for the INTERNAL listener only. The internal port
+  // is not fronted by nginx, so it defaults to `false` (see app.ts): honouring
+  // X-Forwarded-For there would let any in-network caller spoof its source IP and
+  // evade the per-IP rate limiter. Set it only when the internal port really is
+  // behind a proxy that rewrites the client address (a service-mesh sidecar) —
+  // otherwise every caller collapses onto one limiter key. Accepts the same forms
+  // as TRUST_PROXY.
+  //
+  // `undefined` (unset) is distinct from any parsed value and is what lets app.ts
+  // apply its own `false` default: parseTrustProxy('') returns 1, which would
+  // silently trust one hop on a port that has none.
+  internalTrustProxy:
+    str('INTERNAL_TRUST_PROXY', '').trim() === ''
+      ? undefined
+      : parseTrustProxy(str('INTERNAL_TRUST_PROXY', '')),
 
   // Express `trust proxy` value. The REST API sits behind nginx, so this must be
   // set for req.ip (and thus the per-IP rate limiter) to see the real client

@@ -36,6 +36,7 @@ vi.mock('../src/permission/resolveRole.js', () => ({
 }))
 
 import { createApp } from '../src/api/app.js'
+import { attachBindGuard } from '../src/api/bindGuard.js'
 import { parseTcpPort } from '../src/config/env.js'
 import { CARD_ACTION_DECIDE_PATH } from '../src/api/routes/cardActionDecide.js'
 import { setOctoIdentity, type OctoIdentity, type OctoUser } from '../src/auth/octoIdentity.js'
@@ -138,15 +139,20 @@ describe('surface split: public listener', () => {
     // A signed-looking blob request (X-Method + X-Signature query params) is
     // claimed by the gateway on the public app, and must NOT be claimed on the
     // internal one — the browser talks to the blob origin directly.
+    //
+    // The public assertion is an exact 403 with the gateway's own body, NOT
+    // `[200,403,404]`: 404 is also what an UNMOUNTED route returns, so accepting
+    // it would let the very regression this test exists to catch (dropping
+    // `servePublic &&` from the gateway mount) pass. ATTACHMENT_DRIVER defaults to
+    // local-hmac, so the gateway is enabled here and rejects a bogus signature
+    // with 403 `invalid_signature` — a body no unmounted path can produce.
     const path = '/attachments/blob/whatever?X-Method=GET&X-Signature=deadbeef'
     const pub = await fetch(`${publicBase}${path}`)
+    expect(pub.status).toBe(403)
+    expect(await pub.json()).toMatchObject({ error: 'invalid_signature' })
+
     const internal = await fetch(`${internalBase}${path}`)
     expect(internal.status).toBe(404) // gateway not mounted on the internal surface
-    // On the public surface the gateway (or the terminal 404 when the local-hmac
-    // driver is off) answers; either way it must not be the internal surface's
-    // behaviour of never having the mount at all. Assert the mount decision, not
-    // the driver config: the gateway rejects a bad signature with 403.
-    expect([200, 403, 404]).toContain(pub.status)
   })
 })
 
@@ -231,20 +237,28 @@ describe('boot-time port validation (config + src/index.ts wiring)', () => {
   // MySQL/Redis. These tests exercise the two pieces that are importable —
   // the strict env parser, and the "a failed second bind must not be swallowed"
   // Node semantics the index.ts error handler relies on.
-  it('rejects a non-port INTERNAL_HTTP_PORT instead of silently disabling the split', () => {
+  it('rejects a non-port INTERNAL_HTTP_PORT instead of silently changing the split state', () => {
     // num() would return -9090 / 0 here, leaving `internalHttpPort > 0` false: the
     // operator sets the variable, boot succeeds, and the split is silently OFF.
-    for (const bad of ['-9090', '70000', '9090.5', 'nope']) {
+    // The hex/exponent/sign forms are worse than that: they coerce to a valid
+    // number, so boot succeeds and binds a port the operator never wrote.
+    for (const bad of ['-9090', '70000', '9090.5', 'nope', '0x2382', '9.09e3', '+9090', '90 90']) {
       expect(() => parseTcpPort('INTERNAL_HTTP_PORT', bad, 0)).toThrow(/INTERNAL_HTTP_PORT/)
     }
-    // unset / empty keep the documented default (disabled); a real port passes.
+    // Unset / whitespace-only mean "not configured" and keep the documented
+    // default, exactly as `INTERNAL_HTTP_PORT=` in an env file behaves. This is
+    // the one intentionally non-strict case; every doc that describes the parser
+    // says so rather than claiming whitespace aborts boot.
     expect(parseTcpPort('INTERNAL_HTTP_PORT', undefined, 0)).toBe(0)
     expect(parseTcpPort('INTERNAL_HTTP_PORT', '  ', 0)).toBe(0)
+    // Plain decimals pass, with or without surrounding whitespace.
     expect(parseTcpPort('INTERNAL_HTTP_PORT', '0', 0)).toBe(0)
     expect(parseTcpPort('INTERNAL_HTTP_PORT', '9090', 0)).toBe(9090)
+    expect(parseTcpPort('INTERNAL_HTTP_PORT', ' 9090 ', 0)).toBe(9090)
+    expect(parseTcpPort('INTERNAL_HTTP_PORT', '65535', 0)).toBe(65535)
   })
 
-  it('a second listener bind failure emits an error event (so index.ts can exit(1))', async () => {
+  it('a second listener bind failure emits an error event (so the guard can exit(1))', async () => {
     // Proves the failure mode is observable via 'error' rather than only via the
     // deliberately non-fatal uncaughtException handler in src/index.ts.
     const blocker = createHttpServer()
@@ -258,5 +272,95 @@ describe('boot-time port validation (config + src/index.ts wiring)', () => {
     expect(err.code).toBe('EADDRINUSE')
     second.close()
     await new Promise<void>((resolve) => blocker.close(() => resolve()))
+  })
+})
+
+// The guard that turns that 'error' event into an exit lives in its own module
+// precisely so it can be tested without live MySQL/Redis (importing src/index.ts
+// needs both). These tests exercise attachBindGuard itself, not Node's semantics.
+describe('attachBindGuard: bind failures are fatal, post-bind socket errors are not', () => {
+  /** Collects the guard's decisions instead of killing the test runner. */
+  function spyHooks() {
+    const exits: number[] = []
+    const logs: string[] = []
+    return {
+      exits,
+      logs,
+      hooks: {
+        exit: ((code: number) => {
+          exits.push(code)
+          // Real process.exit never returns; the guard `return`s right after it,
+          // so a throwing stub is unnecessary and would mask the log assertion.
+          return undefined as never
+        }) as (code: number) => never,
+        logError: (message: string) => {
+          logs.push(message)
+        },
+      },
+    }
+  }
+
+  it('exits(1) when the port is already taken (pre-listening error)', async () => {
+    const blocker = createHttpServer()
+    await new Promise<void>((resolve) => blocker.listen(0, '127.0.0.1', resolve))
+    const { port } = blocker.address() as AddressInfo
+
+    const { exits, logs, hooks } = spyHooks()
+    const guarded = createHttpServer()
+    attachBindGuard(guarded, `test listener :${port}`, hooks)
+    await new Promise<void>((resolve) => {
+      guarded.on('error', () => resolve()) // our own listener just unblocks the await
+      guarded.listen(port, '127.0.0.1')
+    })
+
+    expect(exits).toEqual([1])
+    expect(logs[0]).toContain('failed to bind')
+    guarded.close()
+    await new Promise<void>((resolve) => blocker.close(() => resolve()))
+  })
+
+  it('does NOT exit on an accept-level error after a successful bind, and keeps serving', async () => {
+    // THE REGRESSION THIS FILE EXISTS FOR. `net.Server` routes accept failures to
+    // the same 'error' event as bind failures, for the whole process lifetime:
+    //   function onconnection(err) { if (err) self.emit('error', new ErrnoException(err, 'accept')) }
+    // An unconditional process.exit(1) therefore kills a healthy, already-serving
+    // node on FD exhaustion (EMFILE/ENFILE) and bypasses the graceful shutdown in
+    // index.ts, so in-memory Yjs docs are never flushed. Before the split feature
+    // there was no 'error' listener at all and such an error was non-fatal; that
+    // posture must be preserved.
+    const { exits, logs, hooks } = spyHooks()
+    const app = createApp({ surface: 'all' })
+    const server = new Server(app)
+    attachBindGuard(server, 'test listener', hooks)
+    const base = await listen(server)
+
+    const emfile: NodeJS.ErrnoException = new Error('accept EMFILE')
+    emfile.code = 'EMFILE'
+    emfile.syscall = 'accept'
+    server.emit('error', emfile) // exactly what net.js does on an accept failure
+
+    expect(exits).toEqual([]) // still alive
+    expect(logs.some((m) => m.includes('non-fatal, still serving'))).toBe(true)
+
+    // And it really is still serving.
+    const res = await fetch(`${base}/healthz`)
+    expect(res.status).toBe(200)
+    await new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve())))
+  })
+
+  it('is installed on BOTH listeners, so neither can half-serve', () => {
+    // Guards against the asymmetry that shipped in the first revision: the public
+    // listener's handler was registered outside the INTERNAL_HTTP_PORT block, so
+    // it changed behaviour for every deployment including those with the flag off.
+    // Both listeners must end up with exactly one guarded 'error' handler.
+    for (const surface of ['public', 'internal'] as const) {
+      const server = new Server(createApp({ surface }))
+      const listeningBefore = server.listenerCount('listening')
+      expect(server.listenerCount('error')).toBe(0)
+      attachBindGuard(server, `test ${surface}`, spyHooks().hooks)
+      expect(server.listenerCount('error')).toBe(1)
+      // ...and exactly one added 'listening' hook (the bind/serve phase latch).
+      expect(server.listenerCount('listening')).toBe(listeningBefore + 1)
+    }
   })
 })

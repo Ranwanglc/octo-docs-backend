@@ -63,7 +63,9 @@ ENV NODE_ENV=production
 # 3000 = public REST API, 1234 = Hocuspocus collab WS, 9090 = optional
 # internal-only API (bound only when INTERNAL_HTTP_PORT is set; serves
 # /internal/html). EXPOSE is documentation/intra-network only — never publish
-# 9090 to the host. If a deployment picks a port other than 9090, update this
+# 9090 to the host (caveat: `docker run -P` publishes EVERY EXPOSEd port to an
+# ephemeral host port, so never use -P with this image; deployments use explicit
+# `ports:`/`expose:`). If a deployment picks a port other than 9090, update this
 # line and the compose `expose:` in docs/DEPLOYMENT.md §0 to match.
 EXPOSE 3000 1234 9090
 

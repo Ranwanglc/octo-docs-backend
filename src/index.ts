@@ -18,6 +18,7 @@ import './config/loadEnv.js'
 import { config } from './config/env.js'
 import { createServer, setEpochWatermark } from './collab/server.js'
 import { createApp } from './api/app.js'
+import { attachBindGuard } from './api/bindGuard.js'
 import { epochInvalidateChannel, currentEpoch, invalidateEpochCache, type InvalidateEvent } from './permission/epoch.js'
 import { closePool, query } from './db/pool.js'
 import { assertAppendV1RoleEncoding } from './db/roleEncodingMarker.js'
@@ -104,15 +105,14 @@ async function main(): Promise<void> {
     // eslint-disable-next-line no-console
     console.log(`[octo-docs] REST API listening on :${config.httpPort}`)
   })
-  // A bind failure on the PUBLIC port must kill the process too: the
+  // A bind failure on the PUBLIC port must kill the process: the
   // uncaughtException handler above is deliberately non-fatal, so without this
   // an EADDRINUSE would be logged while the process kept running with no REST
-  // API at all.
-  httpServer.on('error', (err) => {
-    // eslint-disable-next-line no-console
-    console.error(`[octo-docs] REST API failed to bind :${config.httpPort} — refusing to serve:`, err)
-    process.exit(1)
-  })
+  // API at all. Post-bind socket errors (EMFILE/ENFILE at accept) stay
+  // non-fatal — see the long rationale in bindGuard.ts; killing an
+  // already-serving node would also bypass the graceful shutdown below and lose
+  // unflushed Yjs docs.
+  attachBindGuard(httpServer, `REST API :${config.httpPort}`)
 
   // Optional second listener for the internal-only surface (one service, two
   // ports). Disabled unless INTERNAL_HTTP_PORT is set, so an existing deployment
@@ -126,28 +126,23 @@ async function main(): Promise<void> {
   // still runs on it (the split reduces reachability, it does not grant trust).
   let internalServer: Server | undefined
   if (config.internalHttpPort > 0) {
-    const internalApp = createApp({ surface: 'internal' })
+    const internalApp = createApp({ surface: 'internal', trustProxy: config.internalTrustProxy })
     internalServer = internalApp.listen(config.internalHttpPort, config.internalHttpHost, () => {
       // eslint-disable-next-line no-console
       console.log(
         `[octo-docs] Internal API listening on ${config.internalHttpHost}:${config.internalHttpPort}`,
       )
     })
-    // Fail fast instead of half-serving. Without this handler an EADDRINUSE /
-    // EACCES on the internal port is swallowed by the non-fatal
-    // uncaughtException handler above: the process would keep serving the public
-    // surface, /healthz would still answer 200, orchestration would call the
-    // container healthy — and /internal/html would be unreachable on BOTH ports.
-    // A visible crashloop beats a silently degraded pod.
-    internalServer.on('error', (err) => {
-      // eslint-disable-next-line no-console
-      console.error(
-        `[octo-docs] internal listener failed to bind ${config.internalHttpHost}:${config.internalHttpPort} ` +
-          '— refusing to serve a half-split process:',
-        err,
-      )
-      process.exit(1)
-    })
+    // Fail fast instead of half-serving. Without this an EADDRINUSE / EACCES on
+    // the internal port is swallowed by the non-fatal uncaughtException handler
+    // above: the process would keep serving the public surface, /healthz would
+    // still answer 200, orchestration would call the container healthy — and
+    // /internal/html would be unreachable on BOTH ports. A visible crashloop
+    // beats a silently degraded pod. Post-bind socket errors stay non-fatal.
+    attachBindGuard(
+      internalServer,
+      `internal listener ${config.internalHttpHost}:${config.internalHttpPort}`,
+    )
   }
 
   // §9.4 graceful shutdown: flush docs, then release locks, then close infra.
