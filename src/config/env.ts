@@ -317,6 +317,11 @@ export const config = {
   // See src/util/docShareLink.ts.
   webOrigin: str('OCTO_WEB_ORIGIN', ''),
 
+  htmlRegistration: {
+    // Dedicated service credential; browser session tokens never authorize this entry.
+    token: str('OCTO_DOCS_HTML_REGISTRATION_TOKEN', ''),
+  },
+
   octoIdentity: {
     mode: str('OCTO_IDENTITY_MODE', 'http') as OctoIdentityMode,
     serverBaseUrl: str('OCTO_SERVER_BASE_URL', 'http://127.0.0.1:8080'),

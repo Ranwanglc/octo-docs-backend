@@ -33,6 +33,7 @@ import { humanDocSpaceScopeMiddleware } from './middleware/docSpaceScope.js'
 import { createRateLimiter, type RateLimiterOptions } from './middleware/rateLimit.js'
 import { collabTokenRouter } from './routes/collabToken.js'
 import { docsRouter, documentResourceRouter, spaceCollectionRouter } from './routes/docs.js'
+import { internalHtmlRegistrationRouter } from './routes/internalHtmlRegistration.js'
 import { membersRouter } from './routes/members.js'
 import { forwardGrantRouter } from './routes/forwardGrant.js'
 import { accessRequestsRouter } from './routes/accessRequests.js'
@@ -223,6 +224,8 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
   api.use(importRouter) // /:docId/import/docx (server-side .docx -> ProseMirror JSON)
 
   app.use('/api/v1/docs', api)
+
+  app.use('/internal/html', createRateLimiter(opts.rateLimit), internalHtmlRegistrationRouter)
 
   // Bot-facing entry (§ v4.3): the SAME nine metadata routers, re-mounted behind
   // a bot identity middleware at a physically distinct prefix so nginx can route
