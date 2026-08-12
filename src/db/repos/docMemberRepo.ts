@@ -66,7 +66,6 @@ export const docMemberRepo = {
     )
   },
 
-
   async remove(docId: string, uid: string): Promise<void> {
     await query('DELETE FROM doc_member WHERE doc_id = ? AND uid = ?', [docId, uid])
   },

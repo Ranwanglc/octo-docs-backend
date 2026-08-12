@@ -142,7 +142,6 @@ export function createApp(opts: { rateLimit?: RateLimiterOptions; trustProxy?: b
     cardActionDecideHandler,
   )
 
-
   const jsonBodyParser = express.json({ limit: '1mb' })
   app.use((req, res, next) => {
     // The Excalidraw importer needs the exact application/json bytes so it can

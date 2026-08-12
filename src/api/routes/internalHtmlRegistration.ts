@@ -8,7 +8,13 @@ import {
 } from 'express'
 import { config } from '../../config/env.js'
 import { HTML_DOC_TYPE } from '../../db/docType.js'
-import { DocOwnershipError, docMetaRepo } from '../../db/repos/docMetaRepo.js'
+import {
+  CanonicalHtmlArchivedError,
+  CanonicalHtmlDeletedError,
+  CanonicalHtmlLegacyConflictError,
+  DocOwnershipError,
+  docMetaRepo,
+} from '../../db/repos/docMetaRepo.js'
 import { buildHtmlDocumentName, DocumentNameError } from '../../permission/documentName.js'
 import { enqueueDocIndex, isSearchIndexedDoc } from '../../search/docIndexQueue.js'
 import { buildDocShareUrl } from '../../util/docShareLink.js'
@@ -100,6 +106,18 @@ export async function internalHtmlRegistrationHandler(req: Request, res: Respons
       createdBy: owner,
     })
   } catch (err) {
+    if (err instanceof CanonicalHtmlDeletedError) {
+      res.status(410).json({ error: 'canonical_document_deleted' })
+      return
+    }
+    if (err instanceof CanonicalHtmlArchivedError) {
+      res.status(409).json({ error: 'canonical_document_archived' })
+      return
+    }
+    if (err instanceof CanonicalHtmlLegacyConflictError) {
+      res.status(409).json({ error: 'canonical_document_conflict' })
+      return
+    }
     if (err instanceof DocOwnershipError) {
       res.status(403).json({ error: 'forbidden' })
       return

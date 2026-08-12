@@ -69,7 +69,6 @@ Copy `.env.example` to `.env` and adjust. Summary:
 | Var | Purpose | Contract |
 | --- | --- | --- |
 | `HOCUSPOCUS_PORT` / `HTTP_PORT` | WS / REST ports | §2.1 / §8.4 |
-
 | `MYSQL_*` | authoritative store connection | §3.4 |
 | `REDIS_*` (incl. `REDIS_PREFIX`) | broadcast bus / cache / registry | §5 |
 | `COLLAB_TOKEN_SECRET` / `COLLAB_TOKEN_TTL_SECONDS` | collab JWT signing + TTL (5 min) | §4.4 |

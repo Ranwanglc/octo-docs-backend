@@ -315,7 +315,6 @@ export const docMetaRepo = {
     return rows[0] ?? null
   },
 
-
   /** Resolve the canonical document_name for a doc_id (§7.3 resolveDocumentName). */
   async resolveDocumentName(docId: string): Promise<string | null> {
     const rows = await query<{ document_name: string }>(
@@ -380,7 +379,6 @@ export const docMetaRepo = {
       return { documentName: row.document_name, permissionEpoch: Number(row.permission_epoch) }
     })
   },
-
 
   /**
    * List documents the caller can see in a space/folder.

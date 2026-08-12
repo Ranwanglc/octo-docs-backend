@@ -13,6 +13,9 @@ vi.mock('../src/config/env.js', () => ({ config: mockConfig }))
 vi.mock('../src/util/ids.js', () => ({ newDocId }))
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   DocOwnershipError: class DocOwnershipError extends Error {},
+  CanonicalHtmlDeletedError: class CanonicalHtmlDeletedError extends Error {},
+  CanonicalHtmlArchivedError: class CanonicalHtmlArchivedError extends Error {},
+  CanonicalHtmlLegacyConflictError: class CanonicalHtmlLegacyConflictError extends Error {},
   docMetaRepo: { upsertHtmlByOctoDocSlug: vi.fn() },
 }))
 vi.mock('../src/search/docIndexQueue.js', () => ({

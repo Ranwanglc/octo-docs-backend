@@ -107,7 +107,6 @@ export function requireSafeSigningSecret(secret: string): string {
   return secret
 }
 
-
 /**
  * Resolve the public, browser-reachable collab WS URL that collab-token responses
  * hand back as `collabWsUrl` (§4.4). The Hocuspocus WS server lives on its own

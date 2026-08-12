@@ -8,6 +8,9 @@ vi.hoisted(() => {
 
 vi.mock('../src/db/repos/docMetaRepo.js', () => ({
   DocOwnershipError: class DocOwnershipError extends Error {},
+  CanonicalHtmlDeletedError: class CanonicalHtmlDeletedError extends Error {},
+  CanonicalHtmlArchivedError: class CanonicalHtmlArchivedError extends Error {},
+  CanonicalHtmlLegacyConflictError: class CanonicalHtmlLegacyConflictError extends Error {},
   docMetaRepo: {
     upsertHtmlByOctoDocSlug: vi.fn(),
   },
@@ -19,7 +22,12 @@ vi.mock('../src/search/docIndexQueue.js', () => ({
 
 import { createApp } from '../src/api/app.js'
 import { config } from '../src/config/env.js'
-import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
+import {
+  CanonicalHtmlArchivedError,
+  CanonicalHtmlDeletedError,
+  CanonicalHtmlLegacyConflictError,
+  docMetaRepo,
+} from '../src/db/repos/docMetaRepo.js'
 import { enqueueDocIndex } from '../src/search/docIndexQueue.js'
 
 let server: Server
@@ -74,6 +82,19 @@ describe('internal HTML lifecycle through createApp', () => {
     })
     expect(response.status).toBe(500)
     expect(await response.json()).toEqual({ error: 'internal_error' })
+  })
+
+  it.each([
+    ['legacy conflict', new CanonicalHtmlLegacyConflictError(), 409, 'canonical_document_conflict'],
+    ['deleted', new CanonicalHtmlDeletedError(), 410, 'canonical_document_deleted'],
+    ['archived', new CanonicalHtmlArchivedError(), 409, 'canonical_document_archived'],
+  ])('maps a canonical %s during legacy registration', async (_case, error, status, code) => {
+    vi.mocked(docMetaRepo.upsertHtmlByOctoDocSlug).mockRejectedValue(error)
+    const response = await fetch(`${base}/internal/html/register`, {
+      method: 'POST', headers, body: JSON.stringify(body),
+    })
+    expect(response.status).toBe(status)
+    expect(await response.json()).toEqual({ error: code })
   })
 
   it('does not expose a DELETE lifecycle route', async () => {
