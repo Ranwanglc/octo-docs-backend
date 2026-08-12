@@ -13,7 +13,7 @@ optionally a **third** for the internal service-to-service surface:
 | --- | --- | --- |
 | Hocuspocus collaborative WS | `1234` (`HOCUSPOCUS_PORT`) | real-time Yjs sync |
 | REST metadata API | `3000` (`HTTP_PORT`) | docs CRUD, collab-token, invites, attachments |
-| Internal REST API (optional) | `9090` (`INTERNAL_HTTP_PORT`, **off** unless set) | service-to-service only: `/v1/bot/docs`, `/internal/html`, `/api/v1/card-actions/decide` |
+| Internal REST API (optional) | `9090` (`INTERNAL_HTTP_PORT`, **off** unless set) | in-network callers only: `/internal/html` (the html service's doc registration) |
 
 > The listeners are colocated in one process (`src/index.ts`). The REST API
 > is stateless and horizontally scalable; the Hocuspocus nodes are stateful and
@@ -26,41 +26,71 @@ Leaving `INTERNAL_HTTP_PORT` unset (or `0`) keeps the historical behaviour: the
 `HTTP_PORT` listener serves **every** route, exactly as before. Nothing to do for
 an existing deployment.
 
-Setting it (`9090` by convention) splits the routes across the two listeners —
-one service, two ports:
+Setting it (`9090` by convention) moves the routes whose **only** caller is
+another service inside our own network onto the second listener. Today that is
+exactly one prefix — `/internal/html`, which the html service calls with the
+shared internal token:
 
 | Route | `HTTP_PORT` (public) | `INTERNAL_HTTP_PORT` (internal) |
 | --- | --- | --- |
 | `/api/v1/docs/**` (human session token) | ✅ | 404 |
 | `/api/v1/ppt/**` (human session token + `X-Space-Id`) | ✅ | 404 |
 | signed attachment blob gateway (browser talks to it directly) | ✅ | 404 |
-| `/v1/bot/docs/**` (bot token) | 404 | ✅ |
+| `/v1/bot/docs/**` (bot token) | ✅ | 404 |
+| `/api/v1/card-actions/decide` (HMAC octo-server callback) | ✅ | 404 |
 | `/internal/html/**` (shared internal token) | 404 | ✅ |
-| `/api/v1/card-actions/decide` (HMAC octo-server callback) | 404 | ✅ |
 | `/healthz` | ✅ | ✅ |
+
+**Why only `/internal/html`.** A route may move only when every caller is
+provably in-network, because an off-network caller hard-404s the moment the split
+is enabled and often cannot be repointed at all:
+
+- `/internal/html` — sole caller is the html service, a sibling container. Safe.
+- `/v1/bot/docs/**` — **stays public.** It is published through the public gateway
+  today (that is its whole reason for existing: nginx routes `/v1/bot/docs` to
+  docs-backend), and its clients are bot-token holders that are not all ours —
+  including user-visible `/v1/bot/docs/:docId/export/file` links. `verifyBot`
+  remains the authenticator, exactly as today.
+- `/api/v1/card-actions/decide` — **stays public.** The caller is octo-server,
+  which is not necessarily on our network. The authenticator is the HMAC over the
+  raw body plus timestamp freshness plus an idempotency receipt, not network
+  position. (The signed canonical covers the **path** only, so changing host/port
+  never invalidates a signature — see `src/api/routes/cardActionDecide.ts`.)
+
+So enabling the split needs **no** octo-server change and **no** bot-client
+change. If a future service becomes exclusively in-network, move its prefix by
+flipping one `servePublic`/`serveInternal` gate in `src/api/app.ts` and updating
+the table above.
 
 Rules when it is enabled:
 
 - **Never publish the internal port to the host.** In compose use
   `expose: ["9090"]`, never `ports:` — a published port binds `0.0.0.0` and
   undoes the whole change. `EXPOSE` in the Dockerfile is documentation only.
+  Same trap with `network_mode: host`, bare metal, or macvlan: there the bind
+  address is the host's, so set `INTERNAL_HTTP_HOST=127.0.0.1`.
 - **Never add it to nginx.** The public gateway must keep pointing at `3000`
   only; `9090` may not appear in any `upstream`/`server` block.
-- **Callers switch to the in-network address**, e.g. the html service's
-  `DOCS_BACKEND_REGISTER_URL=http://octo-docs-backend:9090/v1/bot/docs`, and
-  octo-server's card-action route URL — both are configuration, no code change.
-  Only move the card-action callback to the internal port if octo-server really
-  is on the same network; otherwise leave it on `3000`.
-- **This is not an authentication boundary.** `verifyBot`, the HMAC signature
-  verify and the internal token stay mandatory on the internal port: anything
-  already inside the network (a compromised sibling container) can still reach
-  it. The split reduces reachability, it does not grant trust.
+- **One caller to repoint:** the html service's
+  `DOCS_BACKEND_REGISTER_URL=http://octo-docs-backend:9090/internal/html/register`.
+  That is configuration, no code change. Nothing else moves — see the table above.
+- **This is not an authentication boundary.** The internal token check stays
+  mandatory on the internal port: anything already inside the network (a
+  compromised sibling container) can still reach it. The split reduces
+  reachability, it does not grant trust.
 - Each listener builds its own rate limiters, so the two surfaces no longer share
   one per-IP budget. The internal listener defaults to `trust proxy = false`
   (it is not behind nginx), so an in-network caller cannot spoof
-  `X-Forwarded-For` to evade throttling.
-- Boot refuses to start if `INTERNAL_HTTP_PORT` equals `HTTP_PORT` (the split
-  would silently collapse back onto one listener).
+  `X-Forwarded-For` to evade throttling. Note the flip side: with `trust proxy`
+  off, all requests from one caller container share a single limiter key, so
+  `RATE_LIMIT_MAX` becomes that caller's aggregate budget — check headroom for
+  html-registration volume before enabling.
+- **Boot fails, loudly, on any port misconfiguration.** `INTERNAL_HTTP_PORT`
+  must differ from both `HTTP_PORT` and `HOCUSPOCUS_PORT` (validated before the
+  first bind), must be `0` or a real port in `1..65535` (`-9090`, `70000` and
+  `nope` abort instead of silently disabling the split), and a bind failure on
+  **either** listener exits the process rather than serving a half-split
+  container that still answers `/healthz` with `200`.
 
 ---
 
@@ -155,7 +185,8 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `HOSTNAME` | no (`octo-docs-local`) | node identity in logs/registry |
 | `HOCUSPOCUS_PORT` | no (`1234`) | WS listener |
 | `HTTP_PORT` | no (`3000`) | REST listener |
-| `INTERNAL_HTTP_PORT` | no (`0` = disabled) | Optional second REST listener serving **only** the service-to-service surface (`/v1/bot/docs`, `/internal/html`, `/api/v1/card-actions/decide`); `HTTP_PORT` then serves **only** the browser-facing surface (`/api/v1/docs`, `/api/v1/ppt`, blob gateway). Each port 404s the other's routes. `0`/unset = one listener serves everything (unchanged behaviour). When set: `expose` it, never `ports:` it, never put it in nginx. Must differ from `HTTP_PORT` or boot fails. Reduces attack surface — it is **not** an auth boundary; every internal route keeps its own verify. |
+| `INTERNAL_HTTP_PORT` | no (`0` = disabled) | Optional second REST listener serving **only** `/internal/html` (the html service's registration endpoint, whose sole caller is a sibling container); `HTTP_PORT` keeps serving every route that has an out-of-network caller — `/api/v1/docs`, `/api/v1/ppt`, the blob gateway, `/v1/bot/docs` and `/api/v1/card-actions/decide`. Each port 404s the other's routes. `0`/unset = one listener serves everything (unchanged behaviour). When set: `expose` it, never `ports:` it, never put it in nginx. Must be `0` or `1..65535` and must differ from both `HTTP_PORT` and `HOCUSPOCUS_PORT`, or boot fails; a bind failure on either listener exits the process. Reduces attack surface — it is **not** an auth boundary; the internal token check still runs. |
+| `INTERNAL_HTTP_HOST` | no (`0.0.0.0`) | Bind address for the internal listener. The default is correct on a compose/k8s bridge network, where an un-published port is only reachable from sibling containers. Set `127.0.0.1` when running with `network_mode: host`, on bare metal, or on macvlan — there `0.0.0.0` makes the internal port host-reachable and the isolation is gone. |
 | `TRUST_PROXY` | **recommended behind a proxy** (`1`) | Express `trust proxy` value. The REST API sits behind nginx, so this must be set for `req.ip` — and the per-IP rate limiter — to resolve the real client from `X-Forwarded-For` instead of the proxy address. `1` = one nginx hop; use the hop count for deeper chains, a preset/CIDR like `loopback`, or `false` when exposed directly. Do **not** use `true` in prod (permissive: clients can spoof `X-Forwarded-For`). |
 | `CORS_ALLOWED_ORIGINS` | **yes when the FE is a different origin** | Comma-separated allowlist of front-end origins permitted to call the REST API and (with the local-hmac driver pointed at this backend origin) the presigned attachment PUT/GET. The browser preflights cross-origin requests with `OPTIONS` and blocks any response whose `Access-Control-Allow-Origin` does not match, so the FE origin **must** be listed or image upload/download fails (XIN-717). Exact origins (`http://192.168.214.189:3010`) or the single value `*` (reflect any origin). Empty (default) allows no cross-origin request. |
 | `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` | no (`60000` / `300`) | Per-IP throttle window and cap on the REST route chains (human `/api/v1/docs` + bot `/v1/bot/docs`); `/healthz` is never throttled. Keyed on the real client IP, so `TRUST_PROXY` must be correct for the deployment. |
@@ -400,7 +431,8 @@ services:
     # Internal s2s surface (only when INTERNAL_HTTP_PORT=9090 is in the env file).
     # `expose` publishes NOTHING to the host: it is reachable only from sibling
     # containers on this network, as http://octo-docs-backend:9090. Moving this
-    # line into `ports:` would bind 0.0.0.0 and defeat the split.
+    # line into `ports:` would bind 0.0.0.0 and defeat the split — as would
+    # `network_mode: host` (there, set INTERNAL_HTTP_HOST=127.0.0.1).
     expose:
       - "9090"
     depends_on:
@@ -457,7 +489,7 @@ container is running:
 | `GET /healthz` | **`200`** `{"ok":true}` | REST process is serving (no-auth liveness) |
 | `GET /api/v1/docs` (no token) | **`401`** `{"error":"unauthorized"}` | auth middleware is wired — a 401 here is **healthy**, not an error |
 | Startup logs | `Hocuspocus listening on :1234` **and** `REST API listening on :3000` | both listeners came up |
-| Startup logs (only with `INTERNAL_HTTP_PORT` set) | `Internal API listening on :9090` | the internal surface came up; absence of this line means the split is **not** active and `/v1/bot/docs` is still on `3000` |
+| Startup logs (only with `INTERNAL_HTTP_PORT` set) | `Internal API listening on 0.0.0.0:9090` | the internal surface came up. This line cannot be missing while the process serves: a bind failure on either listener now exits the process, so absence means the container is not running (check for `refusing to serve` in the logs) |
 | Startup/runtime logs | **0** `ACCESS_DENIED` / no MySQL auth failures | DB credentials are correct (see the 504 trap, §3.1) |
 
 ```bash
@@ -472,13 +504,23 @@ run these from **inside** a sibling container (the internal port is not reachabl
 from the host by design):
 
 ```bash
-# the bot surface moved off the public port
-curl -s -o /dev/null -w '%{http_code}\n' http://octo-docs-backend:3000/v1/bot/docs  # -> 404
-# and answers on the internal one (401 = verifyBot ran, i.e. mounted + still guarded)
-curl -s -o /dev/null -w '%{http_code}\n' http://octo-docs-backend:9090/v1/bot/docs  # -> 401
+# the html registration surface moved off the public port
+curl -s -o /dev/null -w '%{http_code}\n' http://octo-docs-backend:3000/internal/html/register \
+  -X POST -H 'content-type: application/json' -H 'x-internal-token: wrong' -d '{}'   # -> 404
+# and answers on the internal one (401 = the token guard ran, i.e. mounted + still guarded)
+curl -s -o /dev/null -w '%{http_code}\n' http://octo-docs-backend:9090/internal/html/register \
+  -X POST -H 'content-type: application/json' -H 'x-internal-token: wrong' -d '{}'   # -> 401
 # the human surface is NOT on the internal port
 curl -s -o /dev/null -w '%{http_code}\n' http://octo-docs-backend:9090/api/v1/docs  # -> 404
+# the bot surface and the card-action callback did NOT move: still on the public port
+curl -s -o /dev/null -w '%{http_code}\n' http://octo-docs-backend:3000/v1/bot/docs  # -> 401
+curl -s -o /dev/null -w '%{http_code}\n' http://octo-docs-backend:3000/api/v1/card-actions/decide \
+  -X POST -H 'content-type: application/json' -d '{}'                               # -> 401
 ```
+
+The `401`-vs-`404` distinction is the whole assertion: `401` means the route is
+mounted **and** its guard ran; `404` means the route is not mounted on that
+listener at all.
 
 From the host, `curl http://localhost:9090/healthz` must **fail to connect** — if
 it answers, the port was published and the isolation is gone.

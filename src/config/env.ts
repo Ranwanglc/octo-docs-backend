@@ -27,6 +27,30 @@ function numMin(name: string, fallback: number, min: number): number {
   return Math.max(min, n)
 }
 
+/**
+ * Strict TCP-port parser for variables where a typo must NOT silently fall back
+ * to "feature off". `num()` accepts -9090 and ' ' (Number(' ') === 0), both of
+ * which would leave a `> 0` gate false while the operator believes the feature is
+ * enabled. Accepts only the sentinel 0 (explicitly disabled) or 1..65535.
+ *
+ * Exported (like parseTrustProxy) so the rule is unit-testable without importing
+ * the whole config module under a mutated environment.
+ */
+export function parseTcpPort(name: string, raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === '') return fallback
+  const n = Number(raw)
+  if (!Number.isInteger(n) || n < 0 || n > 65535) {
+    throw new Error(
+      `Env var ${name} must be 0 (disabled) or a TCP port in 1..65535, got: ${JSON.stringify(raw)} (refusing to run)`,
+    )
+  }
+  return n
+}
+
+function numPort(name: string, fallback: number): number {
+  return parseTcpPort(name, process.env[name], fallback)
+}
+
 function bool(name: string, fallback: boolean): boolean {
   const v = process.env[name]
   if (v === undefined || v === '') return fallback
@@ -188,18 +212,34 @@ export const config = {
   // 0 (the default) = disabled: one listener serves every surface exactly as
   // before, so an existing deployment that does not set this variable is
   // bit-for-bit unchanged. Set it (conventionally 9090) and the process binds a
-  // SECOND port that serves ONLY the s2s surfaces (`/v1/bot/docs`,
-  // `/internal/html`, the HMAC card-action callback), while `httpPort` keeps
-  // serving ONLY the browser-facing surfaces (`/api/v1/docs`, `/api/v1/ppt`, the
-  // signed attachment blob gateway). Each surface 404s the other's routes.
+  // SECOND port that serves ONLY `/internal/html` — the html service registering
+  // published docs with the shared internal token, whose caller is always inside
+  // our own network — while `httpPort` keeps serving every route that has an
+  // out-of-network caller: `/api/v1/docs`, `/api/v1/ppt`, the signed attachment
+  // blob gateway, `/v1/bot/docs` (published through the public gateway today, and
+  // its bot-token clients are not all in-network) and the HMAC card-action
+  // callback (octo-server may live off our network). Each surface 404s the
+  // other's routes.
   //
   // The internal port MUST NOT be published to the host (compose: `expose`, never
   // `ports:`) and MUST NOT appear in any nginx upstream — that network
   // unreachability is the whole point. It is a reduction of attack surface, NOT a
-  // trust boundary: verifyBot / the HMAC verify / the internal token stay exactly
-  // as strict on this port, because anything already inside the network (a
-  // compromised sibling container) can still reach it.
-  internalHttpPort: num('INTERNAL_HTTP_PORT', 0),
+  // trust boundary: the internal token check stays exactly as strict on this port,
+  // because anything already inside the network (a compromised sibling container)
+  // can still reach it.
+  //
+  // Parsed with numPort (not num) so an operator typo cannot silently disable the
+  // split: -9090 / ' ' / 70000 abort boot instead of quietly falling back to the
+  // single-listener behaviour the operator believes they turned off.
+  internalHttpPort: numPort('INTERNAL_HTTP_PORT', 0),
+
+  // Bind address for the internal listener. Defaults to all interfaces, which is
+  // correct on a compose/k8s bridge network where the port is never published (the
+  // container IP is only reachable in-network). Set it to 127.0.0.1 when the
+  // process runs with `network_mode: host`, on bare metal, or on macvlan — there
+  // 0.0.0.0 makes the internal port immediately host-reachable and the isolation
+  // is gone.
+  internalHttpHost: str('INTERNAL_HTTP_HOST', '0.0.0.0'),
 
   // Express `trust proxy` value. The REST API sits behind nginx, so this must be
   // set for req.ip (and thus the per-IP rate limiter) to see the real client

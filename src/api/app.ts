@@ -25,20 +25,31 @@
  *
  * SURFACE SPLIT (`opts.surface`, one service / two ports)
  * -------------------------------------------------------
- * The mounts above fall into two audiences, and a deployment can now serve them
- * on two DIFFERENT listeners from this one process (see config.internalHttpPort
- * and src/index.ts):
+ * A deployment can serve the mounts above on two DIFFERENT listeners from this
+ * one process (see config.internalHttpPort and src/index.ts):
  *
- *   'public'   — reachable from the browser through nginx:
- *                  /api/v1/docs/**   (human session token)
+ *   'internal' — routes whose ONLY caller is another service inside our own
+ *                network, authenticated by the shared internal token:
+ *                  /internal/html/**   (the html service registering published
+ *                                       docs with docs-backend)
+ *   'public'   — EVERYTHING else, i.e. every route that has a caller outside the
+ *                container network today:
+ *                  /api/v1/docs/**   (human session token, browser via nginx)
  *                  /api/v1/ppt/**    (human session token + X-Space-Id)
  *                  signed attachment blob gateway (browser PUT/GETs the binary
  *                                                  directly at this origin)
- *   'internal' — service-to-service only, never proxied by nginx, never published
- *                to the host:
- *                  /v1/bot/docs/**            (bot token)
- *                  /internal/html/**          (shared internal token)
- *                  /api/v1/card-actions/decide (HMAC-signed octo-server callback)
+ *                  /v1/bot/docs/**   (bot token — published through the public
+ *                                     gateway today; bot clients are not all
+ *                                     in-network, so moving it would 404 them)
+ *                  /api/v1/card-actions/decide (HMAC callback from octo-server,
+ *                                     which is not necessarily on our network)
+ *
+ * The membership rule is deliberately conservative: a route only moves to the
+ * internal surface when EVERY caller is provably in-network. `/v1/bot/docs` and
+ * the card-action callback fail that test (bot-token clients and octo-server can
+ * live off-network), so they stay on the public surface and their own token/HMAC
+ * verify remains the authenticator — which it already is today. Reachability is
+ * only narrowed where it costs no reachable caller.
  *
  * `/healthz` is mounted on BOTH so each listener is independently probeable.
  * 'all' (the default) mounts everything on one listener — the historical
@@ -49,10 +60,10 @@
  * limiters), so the two listeners never share a rate-limit budget. Handler code
  * is untouched: this is purely which routers get mounted where.
  *
- * The split reduces attack surface; it is NOT an authentication boundary. Every
- * internal route keeps its own verify step (verifyBot / HMAC / internal token),
- * because a compromised sibling container inside the same network can still
- * reach the internal port.
+ * The split reduces attack surface; it is NOT an authentication boundary. The
+ * internal route keeps its own verify step (the internal token), because a
+ * compromised sibling container inside the same network can still reach the
+ * internal port.
  */
 import express, { type Express, Router, type Request, type Response, type NextFunction } from 'express'
 import { config } from '../config/env.js'
@@ -180,9 +191,16 @@ export function createApp(
   // compute) or brute-force signatures unthrottled. It gets its own limiter
   // instance so its budget is independent of the blob gateway's above.
   //
-  // Internal surface: octo-server calls this server-to-server, never a browser,
-  // so it lives on the internal listener when the two-port split is enabled.
-  if (serveInternal) {
+  // PUBLIC surface (deliberate — do not "move it inside"): the caller is
+  // octo-server, which is NOT necessarily deployed on our container network. If
+  // this route were internal-only, enabling the split would 404 every 同意/拒绝
+  // tap in any cross-network topology. The authenticator here is the HMAC over
+  // the raw body + timestamp freshness + an idempotency receipt — not network
+  // position — and the route is already publicly reachable today, so keeping it
+  // public is not a posture regression. The signed canonical covers the PATH
+  // only (see cardActionDecide.ts), so repointing host/port never invalidates a
+  // signature either way.
+  if (servePublic) {
     const cardActionLimiter = createRateLimiter(opts.rateLimit)
     app.post(
       CARD_ACTION_DECIDE_PATH,
@@ -311,8 +329,15 @@ export function createApp(
   botApi.use(exportRouter) // /v1/bot/docs/:docId/export/file?format=... and legacy PDF
   botApi.use(boardExportRouter) // /v1/bot/docs/:docId/export (whiteboard PNG/SVG, W3)
   botApi.use(importRouter) // /v1/bot/docs/:docId/import/{docx|markdown|xlsx}
-  // Internal surface: bot-token service-to-service traffic only.
-  if (serveInternal) app.use('/v1/bot/docs', botApi)
+  // PUBLIC surface (deliberate): this prefix is published through the public
+  // gateway today — that is its entire reason for existing (see the comment
+  // above: nginx routes /v1/bot/docs -> docs-backend). Its clients are bot-token
+  // holders that are not all in-network (octo-server, bot integrations, and the
+  // user-visible /v1/bot/docs/:docId/export/file links), and an off-network one
+  // cannot be repointed at all. Moving it behind the internal port would hard-404
+  // every such caller the moment the split is enabled, so it stays public and
+  // verifyBot remains the authenticator — exactly as it is today.
+  if (servePublic) app.use('/v1/bot/docs', botApi)
 
   // PPT contract surface (§3 / §4). Mounted as its OWN router so `/api/v1/ppt/**`
   // uses the C-style `{data}`/`{error}` envelope and error enum, while the legacy

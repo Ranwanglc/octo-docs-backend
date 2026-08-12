@@ -46,6 +46,24 @@ async function main(): Promise<void> {
     query: (sql, params) => query<Record<string, unknown>>(sql, params),
   })
 
+  // Validate every port BEFORE binding anything, so a misconfiguration is a boot
+  // failure with an actionable message rather than a raw EADDRINUSE after two
+  // sockets are already up. The internal port must collide with NEITHER the
+  // public REST port nor the Hocuspocus port.
+  if (config.internalHttpPort > 0) {
+    const clash: Array<[string, number]> = [
+      ['HTTP_PORT', config.httpPort],
+      ['HOCUSPOCUS_PORT', config.hocuspocusPort],
+    ].filter(([, port]) => port === config.internalHttpPort) as Array<[string, number]>
+    if (clash.length > 0) {
+      throw new Error(
+        `INTERNAL_HTTP_PORT (${config.internalHttpPort}) must differ from ` +
+          clash.map(([name, port]) => `${name} (${port})`).join(' and ') +
+          ' (refusing to run: the two-port split would silently collapse onto one listener)',
+      )
+    }
+  }
+
   const hocuspocus = createServer()
 
   // Subscribe to epoch invalidation events (§4.5 step 3). On an event we drop
@@ -86,28 +104,49 @@ async function main(): Promise<void> {
     // eslint-disable-next-line no-console
     console.log(`[octo-docs] REST API listening on :${config.httpPort}`)
   })
+  // A bind failure on the PUBLIC port must kill the process too: the
+  // uncaughtException handler above is deliberately non-fatal, so without this
+  // an EADDRINUSE would be logged while the process kept running with no REST
+  // API at all.
+  httpServer.on('error', (err) => {
+    // eslint-disable-next-line no-console
+    console.error(`[octo-docs] REST API failed to bind :${config.httpPort} — refusing to serve:`, err)
+    process.exit(1)
+  })
 
-  // Optional second listener for the service-to-service surface (one service,
-  // two ports). Disabled unless INTERNAL_HTTP_PORT is set, so an existing
-  // deployment keeps a single all-surfaces listener exactly as before.
+  // Optional second listener for the internal-only surface (one service, two
+  // ports). Disabled unless INTERNAL_HTTP_PORT is set, so an existing deployment
+  // keeps a single all-surfaces listener exactly as before.
   //
-  // When enabled, `httpPort` above serves ONLY the browser-facing routes and this
-  // port serves ONLY /v1/bot/docs + /internal/html + the HMAC card-action
-  // callback. This port must never be published to the host or added to an nginx
-  // upstream; every route on it still runs its own auth verify (the split reduces
-  // reachability, it does not grant trust).
+  // When enabled, this port serves ONLY /internal/html (the html service
+  // registering published docs) and `httpPort` keeps serving every route that has
+  // an out-of-network caller — the human API, the PPT surface, the blob gateway,
+  // /v1/bot/docs and the HMAC card-action callback. This port must never be
+  // published to the host or added to an nginx upstream; the internal token check
+  // still runs on it (the split reduces reachability, it does not grant trust).
   let internalServer: Server | undefined
   if (config.internalHttpPort > 0) {
-    if (config.internalHttpPort === config.httpPort) {
-      throw new Error(
-        `INTERNAL_HTTP_PORT (${config.internalHttpPort}) must differ from HTTP_PORT (${config.httpPort}) ` +
-          '(refusing to run: the two-port split would silently collapse onto one listener)',
-      )
-    }
     const internalApp = createApp({ surface: 'internal' })
-    internalServer = internalApp.listen(config.internalHttpPort, () => {
+    internalServer = internalApp.listen(config.internalHttpPort, config.internalHttpHost, () => {
       // eslint-disable-next-line no-console
-      console.log(`[octo-docs] Internal API listening on :${config.internalHttpPort}`)
+      console.log(
+        `[octo-docs] Internal API listening on ${config.internalHttpHost}:${config.internalHttpPort}`,
+      )
+    })
+    // Fail fast instead of half-serving. Without this handler an EADDRINUSE /
+    // EACCES on the internal port is swallowed by the non-fatal
+    // uncaughtException handler above: the process would keep serving the public
+    // surface, /healthz would still answer 200, orchestration would call the
+    // container healthy — and /internal/html would be unreachable on BOTH ports.
+    // A visible crashloop beats a silently degraded pod.
+    internalServer.on('error', (err) => {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[octo-docs] internal listener failed to bind ${config.internalHttpHost}:${config.internalHttpPort} ` +
+          '— refusing to serve a half-split process:',
+        err,
+      )
+      process.exit(1)
     })
   }
 
