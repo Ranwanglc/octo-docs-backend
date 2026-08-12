@@ -71,9 +71,25 @@ Rules when it is enabled:
   address is the host's, so set `INTERNAL_HTTP_HOST=127.0.0.1`.
 - **Never add it to nginx.** The public gateway must keep pointing at `3000`
   only; `9090` may not appear in any `upstream`/`server` block.
-- **One caller to repoint:** the html service's
-  `DOCS_BACKEND_REGISTER_URL=http://octo-docs-backend:9090/internal/html/register`.
-  That is configuration, no code change. Nothing else moves — see the table above.
+- **One caller to repoint, and it needs its own variable.** The html service must
+  set a *second*, dedicated variable for the internal endpoint and keep the
+  existing one pointed at the public port:
+
+  ```
+  DOCS_BACKEND_REGISTER_URL=http://octo-docs-backend:3000/v1/bot/docs
+  DOCS_BACKEND_INTERNAL_REGISTER_URL=http://octo-docs-backend:9090/internal/html/register
+  ```
+
+  Do **not** simply repoint `DOCS_BACKEND_REGISTER_URL` at `9090`. In
+  octo-docs-html that one variable is the base for **three** bot-face calls
+  (`POST /v1/bot/docs`, `PATCH`/`DELETE /v1/bot/docs/octo-doc/:slug`) *and* the
+  derivation source for the internal endpoint (it strips the `/v1/bot/docs`
+  suffix). Moving it to the internal port 404s bot register/rename/delete;
+  leaving it alone 404s user-publish registration. The dedicated variable is the
+  only configuration that satisfies both. Requires
+  Mininglamp-OSS/octo-docs-html#37; with an octo-docs-html build that predates it,
+  `INTERNAL_HTTP_PORT` cannot be enabled without breaking one of the two paths.
+  Nothing else moves — see the table above.
 - **This is not an authentication boundary.** The internal token check stays
   mandatory on the internal port: anything already inside the network (a
   compromised sibling container) can still reach it. The split reduces
