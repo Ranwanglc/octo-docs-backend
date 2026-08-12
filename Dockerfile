@@ -60,6 +60,9 @@ COPY migrations ./migrations
 RUN npm run build
 
 ENV NODE_ENV=production
-EXPOSE 3000 1234
+# 3000 = public REST API, 1234 = Hocuspocus collab WS, 9090 = optional
+# internal-only s2s API (bound only when INTERNAL_HTTP_PORT is set). EXPOSE is
+# documentation/intra-network only — never publish 9090 to the host.
+EXPOSE 3000 1234 9090
 
 CMD ["node", "dist/index.js"]

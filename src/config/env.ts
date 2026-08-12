@@ -183,6 +183,24 @@ export const config = {
   hocuspocusPort: num('HOCUSPOCUS_PORT', 1234),
   httpPort: num('HTTP_PORT', 3000),
 
+  // Second, INTERNAL-ONLY HTTP listener (service-to-service surface split).
+  //
+  // 0 (the default) = disabled: one listener serves every surface exactly as
+  // before, so an existing deployment that does not set this variable is
+  // bit-for-bit unchanged. Set it (conventionally 9090) and the process binds a
+  // SECOND port that serves ONLY the s2s surfaces (`/v1/bot/docs`,
+  // `/internal/html`, the HMAC card-action callback), while `httpPort` keeps
+  // serving ONLY the browser-facing surfaces (`/api/v1/docs`, `/api/v1/ppt`, the
+  // signed attachment blob gateway). Each surface 404s the other's routes.
+  //
+  // The internal port MUST NOT be published to the host (compose: `expose`, never
+  // `ports:`) and MUST NOT appear in any nginx upstream — that network
+  // unreachability is the whole point. It is a reduction of attack surface, NOT a
+  // trust boundary: verifyBot / the HMAC verify / the internal token stay exactly
+  // as strict on this port, because anything already inside the network (a
+  // compromised sibling container) can still reach it.
+  internalHttpPort: num('INTERNAL_HTTP_PORT', 0),
+
   // Express `trust proxy` value. The REST API sits behind nginx, so this must be
   // set for req.ip (and thus the per-IP rate limiter) to see the real client
   // rather than the proxy. Defaults to 1 (one nginx hop); see parseTrustProxy.

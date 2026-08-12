@@ -6,17 +6,61 @@ development and the application architecture see the top-level
 [`README.md`](../README.md); this document covers the production/staging
 container lifecycle.
 
-The service is a single process that exposes **two** listeners:
+The service is a single process that exposes **two** listeners by default, and
+optionally a **third** for the internal service-to-service surface:
 
 | Listener | Default port | Purpose |
 | --- | --- | --- |
 | Hocuspocus collaborative WS | `1234` (`HOCUSPOCUS_PORT`) | real-time Yjs sync |
 | REST metadata API | `3000` (`HTTP_PORT`) | docs CRUD, collab-token, invites, attachments |
+| Internal REST API (optional) | `9090` (`INTERNAL_HTTP_PORT`, **off** unless set) | service-to-service only: `/v1/bot/docs`, `/internal/html`, `/api/v1/card-actions/decide` |
 
-> The two listeners are colocated in one process (`src/index.ts`). The REST API
+> The listeners are colocated in one process (`src/index.ts`). The REST API
 > is stateless and horizontally scalable; the Hocuspocus nodes are stateful and
 > documentName-affinity routed. They can be split into separate deployables
 > later — this guide assumes the colocated process the image ships today.
+
+### Internal/public surface split (`INTERNAL_HTTP_PORT`)
+
+Leaving `INTERNAL_HTTP_PORT` unset (or `0`) keeps the historical behaviour: the
+`HTTP_PORT` listener serves **every** route, exactly as before. Nothing to do for
+an existing deployment.
+
+Setting it (`9090` by convention) splits the routes across the two listeners —
+one service, two ports:
+
+| Route | `HTTP_PORT` (public) | `INTERNAL_HTTP_PORT` (internal) |
+| --- | --- | --- |
+| `/api/v1/docs/**` (human session token) | ✅ | 404 |
+| `/api/v1/ppt/**` (human session token + `X-Space-Id`) | ✅ | 404 |
+| signed attachment blob gateway (browser talks to it directly) | ✅ | 404 |
+| `/v1/bot/docs/**` (bot token) | 404 | ✅ |
+| `/internal/html/**` (shared internal token) | 404 | ✅ |
+| `/api/v1/card-actions/decide` (HMAC octo-server callback) | 404 | ✅ |
+| `/healthz` | ✅ | ✅ |
+
+Rules when it is enabled:
+
+- **Never publish the internal port to the host.** In compose use
+  `expose: ["9090"]`, never `ports:` — a published port binds `0.0.0.0` and
+  undoes the whole change. `EXPOSE` in the Dockerfile is documentation only.
+- **Never add it to nginx.** The public gateway must keep pointing at `3000`
+  only; `9090` may not appear in any `upstream`/`server` block.
+- **Callers switch to the in-network address**, e.g. the html service's
+  `DOCS_BACKEND_REGISTER_URL=http://octo-docs-backend:9090/v1/bot/docs`, and
+  octo-server's card-action route URL — both are configuration, no code change.
+  Only move the card-action callback to the internal port if octo-server really
+  is on the same network; otherwise leave it on `3000`.
+- **This is not an authentication boundary.** `verifyBot`, the HMAC signature
+  verify and the internal token stay mandatory on the internal port: anything
+  already inside the network (a compromised sibling container) can still reach
+  it. The split reduces reachability, it does not grant trust.
+- Each listener builds its own rate limiters, so the two surfaces no longer share
+  one per-IP budget. The internal listener defaults to `trust proxy = false`
+  (it is not behind nginx), so an in-network caller cannot spoof
+  `X-Forwarded-For` to evade throttling.
+- Boot refuses to start if `INTERNAL_HTTP_PORT` equals `HTTP_PORT` (the split
+  would silently collapse back onto one listener).
 
 ---
 
@@ -25,7 +69,8 @@ The service is a single process that exposes **two** listeners:
 The repository ships a single-stage [`Dockerfile`](../Dockerfile) based on
 `node:22-alpine`. It runs `npm ci`, compiles TypeScript with `npm run build`
 (emitting `dist/`), sets `NODE_ENV=production`, and starts `node dist/index.js`.
-It `EXPOSE`s both `3000` and `1234`.
+It `EXPOSE`s `3000`, `1234` and `9090` (the last one is only bound when
+`INTERNAL_HTTP_PORT` is set, and must never be published to the host).
 
 ### Build command
 
@@ -90,7 +135,9 @@ Notes:
   Production attachment delivery needs a real S3-compatible backend
   (MinIO or COS), selected with `ATTACHMENT_DRIVER=s3` (see §3.3).
 - Exposed ports: **WS `1234`** and **REST `3000`**. Publish both, or front them
-  with a gateway that routes WS upgrades to `1234` and REST to `3000`.
+  with a gateway that routes WS upgrades to `1234` and REST to `3000`. If you
+  enable `INTERNAL_HTTP_PORT`, that port is **in-network only** — do not publish
+  it and do not proxy it (see §0).
 
 ---
 
@@ -108,6 +155,7 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `HOSTNAME` | no (`octo-docs-local`) | node identity in logs/registry |
 | `HOCUSPOCUS_PORT` | no (`1234`) | WS listener |
 | `HTTP_PORT` | no (`3000`) | REST listener |
+| `INTERNAL_HTTP_PORT` | no (`0` = disabled) | Optional second REST listener serving **only** the service-to-service surface (`/v1/bot/docs`, `/internal/html`, `/api/v1/card-actions/decide`); `HTTP_PORT` then serves **only** the browser-facing surface (`/api/v1/docs`, `/api/v1/ppt`, blob gateway). Each port 404s the other's routes. `0`/unset = one listener serves everything (unchanged behaviour). When set: `expose` it, never `ports:` it, never put it in nginx. Must differ from `HTTP_PORT` or boot fails. Reduces attack surface — it is **not** an auth boundary; every internal route keeps its own verify. |
 | `TRUST_PROXY` | **recommended behind a proxy** (`1`) | Express `trust proxy` value. The REST API sits behind nginx, so this must be set for `req.ip` — and the per-IP rate limiter — to resolve the real client from `X-Forwarded-For` instead of the proxy address. `1` = one nginx hop; use the hop count for deeper chains, a preset/CIDR like `loopback`, or `false` when exposed directly. Do **not** use `true` in prod (permissive: clients can spoof `X-Forwarded-For`). |
 | `CORS_ALLOWED_ORIGINS` | **yes when the FE is a different origin** | Comma-separated allowlist of front-end origins permitted to call the REST API and (with the local-hmac driver pointed at this backend origin) the presigned attachment PUT/GET. The browser preflights cross-origin requests with `OPTIONS` and blocks any response whose `Access-Control-Allow-Origin` does not match, so the FE origin **must** be listed or image upload/download fails (XIN-717). Exact origins (`http://192.168.214.189:3010`) or the single value `*` (reflect any origin). Empty (default) allows no cross-origin request. |
 | `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` | no (`60000` / `300`) | Per-IP throttle window and cap on the REST route chains (human `/api/v1/docs` + bot `/v1/bot/docs`); `/healthz` is never throttled. Keyed on the real client IP, so `TRUST_PROXY` must be correct for the deployment. |
@@ -347,8 +395,14 @@ services:
     image: octo-docs-backend:cos-0ce1333
     env_file: ./octo-docs-backend.env
     ports:
-      - "3000:3000"   # REST
+      - "3000:3000"   # REST (public surface, behind nginx)
       - "1234:1234"   # Hocuspocus WS
+    # Internal s2s surface (only when INTERNAL_HTTP_PORT=9090 is in the env file).
+    # `expose` publishes NOTHING to the host: it is reachable only from sibling
+    # containers on this network, as http://octo-docs-backend:9090. Moving this
+    # line into `ports:` would bind 0.0.0.0 and defeat the split.
+    expose:
+      - "9090"
     depends_on:
       - mysql
       - redis
@@ -403,6 +457,7 @@ container is running:
 | `GET /healthz` | **`200`** `{"ok":true}` | REST process is serving (no-auth liveness) |
 | `GET /api/v1/docs` (no token) | **`401`** `{"error":"unauthorized"}` | auth middleware is wired — a 401 here is **healthy**, not an error |
 | Startup logs | `Hocuspocus listening on :1234` **and** `REST API listening on :3000` | both listeners came up |
+| Startup logs (only with `INTERNAL_HTTP_PORT` set) | `Internal API listening on :9090` | the internal surface came up; absence of this line means the split is **not** active and `/v1/bot/docs` is still on `3000` |
 | Startup/runtime logs | **0** `ACCESS_DENIED` / no MySQL auth failures | DB credentials are correct (see the 504 trap, §3.1) |
 
 ```bash
@@ -411,6 +466,22 @@ curl -fsS http://localhost:3000/healthz
 # auth wired (401 is the success condition here)
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/api/v1/docs   # -> 401
 ```
+
+With `INTERNAL_HTTP_PORT=9090` enabled, also verify the split actually holds —
+run these from **inside** a sibling container (the internal port is not reachable
+from the host by design):
+
+```bash
+# the bot surface moved off the public port
+curl -s -o /dev/null -w '%{http_code}\n' http://octo-docs-backend:3000/v1/bot/docs  # -> 404
+# and answers on the internal one (401 = verifyBot ran, i.e. mounted + still guarded)
+curl -s -o /dev/null -w '%{http_code}\n' http://octo-docs-backend:9090/v1/bot/docs  # -> 401
+# the human surface is NOT on the internal port
+curl -s -o /dev/null -w '%{http_code}\n' http://octo-docs-backend:9090/api/v1/docs  # -> 404
+```
+
+From the host, `curl http://localhost:9090/healthz` must **fail to connect** — if
+it answers, the port was published and the isolation is gone.
 
 A `200` on `/healthz` together with a `401` on `/api/v1/docs` and both
 "listening" log lines is the green state. A REST endpoint hanging (no response →

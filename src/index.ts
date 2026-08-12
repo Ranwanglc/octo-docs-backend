@@ -12,6 +12,7 @@
  * scaffold.
  */
 import { Redis } from 'ioredis'
+import type { Server } from 'node:http'
 // B3: load .env before config/env.js is evaluated (must be the first import).
 import './config/loadEnv.js'
 import { config } from './config/env.js'
@@ -80,11 +81,35 @@ async function main(): Promise<void> {
   // eslint-disable-next-line no-console
   console.log(`[octo-docs] Hocuspocus listening on :${config.hocuspocusPort}`)
 
-  const app = createApp()
+  const app = createApp({ surface: config.internalHttpPort > 0 ? 'public' : 'all' })
   const httpServer = app.listen(config.httpPort, () => {
     // eslint-disable-next-line no-console
     console.log(`[octo-docs] REST API listening on :${config.httpPort}`)
   })
+
+  // Optional second listener for the service-to-service surface (one service,
+  // two ports). Disabled unless INTERNAL_HTTP_PORT is set, so an existing
+  // deployment keeps a single all-surfaces listener exactly as before.
+  //
+  // When enabled, `httpPort` above serves ONLY the browser-facing routes and this
+  // port serves ONLY /v1/bot/docs + /internal/html + the HMAC card-action
+  // callback. This port must never be published to the host or added to an nginx
+  // upstream; every route on it still runs its own auth verify (the split reduces
+  // reachability, it does not grant trust).
+  let internalServer: Server | undefined
+  if (config.internalHttpPort > 0) {
+    if (config.internalHttpPort === config.httpPort) {
+      throw new Error(
+        `INTERNAL_HTTP_PORT (${config.internalHttpPort}) must differ from HTTP_PORT (${config.httpPort}) ` +
+          '(refusing to run: the two-port split would silently collapse onto one listener)',
+      )
+    }
+    const internalApp = createApp({ surface: 'internal' })
+    internalServer = internalApp.listen(config.internalHttpPort, () => {
+      // eslint-disable-next-line no-console
+      console.log(`[octo-docs] Internal API listening on :${config.internalHttpPort}`)
+    })
+  }
 
   // §9.4 graceful shutdown: flush docs, then release locks, then close infra.
   const shutdown = async (signal: string): Promise<void> => {
@@ -95,6 +120,7 @@ async function main(): Promise<void> {
       // TODO(§5.3 / §9.4): releaseAllDocumentLocks() so a takeover node can
       // become primary writer immediately without waiting for the lock TTL.
       httpServer.close()
+      internalServer?.close()
       sub.disconnect()
       await closeRedis()
       await closeKafkaProducer()
