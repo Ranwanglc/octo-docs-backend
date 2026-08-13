@@ -46,6 +46,33 @@ describe('collab token sign/verify (§4.4)', () => {
     expect(() => verifyCollabToken('not-a-jwt')).toThrow()
   })
 
+  it('rejects PPT relay audience and PPT document names on the legacy verifier', () => {
+    const pptAud = jwt.sign(
+      {
+        uid: 'u_1',
+        documentName: 'octo:s:f:ppt:d_ppt',
+        role: 'admin',
+        permission_epoch: 0,
+        kind: 'html_ppt',
+      },
+      config.collabToken.secret,
+      { algorithm: 'HS256', audience: 'ppt-relay' },
+    )
+    expect(() => verifyCollabToken(pptAud)).toThrow(/audience|ppt/i)
+
+    const noAudPptDoc = jwt.sign(
+      {
+        uid: 'u_1',
+        documentName: 'octo:s:f:ppt:d_ppt',
+        role: 'writer',
+        permission_epoch: 0,
+      },
+      config.collabToken.secret,
+      { algorithm: 'HS256' },
+    )
+    expect(() => verifyCollabToken(noAudPptDoc)).toThrow(/ppt/i)
+  })
+
   it('round-trips a commenter claim', () => {
     const result = signCollabToken({
       uid: 'u_commenter', documentName: 'octo:s:f:d', role: 'commenter', permission_epoch: 4,
