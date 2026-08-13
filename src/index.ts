@@ -6,10 +6,16 @@
  * (§4.5 step 3) to refresh the per-node epoch watermark, and a SIGTERM graceful
  * shutdown that flushes documents and releases locks (§9.4).
  *
- * NOTE: In production these can be separate deployables — the Meta API is
- * stateless and horizontally scalable, while Hocuspocus nodes are stateful and
- * documentName-affinity routed (§9.1). They are colocated here for a runnable
- * scaffold.
+ * NOTE: In production the Hocuspocus WS and the REST Meta API can be separate
+ * deployables. The REST Meta API is stateless for its request/response endpoints,
+ * but the PPT relay attached to it (below) keeps a PROCESS-LOCAL room registry
+ * (live sockets, per-room seq/budget state) and a Redis-backed single-use ticket
+ * store. For THIS round the committed topology is SINGLE-REPLICA: deploy exactly
+ * one REST/PPT-relay replica per environment (see DEPLOYMENT.md). The earlier
+ * docId-affinity routing note is retracted — horizontal REST scaling can be
+ * revisited only after the relay grows an explicit shared transport or affinity
+ * design; until then a second replica would split a deck's room state and is not
+ * supported. The two listeners are colocated here for a runnable scaffold.
  */
 import { Redis } from 'ioredis'
 import type { Server } from 'node:http'
@@ -19,6 +25,7 @@ import { config } from './config/env.js'
 import { createServer, setEpochWatermark } from './collab/server.js'
 import { createApp } from './api/app.js'
 import { attachBindGuard } from './api/bindGuard.js'
+import { createPptRelay } from './ppt/relay/index.js'
 import { epochInvalidateChannel, currentEpoch, invalidateEpochCache, type InvalidateEvent } from './permission/epoch.js'
 import { closePool, query } from './db/pool.js'
 import { assertAppendV1RoleEncoding } from './db/roleEncodingMarker.js'
@@ -67,6 +74,18 @@ async function main(): Promise<void> {
 
   const hocuspocus = createServer()
 
+  // R4-B1: construct the Bento-frame PPT relay BEFORE the epoch-invalidation
+  // subscriber below — `handleInvalidate` closes over `pptRelay`, so creating the
+  // relay after wiring `sub.on('message', ...)` left a temporal-dead-zone window
+  // where an invalidation arriving between subscribe and relay-construction would
+  // throw a ReferenceError (XIN-1693 P2-g). It is ATTACHED to the REST HTTP server
+  // further below, once that server exists — and ONLY when `config.ppt.relay.enabled`
+  // is true (default false). While disabled the relay is constructed but never
+  // attached, so `applyEpochBump` is a cheap no-op on empty rooms and the
+  // `/api/v1/ppt/collab` upgrade path is absent (XIN-1821: Half A ships inert until
+  // the Half B op-metadata trust boundary lands; see docs/DEPLOYMENT.md).
+  const pptRelay = createPptRelay()
+
   // Subscribe to epoch invalidation events (§4.5 step 3). On an event we drop
   // caches and refresh the local watermark. Acting on individual live
   // connections (close 4403 / flip readOnly) is the next layer; the
@@ -92,6 +111,14 @@ async function main(): Promise<void> {
     } catch {
       /* doc gone or source unconfirmable; backstop is beforeHandleMessage */
     }
+    // R4-B1: propagate the permission change to any live PPT relay sockets on
+    // this doc — re-resolve each connection's role, notify `role-changed`, and
+    // close a revoked (now-`none`) socket. Old-epoch frames still in flight are
+    // refused by the relay's per-frame epoch check.
+    void pptRelay.applyEpochBump(event.documentName).catch((err) => {
+      // eslint-disable-next-line no-console
+      console.warn('[octo-docs] PPT relay epoch bump failed:', err)
+    })
     // TODO(§4.5 step 3): locate local connections via the connection registry
     // and close(4403) revoked / flip readOnly on downgraded connections.
   }
@@ -145,6 +172,28 @@ async function main(): Promise<void> {
     )
   }
 
+  // R4-B1: the Bento-frame PPT relay is hosted INSIDE B — attached to the REST
+  // HTTP server on the `/api/v1/ppt/collab` upgrade path (owner-locked "no second
+  // service"), NOT the Hocuspocus server above and NOT a new deployable. The relay
+  // itself was constructed earlier (before the epoch subscriber that references
+  // it); here we only bind it to the now-listening HTTP server.
+  // R4-B1: the Bento-frame PPT relay is hosted INSIDE B — attached to the REST
+  // HTTP server on the `/api/v1/ppt/collab` upgrade path (owner-locked "no second
+  // service"), NOT the Hocuspocus server above and NOT a new deployable. The relay
+  // itself was constructed earlier (before the epoch subscriber that references
+  // it); here we only bind it to the now-listening HTTP server — and ONLY when the
+  // relay is enabled. Default OFF (XIN-1821): Half A carries no reachable op-metadata
+  // trust boundary yet, so the endpoint stays absent until an operator opts in via
+  // `PPT_RELAY_ENABLED=true` (Half B pairs the boundary with R4-F1).
+  if (config.ppt.relay.enabled) {
+    pptRelay.attach(httpServer)
+    // eslint-disable-next-line no-console
+    console.log('[octo-docs] PPT relay attached on /api/v1/ppt/collab')
+  } else {
+    // eslint-disable-next-line no-console
+    console.log('[octo-docs] PPT relay DISABLED (PPT_RELAY_ENABLED not set); /api/v1/ppt/collab is not mounted')
+  }
+
   // §9.4 graceful shutdown: flush docs, then release locks, then close infra.
   const shutdown = async (signal: string): Promise<void> => {
     // eslint-disable-next-line no-console
@@ -153,6 +202,7 @@ async function main(): Promise<void> {
       await hocuspocus.destroy() // flushes in-memory docs (triggers onStoreDocument)
       // TODO(§5.3 / §9.4): releaseAllDocumentLocks() so a takeover node can
       // become primary writer immediately without waiting for the lock TTL.
+      pptRelay.close()
       httpServer.close()
       internalServer?.close()
       sub.disconnect()

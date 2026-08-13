@@ -245,7 +245,11 @@ export function makePptSourceHandler(provider: PptSourceProvider) {
 
     // Load doc + resolve effective role (throws enveloped NOT_FOUND / CONFLICT /
     // UNSUPPORTED_DOCUMENT_TYPE). Role may be 'none'; the mode floor below rejects it.
-    const { meta, role } = await loadPptDocForRead(uid, spaceId, docId, { token: req.octoToken })
+    // This is a LIVE REST route (served regardless of the relay flag), so it uses the
+    // 'propagate' membership-error mode: an identity-service outage surfaces as a 5xx,
+    // never a silent 403/404 for a legitimate `anyone_in_space` reader (XIN-1835 spec
+    // deviation — the fail-closed swallow is scoped to the relay ticket path only).
+    const { meta, role } = await loadPptDocForRead(uid, spaceId, docId, { token: req.octoToken, membershipErrorMode: 'propagate' })
 
     // ACCESS POLICY — the headline guarantee. reader/commenter fail the writer
     // floor on draft/live => 403; everyone with read access passes on published.

@@ -15,10 +15,17 @@ optionally a **third** for the internal service-to-service surface:
 | REST metadata API | `3000` (`HTTP_PORT`) | docs CRUD, collab-token, invites, attachments |
 | Internal REST API (optional) | `9090` (`INTERNAL_HTTP_PORT`, **off** unless set) | in-network callers only: `/internal/html` (the html service's doc registration) |
 
-> The listeners are colocated in one process (`src/index.ts`). The REST API
-> is stateless and horizontally scalable; the Hocuspocus nodes are stateful and
-> documentName-affinity routed. They can be split into separate deployables
-> later — this guide assumes the colocated process the image ships today.
+> **PPT relay topology for this round is single-replica.** The listeners are
+> colocated in one process (`src/index.ts`), and the Bento PPT collaboration relay
+> attached to the REST server on `/api/v1/ppt/collab` keeps a process-local room
+> registry (live sockets, replay state, per-room sequence and byte-budget state).
+> Do not run multiple REST/PPT-relay replicas for the same environment in this
+> round. Horizontal REST scaling can be revisited only after the relay has an
+> explicit shared transport or affinity design; until then, deploy exactly one
+> backend replica for PPT collaboration. The Hocuspocus nodes are stateful and
+> documentName-affinity routed. The optional internal listener below is a second
+> port of the *same* process, not a separate deployable — it does not change this
+> replica count.
 
 ### Internal/public surface split (`INTERNAL_HTTP_PORT`)
 
@@ -207,12 +214,34 @@ vars (those without a fallback) **fail fast at boot** — that is intentional.
 | `CORS_ALLOWED_ORIGINS` | **yes when the FE is a different origin** | Comma-separated allowlist of front-end origins permitted to call the REST API and (with the local-hmac driver pointed at this backend origin) the presigned attachment PUT/GET. The browser preflights cross-origin requests with `OPTIONS` and blocks any response whose `Access-Control-Allow-Origin` does not match, so the FE origin **must** be listed or image upload/download fails (XIN-717). Exact origins (`http://192.168.214.189:3010`) or the single value `*` (reflect any origin). Empty (default) allows no cross-origin request. |
 | `RATE_LIMIT_WINDOW_MS` / `RATE_LIMIT_MAX` | no (`60000` / `300`) | Per-IP throttle window and cap on the REST route chains (human `/api/v1/docs` + bot `/v1/bot/docs`); `/healthz` is never throttled. Keyed on the real client IP, so `TRUST_PROXY` must be correct for the deployment. |
 | `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` | recommended | authoritative store connection |
-| `MYSQL_CONNECTION_LIMIT` | no (`10`) | pool size |
+| `MYSQL_CONNECTION_LIMIT` | no (`10`) | pool size. PPT replay cursors reserve up to `PPT_RELAY_MAX_IN_FLIGHT_REPLAYS` connections while they stream pages; keep this high enough for ordinary REST traffic plus replay headroom. |
 | `REDIS_HOST` / `REDIS_PORT` | recommended | broadcast bus / cache / registry |
 | `REDIS_PREFIX` | no (`octo-docs`) | multi-product key isolation prefix |
 | `COLLAB_TOKEN_SECRET` | **yes in prod** | signing secret for the short-lived collab JWT. Use an asymmetric key / KMS-managed secret; the HS256 default `dev-only-change-me` is dev only. |
 | `COLLAB_TOKEN_TTL_SECONDS` | no (`300`) | collab JWT TTL (5 min) |
 | `COLLAB_TOKEN_PUBLIC_WS_URL` | **yes in prod** | public, browser-reachable collab WS origin returned to clients as `collabWsUrl` (§4.4). Absolute `ws://`/`wss://` only — the Hocuspocus WS server runs on its own `:1234` origin and is **not** reverse-proxied, so a relative path never reaches it. **Fail-fast prod gate:** if `NODE_ENV=production` and this is unset or malformed the process **refuses to start** (clients no longer carry a build-time WS fallback). Optional in local dev only. |
+| `PPT_RELAY_ENABLED` | no (`false`) | **Master on/off switch for the PPT collab relay. Default OFF.** When false the relay is NOT attached to the REST server and the collab-token issuance route is NOT mounted, so `/api/v1/ppt/collab` is entirely absent. The relay currently ships as **Half A** (durable transport + snapshotting + the server-only room-relative clock bound); the op-metadata trust boundary that ties an op's actor to the authenticated uid and enforces per-actor sequence continuity is **deferred to Half B** (paired with the R4-F1 client). While that boundary is absent, an authenticated writer could submit ops under an arbitrary `a`/`s` (actor impersonation) — so **leave this OFF in production until Half B lands.** Accepts `true`/`false`/`1`/`0` only; any other value fails startup. See "PPT relay op-metadata trust model" below. |
+| `PPT_RELAY_PUBLIC_WS_URL` | **yes in prod _when the relay is enabled_** | public, browser-reachable origin of the Bento PPT collab relay, returned to clients as `pptWsUrl` in the collab-token response (§7.1). Absolute `ws://`/`wss://` only. The relay is hosted **inside the REST server** on the `/api/v1/ppt/collab` upgrade path (unlike the Hocuspocus WS server), so this normally points at the REST origin. **Fail-fast prod gate — gated behind `PPT_RELAY_ENABLED`:** when the relay is enabled and `NODE_ENV=production`, an unset or malformed value makes the process **refuse to start**. When the relay is **off** (the default) its validation is **skipped entirely** — the value is neither required nor consulted, so a disabled relay never fails startup on this knob (XIN-1825). Optional in local dev. Only consulted when `PPT_RELAY_ENABLED=true`. |
+| `PPT_RELAY_SYNC_PV` | no (`2`) | Bento CRDT sync protocol version the relay speaks; a frame whose `pv` differs is refused `protocol-version` before any decode. Keep in step with `ppt_doc_state.bento_sync_pv`. |
+| `PPT_RELAY_TICKET_TTL_SECONDS` | no (`30`) | one-time WS handshake ticket TTL. Short by design; the ticket is single-use across relay nodes (Redis-backed store), so a leaked/replayed ticket is useless quickly. |
+| `PPT_RELAY_MAX_FRAME_BYTES` / `PPT_RELAY_MAX_OPS_PER_FRAME` | no (`1900000` / `512`) | per-op-frame wire-byte cap and op-count cap (both `too-large`, permanent). |
+| `PPT_RELAY_MAX_FRAMES_PER_WINDOW` / `PPT_RELAY_RATE_WINDOW_MS` | no (`200` / `10000`) | sliding-window rate limit on persisted frames (`rate-limited`, a retryable refusal). `PPT_RELAY_MAX_FRAMES_PER_WINDOW` **also** governs the SEPARATE ephemeral-frame window (`hello`/`need`/`p`), so a presence/handshake flood is rate-limited without draining the op budget. |
+| `PPT_RELAY_MAX_SINGLE_BLOB_BYTES` | no (`8388608`) | per-snapshot blob cap; larger than the op-frame cap so a legitimate snapshot is not pre-empted by it (`too-large`, permanent). Also the WS `maxPayload`. |
+| `PPT_RELAY_MAX_ROOM_FRAME_BYTES` | no (`100663296`) | per-room durable frame-byte budget (`room-full`, permanent). Seeded from durable state on first join, so a restart does not reset it. |
+| `PPT_RELAY_MAX_EPHEMERAL_FRAME_BYTES` | no (`65536`) | byte cap for the ephemeral frames (`hello`/`need`/`p`/`bye`), which carry only a small resume cursor or presence payload — far tighter than the op/blob caps (`too-large`, permanent). |
+| `PPT_RELAY_MAX_LIVE_BUFFER_FRAMES` / `PPT_RELAY_MAX_LIVE_BUFFER_BYTES` | no (`4096` / `8388608`) | live frames buffered while a connection is replaying. Overflow closes the socket with `4410 resync required`; no overflowing frame is sent and no silent drop occurs. |
+| `PPT_RELAY_MAX_IN_FLIGHT_REPLAYS` | no (`max(1,min(2,floor(MYSQL_CONNECTION_LIMIT/4)))`) | process-wide replay cursor semaphore. Must be strictly lower than `MYSQL_CONNECTION_LIMIT`, so replay transactions cannot consume the full MySQL pool. |
+| `PPT_RELAY_REPLAY_PAGE_SIZE` / `PPT_RELAY_REPLAY_PAGE_BYTES` | no (`1000` / `4194304`) | max op rows and persisted JSON bytes read per replay page. The relay sends one page and waits for outbound progress before fetching the next page. |
+| `PPT_RELAY_SEND_HIGH_WATER_BYTES` | no (`4194304`) | socket `bufferedAmount` (bytes) above which replay pauses before sending its next frame, so one slow/greedy consumer cannot make the relay accumulate an unbounded send backlog. |
+| `PPT_RELAY_SEND_DRAIN_TIMEOUT_MS` | no (`5000`) | max wait for a congested socket to drain before the relay closes it instead of enqueueing more frames. |
+| `PPT_RELAY_AUTH_REFRESH_MS` | no (`5000`) | jittered per-connection read-auth refresh interval for live relay sockets. |
+| `PPT_RELAY_DOC_STATUS_CACHE_TTL_MS` | no (`2000`) | short doc-status cache TTL used to bound repeated status provider calls; local status-changing REST paths must invalidate by publishing the existing epoch/status bump. |
+| `PPT_RELAY_REAUTH_GRACE_MS` | no (`10000`) | grace window for a share-derived socket whose ticket membership claim just expired to present a fresh ticket via an in-place `reauth` frame before the relay fails closed. Keep it above `PPT_RELAY_AUTH_REFRESH_MS` so a read-auth refresh fires inside the window without clearing the sticky pending-reauth state. |
+| `PPT_RELAY_MAX_INBOUND_QUEUE` | no (`256`) | depth cap for a connection's inbound ordering chain; beyond it further frames are shed `rate-limited`. |
+| `PPT_RELAY_MAX_INBOUND_QUEUE_BYTES` | no (`67108864`) | BYTE cap for a connection's inbound ordering chain (XIN-1840 P1-3). The depth cap above bounds only frame COUNT, so a burst of near-`PPT_RELAY_MAX_FRAME_BYTES` frames could retain ~`MAX_INBOUND_QUEUE × MAX_FRAME_BYTES` in-process before the socket drains; beyond EITHER cap the frame is shed `rate-limited`. |
+| `PPT_RELAY_MAX_OPS_ADMISSION_PER_WINDOW` | no (`5000`) | coarse per-connection ceiling for ALL `ops` frames per `PPT_RELAY_RATE_WINDOW_MS`, checked BEFORE the identity gate / payload hash / dedup-ledger read (XIN-1840 P1-2), so a reader looping one harvested-valid frameId is O(1)-shed (silently dropped, never `refused`) before paying that work. Sized far above the `PPT_RELAY_MAX_FRAMES_PER_WINDOW` mutation budget and any idempotent resend, so a genuine frame is never shed. |
+| `PPT_RELAY_MAX_BUFFERED_OP_LAG` | no (`4096`) | seq-lag cap after which the snapshotter ages out a permanently-buffered op to unfreeze GC. Now operator-tunable: lower it so a room whose average frame is above `PPT_RELAY_MAX_ROOM_FRAME_BYTES / lagCap` bytes forces the reclaim on seq lag before the byte-budget (`room-full`) trigger fires. Each aged-op drop emits the `ppt_relay_aged_op_drop` alert (§6.1). |
+| `PPT_RELAY_LEDGER_RETENTION_FRAMES` | no (`262144`) | retention window (room seqs) for the `ppt_collab_frame` dedup ledger. The ledger outlives the pruned op log so a resend after a lost ack re-acks its original seq; without retention it grew forever. Ledger rows are reclaimed only once they fall this many seqs behind the covered watermark, bounding the table to ~this many rows per doc. An idempotent resend happens within seconds — far inside the window — so recent frames are always preserved; a resend older than the window is re-minted and rebroadcast but the reducer drops it as a duplicate (inert). |
 | `OCTO_IDENTITY_MODE` | no (`http`) | `http` (cross-service introspection) or `middleware` |
 | `OCTO_SERVER_BASE_URL` | when `http` | octo-server base for token→uid lookups |
 | `OCTO_SERVER_TOKEN` | no (default empty) — **set it if you want approver names on access cards** | Backend service token for octo-server, used by the server-side calls the backend makes on its own behalf (no user session available): (a) the add-member uid existence check (anti ghost-member) in `members.ts`, and (b) resolving the **approver's display name** for the access-decision result card (`decisionDisplay.ts`). For (a), leaving it empty is fine — that check falls back to the caller's own session token. For (b) there is no caller token (the card-action callback is a signed webhook), so with this unset `GET /v1/users/:uid` answers 401, the name is omitted, and the card renders octo-server's generic reviewer label instead of the real approver's name (the lookup miss is logged). Collaborator name/avatar display elsewhere is unaffected (the frontend fetches those directly with the logged-in user's token). |
@@ -544,6 +573,83 @@ it answers, the port was published and the isolation is gone.
 A `200` on `/healthz` together with a `401` on `/api/v1/docs` and both
 "listening" log lines is the green state. A REST endpoint hanging (no response →
 gateway 504) points back to the MySQL credential trap in §3.1.
+
+### 6.1 PPT relay — operator obligation: aged-op drop alert (XIN-1807 P1-2)
+
+The server-side snapshotter may, to unfreeze GC, drop a permanently-buffered op whose
+cross-actor dependency never became durable. This is bounded and strictly better than
+bricking the room, but the dropped op **may still exist on live peers**, so the drop is a
+potential server↔peer divergence with no other in-band signal. Production emits a
+structured **`console.error`** line carrying the stable event tag `ppt_relay_aged_op_drop`
+plus the dropped `(actor, s)` pairs.
+
+**You MUST wire a log-based alert on `ppt_relay_aged_op_drop`.** It should fire rarely or
+never in a healthy deployment; each occurrence is a data-integrity event to investigate.
+The logged `dropped` array (each `{a, s}`) is the record for reconciliation — capture it
+from your log pipeline. Example line:
+
+```
+[ppt-relay] aged-op drop (data-integrity divergence risk; alert + reconcile) {"event":"ppt_relay_aged_op_drop","docId":"…","targetSeq":42,"bufferedLag":5000,"lagCap":4096,"droppedCount":1,"dropped":[{"a":"…","s":7}]}
+```
+
+### 6.2 PPT relay — op-metadata trust model (Half A / Half B split, XIN-1821)
+
+The PPT collab relay currently ships as **Half A**: durable transport, the dedup ledger,
+seq counter, replay, backpressure, room byte limits, the server-side snapshotter, the
+materialization proof, and the aged-op escalation above. **The relay is disabled by
+default (`PPT_RELAY_ENABLED=false`) and must stay off in production until Half B lands.**
+
+What Half A **does** enforce on op metadata (no client half required):
+
+- **Wire shape / charset.** Each op's actor `a` is charset-restricted (`[a-z0-9-]{1,64}`)
+  and the reserved reducer namespace (`@…`) is refused, and node ids / `set` keys naming ANY
+  `Object.prototype` member (`__proto__`/`constructor`/`prototype` **and** `valueOf`/
+  `toString`/`hasOwnProperty`/… — XIN-1840 P0-1) or a DocShape container (`slides`/`elements`)
+  are rejected, `del`/`ord` ids are shape-checked per `kind` (bare slide id vs composite
+  element key), and a `txt` op is limited to one insert group — so a wire op can neither mint
+  the reducer actor nor crash/pollute/silently-drop-through the reduction.
+- **Room-relative clock bound.** An op's `l` (and a `txt` op's seed generation `sd[0]`) is
+  refused when it exceeds the room's live Lamport clock by more than a generous slack, so a
+  single wire-legal value cannot pin the clock at a ceiling and permanently refuse every
+  legitimate successor.
+- **Snapshot column guard.** A snapshot whose serialized `doc_json`/`state_json` would
+  exceed the 16 MiB `MEDIUMTEXT` ceiling fails closed **before** the write, so the op log is
+  never pruned behind a truncated document. If you see this, the deck's materialized state
+  has outgrown the column and needs a schema/segmentation change — it is a hard capacity
+  limit, surfaced to the client as a permanent `room-full`.
+
+What Half A **does NOT** enforce (deferred to **Half B**, paired with the R4-F1 client):
+
+- **Actor↔uid binding.** An op's `a` is NOT tied to the authenticated uid, so an
+  authenticated writer could author under another collaborator's actor (impersonation /
+  co-editor censorship). This needs the client to send a `clientSessionId` so the server can
+  mint and bind the actor.
+- **Per-actor `s` continuity.** A non-contiguous per-actor sequence is not refused at the
+  boundary (it can still park a buffered op that the aged-op path in §6.1 eventually drops).
+
+Because those two gates are absent, **the relay must not be exposed in production yet.**
+`PPT_RELAY_ENABLED=false` keeps `/api/v1/ppt/collab` unmounted and the collab-token route
+absent, so no ticket is issued and the endpoint cannot be reached. Turn it on only once
+Half B binds the actor to the authenticated identity.
+
+### 6.3 PPT relay — quarantined frame is a manual-intervention event (XIN-1835 P0-1 / XIN-1840)
+
+The wire validator is the primary guard against a frame the reducer cannot apply, but the
+snapshotter has a defense-in-depth backstop: if a frame still **throws** inside
+`engine.apply`, it is **quarantined** — the snapshotter freezes the proven watermark at the
+last clean boundary strictly below it and NEVER prunes the poison frame or anything after
+it, so the room degrades to **read-only from that seq** rather than bricking. Production
+logs it as `[ppt-relay] doc <id>: quarantined a throwing frame at seq <n>` (watermark frozen,
+frame not pruned).
+
+**A quarantined frame is a manual-intervention event, not self-healing.** The room stops
+advancing its snapshot and its op log grows unpruned until an operator acts; a validator that
+accepts a frame the reducer rejects is a bug to fix at the wire, not a runtime condition the
+relay recovers from on its own. On seeing this log line: capture the offending `(docId, seq)`
+and the frame, treat it as a validator/reducer accept-set escape (the class the wire-grammar
+fuzz gate in `test/pptOpValidationFuzz.test.ts` is meant to prevent), and file it for a wire
+fix. An automated operator escape hatch (e.g. surgically dropping the quarantined frame) is
+out of scope this round.
 
 ---
 

@@ -292,10 +292,17 @@ CREATE TABLE doc_access_notify_card (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------------------------------------------------------------------
--- Bento PPT (`html_ppt`) — R2-B1 (XIN-1514): human create + templates +
--- idempotency. These tables are PPT-owned and never touch the legacy doc/Yjs
--- paths. Kept in lockstep with migrations/upgrades/2026-08-05-add-ppt-create-tables.sql
--- so a fresh build from this schema.sql and an upgraded DB are identical.
+-- Bento PPT (`html_ppt`) — R2-B1 create/templates (XIN-1514) + R4-B1 collab
+-- relay durability (ppt_collab_op / ppt_live_snapshot / ppt_collab_seq /
+-- ppt_collab_frame). These tables are PPT-owned and never touch the legacy
+-- doc/Yjs paths. Kept in lockstep with the PPT upgrade migrations so a fresh
+-- build from this schema.sql and an upgraded DB are identical:
+--   · 2026-08-05-add-ppt-create-tables.sql          (ppt_doc_state, ppt_create_idempotency)
+--   · 2026-08-06-add-ppt-collab-relay-tables.sql     (ppt_collab_op, ppt_live_snapshot)
+--   · 2026-08-06-add-ppt-collab-seq-counter.sql      (ppt_collab_seq)
+--   · 2026-08-07-add-ppt-collab-frame-dedup.sql + -append-time-authority + -payload-hash-bin
+--     + -payload-hash-canonical-ops.sql             (ppt_collab_frame + payload-hash scheme)
+--   · 2026-08-08-ppt-live-snapshot-sync-state.sql    (ppt_live_snapshot.state_json/_sha/_bytes)
 -- ---------------------------------------------------------------------------
 
 -- Per-document PPT state that does not belong on the shared doc_meta row: the
@@ -336,4 +343,93 @@ CREATE TABLE ppt_idempotency (
   created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   PRIMARY KEY (space_id, scope, uid, idempotency_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Durable Bento op frames for the PPT relay (R4-B1, §7.3). One row per accepted
+-- `ops` frame, addressed by the MONOTONIC per-room sequence `(doc_id, seq)`. The
+-- relay acks a frame ONLY after its row is durably committed, then broadcasts;
+-- UNIQUE (doc_id, frame_id) makes a resent frame a no-op that re-acks its
+-- original seq rather than inserting a duplicate. Covered ops are pruned only
+-- after a live snapshot that covers them is durable.
+CREATE TABLE ppt_collab_op (
+  doc_id      VARCHAR(64) NOT NULL,                       -- FK-by-convention to doc_meta.doc_id (html_ppt row)
+  seq         BIGINT      NOT NULL,                        -- monotonic per-room sequence (relay-assigned)
+  frame_id    VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, -- globally-unique Bento frame id (dedup key)
+  frame_json  MEDIUMTEXT  NOT NULL,                        -- the original `ops` frame, plaintext JSON
+  frame_bytes INT         NOT NULL DEFAULT 0,              -- byte size of frame_json (room-budget accounting)
+  created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (doc_id, seq),
+  UNIQUE KEY uq_ppt_collab_op_frame (doc_id, frame_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Authoritative live BentoDoc snapshot per PPT doc (R4-B1, §7.3). snapshot_version
+-- advances atomically on each save; covered_seq records the op prefix the snapshot
+-- subsumes, so the relay prunes ppt_collab_op rows with seq <= covered_seq only
+-- AFTER this row is durable. One row per doc (PK doc_id) — the snapshot is
+-- replaced in place, never versioned here (published versions live in ppt_version).
+CREATE TABLE ppt_live_snapshot (
+  doc_id           VARCHAR(64) NOT NULL,                  -- one authoritative live snapshot per doc
+  snapshot_version BIGINT      NOT NULL DEFAULT 0,        -- monotonic; advances atomically on each save
+  covered_seq      BIGINT      NOT NULL DEFAULT 0,        -- ppt_collab_op.seq this snapshot covers (<= are prunable)
+  doc_json         MEDIUMTEXT  NOT NULL,                  -- the authoritative BentoDoc snapshot, plaintext JSON
+  doc_sha          CHAR(64)    NOT NULL,                  -- sha256(hex) of doc_json (integrity / dedup)
+  doc_bytes        INT         NOT NULL DEFAULT 0,        -- byte size of doc_json
+  -- Serialized Bento SyncState reduced ALONGSIDE doc_json, persisted atomically
+  -- with it and covered_seq so a late joiner replays (doc,state) then applies ops
+  -- with seq > covered_seq deterministically (R4-B1 XIN-1759 Part B / XIN-1764
+  -- Option 2). NULL only for a legacy doc-only row written before this column.
+  state_json       MEDIUMTEXT  NULL DEFAULT NULL,         -- serialized SyncStateJSON (nullable: legacy doc-only rows)
+  state_sha        CHAR(64)    NULL DEFAULT NULL,         -- sha256(hex) of state_json
+  state_bytes      INT         NOT NULL DEFAULT 0,        -- byte size of state_json (0 when NULL)
+  created_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (doc_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Durable per-room sequence counter for the PPT relay (R4-B1, §7.3). `last_seq`
+-- is the highest op sequence ever ASSIGNED to the room; the relay allocates the
+-- next seq by atomically incrementing this row inside the append transaction.
+-- This is the authoritative seq source, decoupled from ppt_collab_op contents:
+--   · a brand-new room has a row to lock on the very first append, so two first
+--     writers cannot both mint seq=1 (the primary-key insert serializes them);
+--   · the counter NEVER regresses when a full-coverage snapshot prunes every
+--     ppt_collab_op row, so a reused seq can never silently overwrite/replay.
+CREATE TABLE ppt_collab_seq (
+  doc_id   VARCHAR(64) NOT NULL,                          -- FK-by-convention to doc_meta.doc_id (html_ppt row)
+  last_seq BIGINT      NOT NULL DEFAULT 0,                -- highest op seq ever assigned for this room (monotonic)
+  PRIMARY KEY (doc_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Durable dedup authority for the PPT relay (R4-B1, XIN-1655 C1 / XIN-1660 D1-D2).
+-- Maps (doc_id, frame_id) -> the room seq the frame was assigned. Written at APPEND
+-- time with (doc_id, frame_id) as the PRIMARY KEY, so it is the single dedup
+-- authority: the relay's append inserts here and lets the PK raise ER_DUP_ENTRY on a
+-- resend (a CURRENT-read dedup that catches a resend whose transaction opened before
+-- the original committed), then re-acks the original seq via a locking read. The
+-- mapping OUTLIVES the op row: a snapshot prunes ppt_collab_op with a plain DELETE,
+-- but this ledger is retained well PAST the op prune (a resend of a recently-pruned
+-- frame still re-acks its ORIGINAL seq instead of being minted a fresh one and
+-- rebroadcast). It is bounded, not infinite: the relay retention-prunes ledger rows
+-- FAR behind the covered watermark (keeping the last PPT_RELAY_LEDGER_RETENTION_FRAMES
+-- seqs) so the table cannot grow without bound (XIN-1821 P1-4).
+--
+-- INVARIANT (ledger ⊇ live op rows): this ledger is a SUPERSET of the (doc_id, frame_id)
+-- pairs in ppt_collab_op — every persisted op has a ledger row (written at append
+-- time, and backfilled for pre-existing rows by
+-- 2026-08-07-backfill-ppt-collab-frame-ledger.sql), and the ledger additionally
+-- retains mappings whose op rows were pruned, up to the retention window. The retention
+-- prune MUST preserve it: it only drops mappings FAR behind coverage (seq far below
+-- covered_seq, so their op rows are already gone AND subsumed by a durable snapshot),
+-- never one whose op row is still live — a within-window resend of a live/recent frame
+-- always finds its row. A resend OLDER than the window re-mints a fresh seq and
+-- rebroadcasts, but the op's (a,s) is <= vv[a] so every reducer drops it as a
+-- duplicate — inert, never a divergence (XIN-1693 P1-1 / XIN-1821 P1-4).
+CREATE TABLE ppt_collab_frame (
+  doc_id      VARCHAR(64) NOT NULL,                        -- FK-by-convention to doc_meta.doc_id (html_ppt row)
+  frame_id    VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, -- globally-unique Bento frame id (dedup key)
+  seq         BIGINT      NOT NULL,                         -- room seq this frame was assigned (retained past prune)
+  payload_hash CHAR(64)   NULL,                             -- sha256(hex) of the CANONICAL ops payload (frame.ops, stable key order); NULL rows are verified against frame_json when the op row exists, else fail closed
+  recorded_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), -- when the mapping was recorded (append time)
+  PRIMARY KEY (doc_id, frame_id),
+  KEY idx_ppt_collab_frame_doc_seq (doc_id, seq)           -- range key for the retention prune `WHERE doc_id=? AND seq<=?` (XIN-1825 P2-1); without it the DELETE range-scans the whole (doc_id) PK partition and next-key-locks every row it examines
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

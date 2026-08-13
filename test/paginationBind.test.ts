@@ -15,6 +15,7 @@ vi.mock('../src/db/pool.js', () => ({
 import { docVersionRepo } from '../src/db/repos/docVersionRepo.js'
 import { docCommentRepo } from '../src/db/repos/docCommentRepo.js'
 import { docMetaRepo } from '../src/db/repos/docMetaRepo.js'
+import { pptCollabOpRepo } from '../src/db/repos/pptCollabOpRepo.js'
 import { query } from '../src/db/pool.js'
 
 const mockQuery = vi.mocked(query)
@@ -115,6 +116,29 @@ describe('paginated repos inline a validated integer LIMIT/OFFSET (no numeric `?
     expect(sql).not.toMatch(/OFFSET \?/)
     expect(params).not.toContain(20)
     expect(params).not.toContain(40)
+  })
+
+  // XIN-1748 P1-2: the PPT relay op repo paged its replay read with `LIMIT ?` and a
+  // STRING bind — an unverified assumption about the driver on the very path P1-4
+  // repaired, diverging from this repo's settled remedy (inline a validated integer,
+  // above). Assert the relay repo now inlines the LIMIT and never binds it via `?`.
+  it('pptCollabOpRepo.since inlines the LIMIT integer and drops it from params', async () => {
+    await pptCollabOpRepo.since('d_ppt1', 0, 1000)
+    const { sql, params } = lastCall()
+    expect(sql).toMatch(/LIMIT 1000\b/)
+    expect(sql).not.toMatch(/LIMIT \?/)
+    expect(params).not.toContain(1000)
+    expect(params).not.toContain('1000')
+  })
+
+  it('pptCollabOpRepo.since with no limit omits the LIMIT clause (no `?` bind)', async () => {
+    await pptCollabOpRepo.since('d_ppt1', 0)
+    const { sql } = lastCall()
+    expect(sql).not.toMatch(/LIMIT/)
+  })
+
+  it('pptCollabOpRepo.since rejects a non-integer limit rather than binding text', async () => {
+    await expect(pptCollabOpRepo.since('d_ppt1', 0, 10.5 as never)).rejects.toThrow(RangeError)
   })
 })
 

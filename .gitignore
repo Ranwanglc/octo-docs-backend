@@ -36,3 +36,7 @@ coverage/
 # Go
 backend/**/bin/
 *.test
+
+# Local-only developer artifacts: throwaway Dockerfiles that FROM a
+# machine-local image tag and would break any other checkout.
+*.dist-only.local

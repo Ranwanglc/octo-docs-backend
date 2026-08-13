@@ -1,0 +1,270 @@
+/**
+ * `ppt_collab_op` — durable Bento op frames for the PPT relay (R4-B1, §7.3).
+ *
+ * Each accepted `ops` frame is one row, addressed by the MONOTONIC per-room
+ * sequence `(doc_id, seq)`. The relay's durability contract lives here: a frame
+ * is committed to this table BEFORE it is acked to the sender or broadcast to
+ * peers, and `UNIQUE (doc_id, frame_id)` makes a resent frame a no-op that
+ * re-acks its original seq instead of inserting a duplicate.
+ *
+ * Sequence assignment is NOT derived from this table's `MAX(seq)` — that scheme
+ * both races on a brand-new room (no row to lock) and regresses after a
+ * full-coverage prune empties the table. The authoritative monotonic counter
+ * lives in {@link ../repos/pptRelaySeqRepo} (`ppt_collab_seq`); this table only
+ * stores the frames at the seqs that counter hands out.
+ *
+ * Idempotent-resend dedup is owned by the durable ledger `ppt_collab_frame` (see
+ * {@link ../repos/pptCollabFrameRepo}), which is written at APPEND time and
+ * OUTLIVES this table's rows. A snapshot prunes covered ops from here with a plain
+ * `DELETE` (see {@link pruneThroughTx}); the mapping a resent frame needs to re-ack
+ * its original seq survives in that ledger, never in this table.
+ */
+import { query, type Tx } from '../pool.js'
+
+export interface PptCollabOpRow {
+  seq: number
+  frameId: string
+  frame: unknown
+  frameBytes?: number
+}
+
+interface RawRow {
+  seq: number
+  frame_id: string
+  frame_json: string
+  frame_bytes?: number
+}
+
+function toOp(row: RawRow): PptCollabOpRow {
+  const raw = row.frame_json
+  return {
+    seq: Number(row.seq),
+    frameId: row.frame_id,
+    frame: typeof raw === 'string' ? (JSON.parse(raw) as unknown) : (raw as unknown),
+    ...(row.frame_bytes !== undefined ? { frameBytes: Number(row.frame_bytes) } : {}),
+  }
+}
+
+/**
+ * Validate a LIMIT for INLINING into the SQL text (never bound via `?`).
+ *
+ * mysql2's prepared-statement path (`conn.execute`) rejects an INTEGER bound to
+ * `LIMIT ?` on real MySQL 8 with `ER_WRONG_ARGUMENTS` ("Incorrect arguments to
+ * mysqld_stmt_execute"): the paged replay read and `opsSince(..., limit)` both hit
+ * it, so durable replay was broken on a real engine (P1-4 / XIN-1740). The
+ * in-memory fake routes `execute` through its own model and never saw it. This
+ * codebase already settled on the fix for the identical bug — INLINE a validated
+ * integer (`LIMIT ${keep}` / `LIMIT ${lim}` in {@link ../repos/docVersionRepo},
+ * asserted by `test/paginationBind.test.ts`), never bind LIMIT via `?`. Adopt the
+ * same convention here so the two paths cannot diverge on driver behaviour.
+ * Guarded to a non-negative safe integer so a caller can never smuggle non-numeric
+ * text into the clause; the returned number is interpolated directly and is absent
+ * from the params array.
+ */
+function limitClause(limit: number): number {
+  if (!Number.isSafeInteger(limit) || limit < 0) {
+    throw new RangeError(`LIMIT must be a non-negative safe integer, got ${limit}`)
+  }
+  return limit
+}
+
+export const pptCollabOpRepo = {
+  /** Insert one op frame at an already-computed seq (tx-scoped). */
+  async insertTx(
+    tx: Tx,
+    docId: string,
+    seq: number,
+    frameId: string,
+    frameJson: string,
+    frameBytes: number,
+  ): Promise<void> {
+    await tx.query(
+      `INSERT INTO ppt_collab_op (doc_id, seq, frame_id, frame_json, frame_bytes)
+       VALUES (?, ?, ?, ?, ?)`,
+      [docId, seq, frameId, frameJson, frameBytes],
+    )
+  },
+
+  /**
+   * Ops with `seq > sinceSeq`, ascending (replay). When `limit` is given, at most
+   * `limit` rows are returned (the next page starts at the last returned seq), so a
+   * huge op backlog is streamed in bounded batches on replay rather than read
+   * unbounded into memory (XIN-1660 hardening).
+   */
+  async since(docId: string, sinceSeq: number, limit?: number): Promise<PptCollabOpRow[]> {
+    if (limit !== undefined && limit >= 0) {
+      const rows = await query<RawRow>(
+        `SELECT seq, frame_id, frame_json FROM ppt_collab_op
+          WHERE doc_id = ? AND seq > ? ORDER BY seq ASC LIMIT ${limitClause(limit)}`,
+        [docId, sinceSeq],
+      )
+      return rows.map(toOp)
+    }
+    const rows = await query<RawRow>(
+      `SELECT seq, frame_id, frame_json FROM ppt_collab_op
+        WHERE doc_id = ? AND seq > ? ORDER BY seq ASC`,
+      [docId, sinceSeq],
+    )
+    return rows.map(toOp)
+  },
+
+  /**
+   * Ops with `seq > sinceSeq`, ascending, INSIDE the caller's transaction so the
+   * read shares one consistent snapshot with the other replay reads (P1-4 atomic
+   * replay view). Bounded to `limit` rows when given (paged fetch). When `maxSeq`
+   * is given it is an INCLUSIVE upper bound (`seq <= maxSeq`): the paged replay
+   * pins it to the head high-water captured at replay open so the cursor converges
+   * to that boundary instead of chasing ops committed by concurrent writers across
+   * the fresh per-page transactions — otherwise an actively-written room's
+   * `nextPage()` never returns empty, the loop never terminates, `ready` is never
+   * emitted and the replay permit is held indefinitely (XIN-1783 P1-4).
+   */
+  async sinceTx(tx: Tx, docId: string, sinceSeq: number, limit?: number, maxSeq?: number): Promise<PptCollabOpRow[]> {
+    const cap = maxSeq !== undefined ? ' AND seq <= ?' : ''
+    const capArgs = maxSeq !== undefined ? [maxSeq] : []
+    if (limit !== undefined && limit >= 0) {
+      const rows = await tx.query<RawRow>(
+        `SELECT seq, frame_id, frame_json FROM ppt_collab_op
+          WHERE doc_id = ? AND seq > ?${cap} ORDER BY seq ASC LIMIT ${limitClause(limit)}`,
+        [docId, sinceSeq, ...capArgs],
+      )
+      return rows.map(toOp)
+    }
+    const rows = await tx.query<RawRow>(
+      `SELECT seq, frame_id, frame_json FROM ppt_collab_op
+        WHERE doc_id = ? AND seq > ?${cap} ORDER BY seq ASC`,
+      [docId, sinceSeq, ...capArgs],
+    )
+    return rows.map(toOp)
+  },
+
+  /**
+   * The stored frame BYTE SIZES (`seq` + `frame_bytes`) for `seq > sinceSeq`, ascending,
+   * INSIDE the caller's transaction — WITHOUT the frame JSON. A cheap size pre-scan the
+   * byte-bounded replay page uses to pick a `seq` cutoff that keeps a page's materialized
+   * op JSON within a byte budget (XIN-1807 P1-1), so the tail scan no longer fetches
+   * `pageRows` FULL rows into memory and only trims what it emits. `frame_bytes` is
+   * `NOT NULL` (written by {@link insertTx} at append time), and reading only integers
+   * keeps this pre-scan's own materialization negligible regardless of frame size. Same
+   * `limit` (row cap) / `maxSeq` (inclusive upper bound) semantics as {@link sinceTx}.
+   */
+  async frameSizesSinceTx(
+    tx: Tx,
+    docId: string,
+    sinceSeq: number,
+    limit: number,
+    maxSeq?: number,
+  ): Promise<{ seq: number; frameBytes: number }[]> {
+    const cap = maxSeq !== undefined ? ' AND seq <= ?' : ''
+    const capArgs = maxSeq !== undefined ? [maxSeq] : []
+    const rows = await tx.query<{ seq: number; frame_bytes: number | null }>(
+      `SELECT seq, frame_bytes FROM ppt_collab_op
+        WHERE doc_id = ? AND seq > ?${cap} ORDER BY seq ASC LIMIT ${limitClause(limit)}`,
+      [docId, sinceSeq, ...capArgs],
+    )
+    return rows.map((r) => ({ seq: Number(r.seq), frameBytes: Number(r.frame_bytes ?? 0) }))
+  },
+
+  /**
+   * Seq of the row already stored for `(doc_id, frame_id)` under a LOCKING read,
+   * or null if unseen. Used on the op-table duplicate-key retry path (P1-1 b): a
+   * pre-upgrade op row can exist for a frame that has no dedup-ledger row, so on an
+   * `ER_DUP_ENTRY` from the op insert we read the op's ORIGINAL seq here and re-ack
+   * it instead of failing permanently.
+   */
+  async getSeqByFrameIdForUpdateTx(tx: Tx, docId: string, frameId: string): Promise<number | null> {
+    const rows = await tx.query<{ seq: number }>(
+      `SELECT seq FROM ppt_collab_op WHERE doc_id = ? AND frame_id = ? FOR UPDATE`,
+      [docId, frameId],
+    )
+    return rows[0] ? Number(rows[0].seq) : null
+  },
+
+  /**
+   * The stored op frame (seq + parsed `frame_json`) for `(doc_id, frame_id)`
+   * under a LOCKING read, or null when no op row exists (unseen, or pruned).
+   * Used to verify a duplicate whose ledger row has a NULL `payload_hash` (a
+   * legacy row recorded before the canonical-ops hash, or a row nulled by the
+   * hash-scheme migration): when the op row is still present we can recompute the
+   * canonical-ops hash from `frame_json` and decide match-vs-mismatch instead of
+   * failing closed on the missing hash (XIN-1736 P2-d). A pruned frame (op row
+   * gone) has no `frame_json` to verify against and still fails closed.
+   */
+  async getFrameByFrameIdForUpdateTx(
+    tx: Tx,
+    docId: string,
+    frameId: string,
+  ): Promise<{ seq: number; frame: unknown } | null> {
+    const rows = await tx.query<RawRow>(
+      `SELECT seq, frame_id, frame_json FROM ppt_collab_op WHERE doc_id = ? AND frame_id = ? FOR UPDATE`,
+      [docId, frameId],
+    )
+    if (!rows[0]) return null
+    const op = toOp(rows[0])
+    return { seq: op.seq, frame: op.frame }
+  },
+
+  /**
+   * Non-locking, non-transactional twin of {@link getFrameByFrameIdForUpdateTx}:
+   * the stored op frame (seq + parsed `frame_json`) for `(doc_id, frame_id)`, or
+   * null when no op row exists (unseen, or pruned). A CURRENT read used by the
+   * relay's PRE-GATE re-ack path to verify a duplicate whose ledger row has a NULL
+   * `payload_hash` (legacy / migration-nulled) WITHOUT opening an append
+   * transaction or taking a row lock — a pure re-ack reads, it does not mutate
+   * (XIN-1750). A pruned frame has no `frame_json` and returns null, so the caller
+   * falls through to the mutation path, which fails closed.
+   */
+  async getFrameByFrameId(docId: string, frameId: string): Promise<{ seq: number; frame: unknown } | null> {
+    const rows = await query<RawRow>(
+      `SELECT seq, frame_id, frame_json FROM ppt_collab_op WHERE doc_id = ? AND frame_id = ?`,
+      [docId, frameId],
+    )
+    if (!rows[0]) return null
+    const op = toOp(rows[0])
+    return { seq: op.seq, frame: op.frame }
+  },
+
+  /**
+   * Highest seq still PRESENT in this table (0 when none). This is NOT the
+   * room's authoritative high-water — a prune drops rows so this can regress;
+   * {@link ../repos/pptRelaySeqRepo.currentSeq} is the monotonic high-water. Kept
+   * only for diagnostics / tests.
+   */
+  async maxSeq(docId: string): Promise<number> {
+    const rows = await query<{ max_seq: number | null }>(
+      `SELECT COALESCE(MAX(seq), 0) AS max_seq FROM ppt_collab_op WHERE doc_id = ?`,
+      [docId],
+    )
+    return rows[0] ? Number(rows[0].max_seq ?? 0) : 0
+  },
+
+  /** Sum of `frame_bytes` for the ops still present (room-budget accounting). */
+  async sumFrameBytes(docId: string): Promise<number> {
+    const rows = await query<{ total: number | null }>(
+      `SELECT COALESCE(SUM(frame_bytes), 0) AS total FROM ppt_collab_op WHERE doc_id = ?`,
+      [docId],
+    )
+    return rows[0] ? Number(rows[0].total ?? 0) : 0
+  },
+
+  /**
+   * Delete ops with `seq <= coveredSeq` (post-snapshot GC) and return the number
+   * of `frame_bytes` reclaimed, so the relay's in-memory room-budget counter can
+   * be decremented in step with the durable delete.
+   *
+   * A plain `DELETE` inside the caller's transaction. Dedup no longer needs a
+   * copy-at-prune step — the `ppt_collab_frame` ledger is written at APPEND time
+   * and outlives the op row — so this avoids the old `INSERT IGNORE … SELECT`,
+   * whose shared next-key locks over the gap ABOVE `coveredSeq` blocked a
+   * concurrent append there into `ER_LOCK_WAIT_TIMEOUT` (XIN-1660 D2).
+   */
+  async pruneThroughTx(tx: Tx, docId: string, coveredSeq: number): Promise<number> {
+    const rows = await tx.query<{ freed: number | null }>(
+      `SELECT COALESCE(SUM(frame_bytes), 0) AS freed FROM ppt_collab_op WHERE doc_id = ? AND seq <= ?`,
+      [docId, coveredSeq],
+    )
+    const freed = rows[0] ? Number(rows[0].freed ?? 0) : 0
+    await tx.query(`DELETE FROM ppt_collab_op WHERE doc_id = ? AND seq <= ?`, [docId, coveredSeq])
+    return freed
+  },
+}

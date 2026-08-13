@@ -1,0 +1,49 @@
+-- Upgrade migration: backfill the PPT relay dedup ledger from ppt_collab_op
+-- (XIN-1693 P1-1).
+--
+-- WHAT: seeds `ppt_collab_frame (doc_id, frame_id, seq)` from every existing
+--   `ppt_collab_op` row that has no ledger row yet.
+--
+-- WHY: `2026-08-07-ppt-collab-frame-append-time-authority.sql` made
+--   `ppt_collab_frame` the SOLE append-time dedup authority, but the op table still
+--   carries `UNIQUE (doc_id, frame_id)` and op rows written by the PREVIOUS deploy
+--   have NO ledger row. On an already-migrated DB a client re-sending such a frame
+--   takes the fresh-frame path: the ledger insert succeeds (no ledger row existed),
+--   then the op insert hits `uq_ppt_collab_op_frame` -> ER_DUP_ENTRY -> the append
+--   transaction rolls back -> the relay surfaces a PERMANENT, forever-retried
+--   `storage-failed` for that frame ("collaboration randomly loses edits after
+--   deploy"). Backfilling the ledger so it is a SUPERSET of the op rows makes every
+--   resend hit the ledger fast-path / PK instead, re-acking the original seq.
+--
+--   The relay's `appendOp` also now reconciles an op-table ER_DUP_ENTRY in-band
+--   (re-acks the op's original seq and repoints the ledger), so the two together
+--   fully close P1-1; this migration removes the failure at the source for the
+--   whole existing backlog rather than one-frame-at-a-time on first resend.
+--
+--   This is a SEPARATE, idempotent migration rather than an edit to the
+--   already-shipped `2026-08-07-ppt-collab-frame-append-time-authority.sql` ON
+--   PURPOSE: the runner records each applied file's checksum and HALTS on drift
+--   (`Migration checksum mismatch ...`, migrate.ts). The authority-flip file has
+--   already run on the dev/staging/review DBs this fix must reach, so editing it
+--   would break migration on exactly those DBs — the same reasoning the sibling
+--   `2026-08-07-backfill-ppt-collab-seq-counter.sql` migration was split out for.
+--
+--   INVARIANT (kept in step with schema.sql): `ppt_collab_frame` is a SUPERSET of
+--   the `(doc_id, frame_id)` pairs in `ppt_collab_op` — every persisted op has a
+--   ledger row, and the ledger additionally retains mappings whose op rows were
+--   pruned. Any future `ppt_collab_frame` retention job MUST preserve this: it may
+--   only drop a mapping whose op row is already gone AND is subsumed by a durable
+--   snapshot, never a mapping whose op row is still live.
+--
+-- SAFETY: idempotent / re-runnable. `INSERT IGNORE` skips rows already present, so
+--   a re-run (or a retry of a partial apply, per migrate.ts's at-least-once
+--   contract) is a no-op. On a fresh install `ppt_collab_op` is empty, so this
+--   seeds nothing. It orders BEFORE the authority-flip file alphabetically, but is
+--   independent of the `pruned_at` -> `recorded_at` rename (it touches only
+--   doc_id/frame_id/seq), so either apply order is correct.
+--
+-- Usage:
+--   mysql -u <user> -p <database> < migrations/upgrades/2026-08-07-backfill-ppt-collab-frame-ledger.sql
+
+INSERT IGNORE INTO ppt_collab_frame (doc_id, frame_id, seq)
+SELECT doc_id, frame_id, seq FROM ppt_collab_op;

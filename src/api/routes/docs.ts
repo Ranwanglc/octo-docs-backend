@@ -826,12 +826,30 @@ function isPlausibleDocId(id: unknown): id is string {
  *
  * Fixed status order so NOTHING is leaked before authorization (§4):
  *   locate/exist → compute role → role=none ⇒ 403 → archived ⇒ 409 → context.
- * A `none` caller gets 403 WITHOUT learning archived/locked state; any failure
- * response carries no title / Space / owner / documentName.
+ * A `none` caller gets 403 WITHOUT learning archived/locked state; no failure
+ * response carries Space / owner / documentName / role / epoch.
  *
- * The 403-vs-404 distinction is deliberately preserved (§4): it is what keeps
- * "hold a doc link, request access" working; enumeration resistance is a later
- * sharing-security phase, not this one.
+ * The ONE field a 403 does carry is `title`, and only a 403 — product decision
+ * (leader): the `/d/:docId` no-access landing must name the document it is asking
+ * the viewer to request access to, instead of saying 无法访问此文档 about an unnamed
+ * thing. Note what this does and does not assume:
+ *   - It is NOT justified by space membership. This route locates by docId alone
+ *     and has no same-space gate, so a 403 here can reach a caller from any
+ *     Space, or none. Anyone holding the docId can read the title.
+ *   - It IS bounded to a caller who already holds the docId AND already learned
+ *     the doc exists from getting 403 rather than 404 — the distinction §4 keeps
+ *     on purpose so "hold a link, request access" works. The share card that
+ *     carries such a link already shows the same title.
+ *   - 404 stays bare. That is the response that hides existence, and a title on
+ *     it would hand out the one bit 404 exists to withhold.
+ * So this widens disclosure from "the doc exists" to "the doc exists and is
+ * named X", for a link holder. Accepted deliberately; if enumeration resistance
+ * lands in the later sharing-security phase, this field is the first thing it
+ * has to revisit.
+ *
+ * A blank stored title omits the field rather than sending `""`, so the client
+ * can tell "no title disclosed" from "the title is empty" and never renders a
+ * placeholder as if it were the document's name — the web side depends on that.
  */
 export async function openContextHandler(req: Request, res: Response): Promise<void> {
   const uid = req.uid!
@@ -851,7 +869,11 @@ export async function openContextHandler(req: Request, res: Response): Promise<v
   const direct = await resolveRole(uid, docId)
   const role = await resolveEffectiveRole(uid, direct, meta, { isBot: false, token: req.octoToken })
   if (role === 'none') {
-    res.status(403).json({ error: 'forbidden' })
+    // See the titleOn403 rationale in this handler's doc comment. Omitted rather than sent empty
+    // when the stored title is blank, so the client can distinguish "no title disclosed" from
+    // "the title is an empty string" and never renders a placeholder as the document's name.
+    const title = typeof meta.title === 'string' && meta.title.trim() !== '' ? meta.title : undefined
+    res.status(403).json({ error: 'forbidden', ...(title ? { title } : {}) })
     return
   }
   // Only now — the caller is at least a reader — may archived/locked state be

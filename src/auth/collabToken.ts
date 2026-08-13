@@ -33,6 +33,8 @@ import jwt from 'jsonwebtoken'
 import { config } from '../config/env.js'
 import type { Role } from '../permission/role.js'
 
+export const LEGACY_COLLAB_AUD = 'legacy-collab'
+
 export interface CollabClaims {
   uid: string
   documentName: string
@@ -145,7 +147,7 @@ export function signCollabToken(claims: CollabClaims): CollabTokenResult {
       ...(claims.space_member === true ? { space_member: true } : {}),
     },
     config.collabToken.secret,
-    { algorithm: 'HS256', expiresIn: ttl },
+    { algorithm: 'HS256', audience: LEGACY_COLLAB_AUD, expiresIn: ttl },
   )
   return buildTokenResult(token, claims.role, claims.permission_epoch, name)
 }
@@ -196,6 +198,22 @@ export function verifyCollabToken(token: string): CollabClaims {
     throw new Error('invalid collab token payload')
   }
   const d = decoded as Record<string, unknown>
+  // Audience scoping (R4-B1): a collab token minted for a different audience
+  // (e.g. the PPT relay) must never verify on this path. Absent `aud` is
+  // tolerated for the compat window; a present-but-foreign audience is rejected.
+  // Enforced before version dispatch so it applies to every wire version.
+  const aud = d.aud
+  if (aud !== undefined && aud !== LEGACY_COLLAB_AUD) {
+    throw new Error('invalid collab token audience')
+  }
+  // PPT collab credentials are never valid on this endpoint (the PPT relay uses
+  // its own token + ticket over the durable Bento transport, R4-B1). Reject
+  // defensively before version dispatch, regardless of wire version — such a
+  // token is never minted here, so this only fires on a forged/misrouted one.
+  const docName = d.documentName
+  if (d.kind === 'html_ppt' || (typeof docName === 'string' && docName.includes(':ppt:'))) {
+    throw new Error('ppt collab credentials are not valid on the legacy collab endpoint')
+  }
   const ver = d.ver
 
   if (ver === undefined) return verifyLegacyV1(d)
