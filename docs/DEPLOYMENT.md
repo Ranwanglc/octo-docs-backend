@@ -48,6 +48,11 @@ shared internal token:
 | `/internal/html/**` (shared internal token) | 404 | ✅ |
 | `/healthz` | ✅ | ✅ |
 
+The 404s above are per-method for the *protected* methods. CORS runs before the
+surface gates, so an `OPTIONS` preflight to an off-surface path still answers
+`204` on either port — it reveals nothing and carries no handler, and the real
+request that follows still 404s.
+
 **Why only `/internal/html`.** A route may move only when every caller is
 provably in-network, because an off-network caller hard-404s the moment the split
 is enabled and often cannot be repointed at all:
